@@ -1,0 +1,16 @@
+# Generates committed test fixtures from Substrate's own crypto (sp-core).
+# Not part of the libpdot build; run by hand when fixtures change.
+[package]
+name = "pdot-fixtures-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sp-core = { version = "43", features = ["full_crypto"] }
+hex = "0.4"
+subxt-core = "0.44"
+sp-crypto-hashing = "0.1"
+codec = { package = "parity-scale-codec", version = "3" }
+
+[workspace]
