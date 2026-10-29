@@ -80,12 +80,27 @@ static int skip_opt_compact(pdot_reader *r)
 }
 
 /* Field { name: Option<String>, ty, type_name: Option<String>, docs } */
-static int read_field(pdot_reader *r, uint32_t *ty)
+static int read_field_named(pdot_reader *r, pdot_md_field *f)
 {
-    TRY(skip_opt_str(r));
-    TRY(read_compact_u32(r, ty));
+    int some;
+
+    f->name = "";
+    f->name_len = 0;
+    TRY(read_option(r, &some));
+    if (some)
+        TRY(read_str(r, &f->name, &f->name_len));
+    TRY(read_compact_u32(r, &f->ty));
     TRY(skip_opt_str(r));
     return skip_strs(r);
+}
+
+static int read_field(pdot_reader *r, uint32_t *ty)
+{
+    pdot_md_field f;
+
+    TRY(read_field_named(r, &f));
+    *ty = f.ty;
+    return 0;
 }
 
 static int skip_fields(pdot_reader *r)
@@ -243,7 +258,9 @@ static int parse_pallets(pdot_metadata *md, pdot_reader *r)
             TRY(pdot_read_bytes(r, &p, &len));
             TRY(skip_strs(r));
         }
-        TRY(skip_opt_compact(r));  /* error */
+        TRY(read_option(r, &pl->has_error));
+        if (pl->has_error)
+            TRY(read_compact_u32(r, &pl->error_ty));
         TRY(pdot_read_u8(r, &pl->index));
         if (md->version >= 15)
             TRY(skip_strs(r));
@@ -288,7 +305,8 @@ static int check_type_refs(const pdot_metadata *md)
     size_t i;
 
     for (i = 0; i < md->npallets; i++)
-        if (md->pallets[i].has_calls && md->pallets[i].calls_ty >= md->ntypes)
+        if ((md->pallets[i].has_calls && md->pallets[i].calls_ty >= md->ntypes) ||
+            (md->pallets[i].has_error && md->pallets[i].error_ty >= md->ntypes))
             return PDOT_E_DECODE;
     for (i = 0; i < md->next; i++)
         if (md->ext[i].ty >= md->ntypes || md->ext[i].implicit_ty >= md->ntypes)
@@ -356,6 +374,152 @@ const pdot_md_pallet *pdot_md_find_pallet(const pdot_metadata *md, const char *n
         if (pdot_md_name_eq(md->pallets[i].name, md->pallets[i].name_len, name))
             return &md->pallets[i];
     return NULL;
+}
+
+const pdot_md_pallet *pdot_md_pallet_at(const pdot_metadata *md, uint8_t index)
+{
+    size_t i;
+
+    for (i = 0; i < md->npallets; i++)
+        if (md->pallets[i].index == index)
+            return &md->pallets[i];
+    return NULL;
+}
+
+/* Reads a Vec<Field> into fields (up to max), returning the full count. */
+static int read_fields(pdot_reader *r, pdot_md_field *fields, size_t max, size_t *nfields)
+{
+    uint64_t n, j;
+    pdot_md_field f;
+
+    TRY(pdot_read_compact(r, &n));
+    for (j = 0; j < n; j++) {
+        TRY(read_field_named(r, &f));
+        if (fields && j < max)
+            fields[j] = f;
+    }
+    if (nfields)
+        *nfields = (size_t)n;
+    return 0;
+}
+
+int pdot_md_variant_at(const pdot_metadata *md, uint32_t ty, uint8_t index,
+                       const char **name, size_t *name_len,
+                       pdot_md_field *fields, size_t max, size_t *nfields)
+{
+    enum pdot_typedef kind;
+    pdot_reader r;
+    uint64_t n, i;
+
+    if (pdot_md_typedef(md, ty, &r, &kind) || kind != PDOT_TYPE_VARIANT)
+        return PDOT_E_METADATA;
+    TRY(pdot_read_compact(&r, &n));
+    for (i = 0; i < n; i++) {
+        const char *vname;
+        size_t vlen, nf;
+        size_t start;
+        uint8_t idx;
+
+        TRY(read_str(&r, &vname, &vlen));
+        start = r.pos;
+        TRY(read_fields(&r, NULL, 0, NULL));
+        TRY(pdot_read_u8(&r, &idx));
+        TRY(skip_strs(&r));
+        if (idx == index) {
+            r.pos = start;
+            TRY(read_fields(&r, fields, max, &nf));
+            if (name) {
+                *name = vname;
+                *name_len = vlen;
+            }
+            if (nfields)
+                *nfields = nf;
+            return 0;
+        }
+    }
+    return PDOT_E_NOTFOUND;
+}
+
+int pdot_md_iter_fields(const pdot_metadata *md, uint32_t ty, pdot_md_iter *it)
+{
+    enum pdot_typedef kind;
+
+    if (pdot_md_typedef(md, ty, &it->r, &kind) ||
+        (kind != PDOT_TYPE_COMPOSITE && kind != PDOT_TYPE_TUPLE))
+        return PDOT_E_METADATA;
+    it->tuple = kind == PDOT_TYPE_TUPLE;
+    TRY(pdot_read_compact(&it->r, &it->left));
+    return 0;
+}
+
+int pdot_md_iter_variant(const pdot_metadata *md, uint32_t ty, uint8_t index,
+                         pdot_md_iter *it, const char **name, size_t *name_len)
+{
+    enum pdot_typedef kind;
+    uint64_t n, i;
+
+    if (pdot_md_typedef(md, ty, &it->r, &kind) || kind != PDOT_TYPE_VARIANT)
+        return PDOT_E_METADATA;
+    it->tuple = 0;
+    TRY(pdot_read_compact(&it->r, &n));
+    for (i = 0; i < n; i++) {
+        size_t start;
+        uint8_t idx;
+
+        TRY(read_str(&it->r, name, name_len));
+        start = it->r.pos;
+        TRY(skip_fields(&it->r));
+        TRY(pdot_read_u8(&it->r, &idx));
+        TRY(skip_strs(&it->r));
+        if (idx == index) {
+            it->r.pos = start;
+            TRY(pdot_read_compact(&it->r, &it->left));
+            return 0;
+        }
+    }
+    return PDOT_E_DECODE;  /* data names a variant the type does not have */
+}
+
+int pdot_md_iter_next(pdot_md_iter *it, pdot_md_field *f)
+{
+    if (it->left == 0)
+        return 0;
+    it->left--;
+    if (it->tuple) {
+        f->name = "";
+        f->name_len = 0;
+        TRY(read_compact_u32(&it->r, &f->ty));
+    } else {
+        TRY(read_field_named(&it->r, f));
+    }
+    return 1;
+}
+
+int pdot_md_fields(const pdot_metadata *md, uint32_t ty, pdot_md_field *fields,
+                   size_t max, size_t *nfields)
+{
+    enum pdot_typedef kind;
+    pdot_reader r;
+    uint64_t n, j;
+
+    if (pdot_md_typedef(md, ty, &r, &kind))
+        return PDOT_E_METADATA;
+    if (kind == PDOT_TYPE_COMPOSITE)
+        return read_fields(&r, fields, max, nfields);
+    if (kind != PDOT_TYPE_TUPLE)
+        return PDOT_E_METADATA;
+    TRY(pdot_read_compact(&r, &n));
+    for (j = 0; j < n; j++) {
+        uint32_t ety;
+        TRY(read_compact_u32(&r, &ety));
+        if (fields && j < max) {
+            fields[j].name = "";
+            fields[j].name_len = 0;
+            fields[j].ty = ety;
+        }
+    }
+    *nfields = (size_t)n;
+    return 0;
 }
 
 int pdot_md_typedef(const pdot_metadata *md, uint32_t ty, pdot_reader *r,

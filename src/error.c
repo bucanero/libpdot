@@ -20,6 +20,7 @@ const char *pdot_strerror(int err)
     case PDOT_E_NOTFOUND:    return "not found";
     case PDOT_E_TIMEOUT:     return "timed out";
     case PDOT_E_METADATA:    return "unexpected runtime metadata";
+    case PDOT_E_DISPATCH:    return "transaction failed on chain";
     default:                 return "unknown error";
     }
 }

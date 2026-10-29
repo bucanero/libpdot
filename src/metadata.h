@@ -25,7 +25,19 @@ typedef struct {
     int         has_calls;
     uint32_t    calls_ty;
     size_t      storage_off;  /* offset of the storage prefix; 0 if none */
+    int         has_error;
+    uint32_t    error_ty;     /* the pallet's Error enum */
 } pdot_md_pallet;
+
+/* A field of a composite type or enum variant; name is empty if unnamed. */
+typedef struct {
+    const char *name;
+    size_t      name_len;
+    uint32_t    ty;
+} pdot_md_field;
+
+/* Upper bound on fields returned by the field lookups below. */
+#define PDOT_MD_MAX_FIELDS 16
 
 enum pdot_hasher {
     PDOT_HASHER_BLAKE2_128, PDOT_HASHER_BLAKE2_256, PDOT_HASHER_BLAKE2_128_CONCAT,
@@ -80,6 +92,33 @@ int pdot_md_variant(const pdot_metadata *md, uint32_t ty, const char *name,
 int pdot_md_variant_fields(const pdot_metadata *md, uint32_t ty, const char *name,
                            uint8_t *index, uint32_t *field_tys, size_t max_fields,
                            size_t *nfields);
+
+/*
+ * Variant of enum ty with the given index: its name and up to max fields.
+ * *nfields is the true count, which may exceed max.
+ */
+int pdot_md_variant_at(const pdot_metadata *md, uint32_t ty, uint8_t index,
+                       const char **name, size_t *name_len,
+                       pdot_md_field *fields, size_t max, size_t *nfields);
+
+/* Fields of a composite type, or elements of a tuple (unnamed). */
+int pdot_md_fields(const pdot_metadata *md, uint32_t ty, pdot_md_field *fields,
+                   size_t max, size_t *nfields);
+
+/* Streams the fields of a composite, tuple or enum variant without a size limit. */
+typedef struct {
+    pdot_reader r;
+    uint64_t    left;
+    int         tuple;   /* tuple elements are bare type ids */
+} pdot_md_iter;
+
+int pdot_md_iter_fields(const pdot_metadata *md, uint32_t ty, pdot_md_iter *it);
+int pdot_md_iter_variant(const pdot_metadata *md, uint32_t ty, uint8_t index,
+                         pdot_md_iter *it, const char **name, size_t *name_len);
+/* 1 and *f filled, 0 at the end, or a negative error. */
+int pdot_md_iter_next(pdot_md_iter *it, pdot_md_field *f);
+
+const pdot_md_pallet *pdot_md_pallet_at(const pdot_metadata *md, uint8_t index);
 
 /* Pallet and call indices for pallet.call, optionally with argument types. */
 int pdot_md_call(const pdot_metadata *md, const char *pallet, const char *call,

@@ -34,6 +34,7 @@ extern "C" {
 #define PDOT_E_NOTFOUND    (-12)
 #define PDOT_E_TIMEOUT     (-13) /* e.g. not included within the mortality window */
 #define PDOT_E_METADATA    (-14) /* metadata lacks or changes something we need */
+#define PDOT_E_DISPATCH    (-15) /* included, but the call failed (see error) */
 
 const char *pdot_strerror(int err);
 
@@ -135,22 +136,46 @@ int pdot_ss58_decode(const char *address, uint8_t account_id[32],
 
 /* ---- Bulletin Chain ------------------------------------------------- */
 
-/* Where a submitted transaction landed in a finalized block. */
+/* Dispatch outcome, read from the block's System.Events. */
+#define PDOT_DISPATCH_UNKNOWN (-1)  /* events unavailable (pruned state) */
+#define PDOT_DISPATCH_FAILED    0
+#define PDOT_DISPATCH_OK        1
+
+/* Where a submitted transaction landed in a finalized block, and how it went. */
 typedef struct {
     uint8_t  tx_hash[32];
     uint8_t  block_hash[32];
     uint32_t block;
     uint32_t index;      /* extrinsic index in the block */
+    int      dispatch;   /* PDOT_DISPATCH_* */
+    char     error[96];  /* "Pallet.Error" when dispatch failed */
 } pdot_tx_result;
 
 typedef struct {
     pdot_cid       cid;  /* the input for renew */
     pdot_tx_result tx;
+    int            has_storage_index;
+    uint32_t       storage_index;  /* TransactionStorage.Stored { index } */
 } pdot_store_result;
 
+/* An account's TransactionStorage.Authorizations entry. */
+typedef struct {
+    int      exists;
+    uint32_t transactions;            /* used */
+    uint32_t transactions_allowance;
+    uint64_t bytes;                   /* used */
+    uint64_t bytes_allowance;
+    uint32_t expiration;              /* expired once the chain reaches this block */
+    uint32_t now;                     /* best block when read */
+} pdot_authorization;
+
+/* Reads and decodes the account's authorization, if any. */
+int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
+                                pdot_authorization *out);
+
 /*
- * Checks TransactionStorage.Authorizations for the account. Only presence is
- * tested; an expired grant that has not been cleaned up still counts.
+ * 1 when an unexpired authorization exists. store is accepted past the byte
+ * allowance (at lower priority); renew is not.
  */
 int pdot_bulletin_is_authorized(pdot_client *c, const uint8_t account_id[32],
                                 int *authorized);
@@ -158,7 +183,7 @@ int pdot_bulletin_is_authorized(pdot_client *c, const uint8_t account_id[32],
 /*
  * Submits TransactionStorage.store(data) and blocks until it is in a
  * finalized block, or PDOT_E_TIMEOUT once the mortality window has passed.
- * Inclusion does not prove the call succeeded; fetch and verify to check.
+ * Returns PDOT_E_DISPATCH, with out->tx.error set, if the call failed.
  */
 int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
                         const uint8_t *data, size_t len,

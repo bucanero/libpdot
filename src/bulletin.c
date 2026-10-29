@@ -1,10 +1,12 @@
 /* Bulletin Chain flows: authorization check, store, renew and fetch. */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "pdot.h"
 #include "bulletin.h"
+#include "decode.h"
 #include "hash.h"
 #include "hex.h"
 #include "http.h"
@@ -113,43 +115,76 @@ int pdot_bulletin_auth_key(pdot_client *c, const pdot_metadata *md,
     return 0;
 }
 
-int pdot_bulletin_is_authorized(pdot_client *c, const uint8_t account_id[32],
-                                int *authorized)
+int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
+                                pdot_authorization *out)
 {
+    static const struct { const char *path; int wide; size_t off; } fields[] = {
+        { "extent.transactions", 0, offsetof(pdot_authorization, transactions) },
+        { "extent.transactions_allowance", 0, offsetof(pdot_authorization, transactions_allowance) },
+        { "extent.bytes", 1, offsetof(pdot_authorization, bytes) },
+        { "extent.bytes_allowance", 1, offsetof(pdot_authorization, bytes_allowance) },
+        { "expiration", 0, offsetof(pdot_authorization, expiration) },
+    };
+    pdot_md_storage st;
     pdot_buf key;
     uint8_t *value;
-    size_t len;
+    size_t len, i;
     int rc;
 
-    if (!c || !account_id || !authorized)
+    if (!c || !account_id || !out)
         return PDOT_E_INVALID;
-    if ((rc = pdot_chain_sync(c)))
+    memset(out, 0, sizeof *out);
+    if ((rc = pdot_chain_sync(c)) || (rc = pdot_rpc_best_number(c, &out->now)))
         return rc;
     pdot_buf_init(&key);
     if (!(rc = pdot_bulletin_auth_key(c, c->md, account_id, &key)))
         rc = pdot_rpc_storage(c, key.data, key.len, &value, &len);
     pdot_buf_free(&key);
-    if (rc == PDOT_E_NOTFOUND) {
-        *authorized = 0;
+    if (rc == PDOT_E_NOTFOUND)
         return 0;
-    }
     if (rc)
         return rc;
+
+    pdot_md_storage_entry(c->md, STORAGE_PALLET, "Authorizations", &st);
+    for (i = 0; i < sizeof fields / sizeof fields[0] && !rc; i++) {
+        uint64_t v;
+        if ((rc = pdot_decode_path_uint(c->md, st.value_ty, value, len, fields[i].path, &v)))
+            rc = pdot_fail(c, rc, "cannot decode Authorization.%s", fields[i].path);
+        else if (fields[i].wide)
+            *(uint64_t *)((char *)out + fields[i].off) = v;
+        else
+            *(uint32_t *)((char *)out + fields[i].off) = (uint32_t)v;
+    }
     free(value);
-    *authorized = 1;
+    if (!rc)
+        out->exists = 1;
+    return rc;
+}
+
+int pdot_bulletin_is_authorized(pdot_client *c, const uint8_t account_id[32],
+                                int *authorized)
+{
+    pdot_authorization a;
+    int rc;
+
+    if (!authorized)
+        return PDOT_E_INVALID;
+    if ((rc = pdot_bulletin_authorization(c, account_id, &a)))
+        return rc;
+    *authorized = a.exists && a.now < a.expiration;
     return 0;
 }
 
 /* Builds, signs and submits a call, then waits for finalized inclusion. */
 static int submit_call(pdot_client *c, const pdot_signer *s, const pdot_tx_params *p,
-                       const pdot_buf *call, pdot_tx_result *out)
+                       const pdot_buf *call, pdot_tx_result *out, pdot_ext_outcome *oc)
 {
     pdot_buf xt;
     int rc;
 
     pdot_buf_init(&xt);
     if (!(rc = pdot_tx_build(c, p, s, call->data, call->len, &xt)))
-        rc = pdot_tx_submit_watch(c, p, xt.data, xt.len, out);
+        rc = pdot_tx_submit_watch(c, p, xt.data, xt.len, out, oc);
     pdot_buf_free(&xt);
     return rc;
 }
@@ -168,8 +203,13 @@ int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
     if ((rc = pdot_tx_params_fetch(c, s, &p)))
         return rc;
     pdot_buf_init(&call);
-    if (!(rc = pdot_bulletin_store_call(c, p.md, data, len, &call)))
-        rc = submit_call(c, s, &p, &call, &out->tx);
+    if (!(rc = pdot_bulletin_store_call(c, p.md, data, len, &call))) {
+        pdot_ext_outcome oc;
+        memset(&oc, 0, sizeof oc);
+        rc = submit_call(c, s, &p, &call, &out->tx, &oc);
+        out->has_storage_index = oc.has_stored;
+        out->storage_index = oc.stored_index;
+    }
     pdot_buf_free(&call);
     return rc;
 }
@@ -192,7 +232,7 @@ int pdot_bulletin_renew(pdot_client *c, const pdot_signer *s,
         return rc;
     pdot_buf_init(&call);
     if (!(rc = pdot_bulletin_renew_call(c, p.md, digest, &call)))
-        rc = submit_call(c, s, &p, &call, out);
+        rc = submit_call(c, s, &p, &call, out, NULL);
     pdot_buf_free(&call);
     return rc;
 }
@@ -211,7 +251,7 @@ int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
         return rc;
     pdot_buf_init(&call);
     if (!(rc = pdot_bulletin_authorize_call(c, p.md, who, transactions, bytes, &call)))
-        rc = submit_call(c, s, &p, &call, out);
+        rc = submit_call(c, s, &p, &call, out, NULL);
     pdot_buf_free(&call);
     return rc;
 }

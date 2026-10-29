@@ -53,13 +53,22 @@ head -c 1048576 /dev/urandom > "$WORK/1mib.bin"
 head -c 700000 /dev/urandom > "$WORK/700k.bin"
 
 echo "== sr25519 //Alice, 1 MiB"
-"$CLI" --rpc $RPC --seed $ALICE_SR roundtrip "$WORK/1mib.bin"
+"$CLI" --rpc $RPC --seed $ALICE_SR roundtrip "$WORK/1mib.bin" | tee "$WORK/sr.out"
+[ "$(grep -c 'dispatch:   ok' "$WORK/sr.out")" = 2 ]
+grep -q 'stored as:  #' "$WORK/sr.out"
+
+echo "== a failing call is reported by name"
+if "$CLI" --rpc $RPC --seed $EVE_SR authorize $ALICE_ECDSA_ADDR 1 0 > "$WORK/fail.out" 2>&1; then
+    echo "expected authorize with 0 bytes to fail"; exit 1
+fi
+grep -q 'TransactionStorage.BadDataSize' "$WORK/fail.out"
 
 echo "== //Eve authorizes ECDSA //Alice"
 "$CLI" --rpc $RPC --seed $EVE_SR authorize $ALICE_ECDSA_ADDR 10 4194304
 
 echo "== ecdsa //Alice, 700 KB"
 "$CLI" --rpc $RPC --scheme ecdsa --seed $ALICE_ECDSA roundtrip "$WORK/700k.bin" | tee "$WORK/ecdsa.out"
+[ "$(grep -c 'dispatch:   ok' "$WORK/ecdsa.out")" = 2 ]
 
 if [ "${KUBO:-0}" = 1 ]; then
     echo "== fetch through a Kubo gateway"

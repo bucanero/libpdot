@@ -222,6 +222,20 @@ bad:
     return PDOT_E_DECODE;
 }
 
+int pdot_read_compact_skip(pdot_reader *r)
+{
+    uint8_t first;
+
+    if (pdot_read_u8(r, &first))
+        return PDOT_E_DECODE;
+    switch (first & 3) {
+    case 0:  return 0;
+    case 1:  return pdot_read_skip(r, 1);
+    case 2:  return pdot_read_skip(r, 3);
+    default: return pdot_read_skip(r, (size_t)(first >> 2) + 4);
+    }
+}
+
 int pdot_read_bytes(pdot_reader *r, const uint8_t **p, size_t *n)
 {
     uint64_t len;

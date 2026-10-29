@@ -193,6 +193,30 @@ int pdot_rpc_storage(pdot_client *c, const uint8_t *key, size_t key_len,
                           value, value_len);
 }
 
+int pdot_rpc_storage_at(pdot_client *c, const uint8_t *key, size_t key_len,
+                        const uint8_t at[32], uint8_t **value, size_t *value_len)
+{
+    cJSON *p = pdot_rpc_hex_param(key, key_len);
+    cJSON *h = pdot_rpc_hex_param(at, 32);
+
+    cJSON_AddItemToArray(p, cJSON_DetachItemFromArray(h, 0));
+    cJSON_Delete(h);
+    return pdot_rpc_bytes(c, "state_getStorage", p, value, value_len);
+}
+
+int pdot_rpc_best_number(pdot_client *c, uint32_t *number)
+{
+    cJSON *res;
+    int rc;
+
+    if ((rc = pdot_rpc(c, "chain_getHeader", NULL, &res)))
+        return rc;
+    if (json_u32(cJSON_GetObjectItemCaseSensitive(res, "number"), number))
+        rc = pdot_fail(c, PDOT_E_RPC, "chain_getHeader: no block number");
+    cJSON_Delete(res);
+    return rc;
+}
+
 int pdot_rpc_state_call(pdot_client *c, const char *fn, const uint8_t *args,
                         size_t args_len, uint8_t **out, size_t *out_len)
 {

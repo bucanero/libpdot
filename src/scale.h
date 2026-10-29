@@ -53,6 +53,8 @@ int pdot_read_u64(pdot_reader *r, uint64_t *v);
 int pdot_read_bool(pdot_reader *r, int *v);
 /* Rejects non-canonical encodings and values above u64. */
 int pdot_read_compact(pdot_reader *r, uint64_t *v);
+/* Skips a compact of any width (up to the 67-byte big mode), e.g. Compact<u128>. */
+int pdot_read_compact_skip(pdot_reader *r);
 /* Vec<u8>: points into the input, no copy. */
 int pdot_read_bytes(pdot_reader *r, const uint8_t **p, size_t *n);
 

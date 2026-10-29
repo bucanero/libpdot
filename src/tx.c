@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -225,9 +226,39 @@ static int find_in_block(pdot_client *c, uint32_t number, const uint8_t tx_hash[
     return 0;
 }
 
-int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
-                         const uint8_t *xt, size_t len, pdot_tx_result *out)
+/* Fills out->dispatch and out->error from the block's System.Events. */
+static int read_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result *out,
+                        pdot_ext_outcome *oc)
 {
+    uint8_t key[32], *events;
+    size_t len;
+    int rc;
+
+    out->dispatch = PDOT_DISPATCH_UNKNOWN;
+    pdot_events_key(key);
+    rc = pdot_rpc_storage_at(c, key, sizeof key, out->block_hash, &events, &len);
+    if (rc)
+        return rc == PDOT_E_RPC || rc == PDOT_E_NOTFOUND ? 0 : rc;  /* pruned */
+    rc = pdot_events_outcome(p->md, events, len, out->index, oc);
+    free(events);
+    if (rc)
+        return pdot_fail(c, rc, "cannot decode events of block #%u: %s", out->block,
+                         pdot_strerror(rc));
+    if (oc->failed) {
+        out->dispatch = PDOT_DISPATCH_FAILED;
+        snprintf(out->error, sizeof out->error, "%s", oc->error);
+        return pdot_fail(c, PDOT_E_DISPATCH, "%s", oc->error);
+    }
+    if (oc->success)
+        out->dispatch = PDOT_DISPATCH_OK;
+    return 0;
+}
+
+int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
+                         const uint8_t *xt, size_t len, pdot_tx_result *out,
+                         pdot_ext_outcome *oc)
+{
+    pdot_ext_outcome local;
     uint8_t node_hash[32], head[32];
     uint32_t next = p->era_block + 1, finalized;
     uint32_t last = p->era_block + (p->era_period ? p->era_period : PDOT_ERA_PERIOD);
@@ -248,7 +279,7 @@ int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
             if ((rc = find_in_block(c, next, out->tx_hash, len, out, &found)))
                 return rc;
             if (found)
-                return 0;
+                return read_outcome(c, p, out, oc ? oc : &local);
             if (next >= last)
                 return pdot_fail(c, PDOT_E_TIMEOUT,
                                  "not included by block %u (mortality window)", last);

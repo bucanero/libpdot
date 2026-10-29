@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "client.h"
+#include "events.h"
 #include "metadata.h"
 #include "scale.h"
 
@@ -37,10 +38,12 @@ int pdot_tx_build(pdot_client *c, const pdot_tx_params *p, const pdot_signer *s,
 
 /*
  * Submits xt and polls finalized blocks after p->era_block until one contains
- * it, filling out. Fails with PDOT_E_TIMEOUT after the mortality window.
+ * it, then reads the block's events into out (and oc, if not NULL).
+ * PDOT_E_TIMEOUT after the mortality window; PDOT_E_DISPATCH if the call failed.
  */
 int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
-                         const uint8_t *xt, size_t len, pdot_tx_result *out);
+                         const uint8_t *xt, size_t len, pdot_tx_result *out,
+                         pdot_ext_outcome *oc);
 
 /* Fills p from the node: metadata, versions, nonce and a finalized checkpoint. */
 int pdot_tx_params_fetch(pdot_client *c, const pdot_signer *s, pdot_tx_params *p);

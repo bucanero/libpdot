@@ -164,15 +164,30 @@ static void print_tx(const pdot_tx_result *tx)
     printf("  block:      #%u\n", tx->block);
     print_hex("  block hash: ", tx->block_hash, 32);
     printf("  index:      %u\n", tx->index);
+    if (tx->dispatch == PDOT_DISPATCH_OK)
+        printf("  dispatch:   ok\n");
+    else if (tx->dispatch == PDOT_DISPATCH_FAILED)
+        printf("  dispatch:   FAILED: %s\n", tx->error);
+    else
+        printf("  dispatch:   unknown (block state unavailable)\n");
 }
 
 static int cmd_authorized(pdot_client *c, const uint8_t id[32], unsigned prefix, int *ok)
 {
-    int rc = pdot_bulletin_is_authorized(c, id, ok);
+    pdot_authorization a;
+    int rc = pdot_bulletin_authorization(c, id, &a);
 
     if (rc)
         return die("authorization check", rc, c);
+    *ok = a.exists && a.now < a.expiration;
     print_account(*ok ? "authorized:     " : "NOT authorized: ", id, prefix);
+    if (a.exists) {
+        printf("  transactions: %u of %u used\n", a.transactions, a.transactions_allowance);
+        printf("  bytes:        %llu of %llu used\n", (unsigned long long)a.bytes,
+               (unsigned long long)a.bytes_allowance);
+        printf("  expires:      block #%u (now #%u)%s\n", a.expiration, a.now,
+               a.now >= a.expiration ? ", EXPIRED" : "");
+    }
     return 0;
 }
 
@@ -189,10 +204,15 @@ static int cmd_store(pdot_client *c, const pdot_signer *s, const char *path,
     fprintf(stderr, "storing %zu bytes, waiting for finalization...\n", len);
     rc = pdot_bulletin_store(c, s, data, len, res);
     free(data);
+    if (rc == PDOT_E_DISPATCH)
+        print_tx(&res->tx);
     if (rc)
         return die("store", rc, c);
     pdot_cid_to_string(&res->cid, cid, sizeof cid);
     printf("stored %zu bytes\n  cid:        %s\n", len, cid);
+    if (res->has_storage_index)
+        printf("  stored as:  #%u/%u (TransactionRef::Position)\n", res->tx.block,
+               res->storage_index);
     print_tx(&res->tx);
     return 0;
 }
@@ -205,8 +225,11 @@ static int cmd_renew(pdot_client *c, const pdot_signer *s, const pdot_cid *cid)
 
     pdot_cid_to_string(cid, str, sizeof str);
     fprintf(stderr, "renewing %s, waiting for finalization...\n", str);
-    if ((rc = pdot_bulletin_renew(c, s, cid, &tx)))
+    if ((rc = pdot_bulletin_renew(c, s, cid, &tx))) {
+        if (rc == PDOT_E_DISPATCH)
+            print_tx(&tx);
         return die("renew", rc, c);
+    }
     printf("renewed %s\n", str);
     print_tx(&tx);
     return 0;
@@ -327,10 +350,12 @@ int main(int argc, char **argv)
             uint32_t txs;
             unsigned long long bytes = strtoull(argv[i + 2], NULL, 10);
             pdot_tx_result tx;
-            if (pdot_ss58_decode(argv[i], who, NULL) || parse_u32(argv[i + 1], &txs) || !bytes) {
+            if (pdot_ss58_decode(argv[i], who, NULL) || parse_u32(argv[i + 1], &txs)) {
                 fprintf(stderr, "error: expected ADDRESS TXS BYTES\n");
                 rc = 2;
             } else if ((rc = pdot_bulletin_authorize_account(c, &s, who, txs, bytes, &tx))) {
+                if (rc == PDOT_E_DISPATCH)
+                    print_tx(&tx);
                 rc = die("authorize", rc, c);
             } else {
                 print_account("authorized:     ", who, o.prefix);

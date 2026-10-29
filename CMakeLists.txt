@@ -7,6 +7,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 option(PDOT_BUILD_TESTS  "Build unit tests" ON)
 option(PDOT_SANITIZE     "Build with ASan and UBSan" OFF)
+option(PDOT_FUZZ         "Build libFuzzer targets (clang)" OFF)
 option(PDOT_WITH_SR25519 "Build the sr25519 signer (sr25519-donna)" ON)
 option(PDOT_WITH_ECDSA   "Build the ECDSA secp256k1 signer (mbedTLS)" ON)
 option(PDOT_SR25519_FORCE_32BIT "Use sr25519-donna's 32-bit field arithmetic" OFF)
@@ -90,6 +91,8 @@ add_library(pdot
   src/http.c
   src/rpc.c
   src/metadata.c
+  src/decode.c
+  src/events.c
   src/tx.c
   src/bulletin.c
   $<TARGET_OBJECTS:pdot_blake2>)
@@ -119,9 +122,19 @@ if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
   target_compile_options(pdot-bulletin PRIVATE ${PDOT_WARNINGS})
 endif()
 
+if(PDOT_FUZZ)
+  foreach(f metadata decode)
+    add_executable(fuzz_${f} fuzz/fuzz_${f}.c)
+    target_link_libraries(fuzz_${f} PRIVATE pdot)
+    target_include_directories(fuzz_${f} PRIVATE src third_party/blake2)
+    target_compile_options(fuzz_${f} PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(fuzz_${f} PRIVATE -fsanitize=fuzzer,address,undefined)
+  endforeach()
+endif()
+
 if(PDOT_BUILD_TESTS)
   enable_testing()
-  set(PDOT_TESTS scale hash cid ss58 metadata)
+  set(PDOT_TESTS scale hash cid ss58 metadata events)
   if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
     list(APPEND PDOT_TESTS signer tx)
   endif()
