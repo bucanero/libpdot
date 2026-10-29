@@ -88,6 +88,17 @@ static void test_golden(const pdot_metadata *md)
     CHECK_HEX(xt.data, xt.len, golden_force_renew);
     pdot_buf_free(&call);
     pdot_buf_free(&xt);
+
+    /* store_with_cid_config(dag-pb, Blake2b256) over the first 100 bytes. */
+    for (i = 0; i < sizeof data; i++)
+        data[i] = (uint8_t)(i * 13);
+    pdot_buf_init(&call);
+    pdot_buf_init(&xt);
+    CHECK(pdot_bulletin_store_cid_call(NULL, md, PDOT_CODEC_DAG_PB, data, 100, &call) == 0);
+    CHECK(pdot_tx_build(NULL, &p, &s, call.data, call.len, &xt) == 0);
+    CHECK_HEX(xt.data, xt.len, golden_store_dagpb);
+    pdot_buf_free(&call);
+    pdot_buf_free(&xt);
     pdot_signer_wipe(&s);
 }
 

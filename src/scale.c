@@ -143,7 +143,7 @@ static int get_le(pdot_reader *r, size_t n, uint64_t *v)
 
 int pdot_read_u8(pdot_reader *r, uint8_t *v)
 {
-    uint64_t t;
+    uint64_t t = 0;
     int rc = get_le(r, 1, &t);
     *v = (uint8_t)t;
     return rc;
@@ -151,7 +151,7 @@ int pdot_read_u8(pdot_reader *r, uint8_t *v)
 
 int pdot_read_u16(pdot_reader *r, uint16_t *v)
 {
-    uint64_t t;
+    uint64_t t = 0;
     int rc = get_le(r, 2, &t);
     *v = (uint16_t)t;
     return rc;
@@ -159,7 +159,7 @@ int pdot_read_u16(pdot_reader *r, uint16_t *v)
 
 int pdot_read_u32(pdot_reader *r, uint32_t *v)
 {
-    uint64_t t;
+    uint64_t t = 0;
     int rc = get_le(r, 4, &t);
     *v = (uint32_t)t;
     return rc;
@@ -184,7 +184,7 @@ int pdot_read_compact(pdot_reader *r, uint64_t *v)
 {
     size_t start = r->pos;
     uint8_t first;
-    uint64_t t;
+    uint64_t t = 0;
     size_t n;
 
     if (pdot_read_u8(r, &first))

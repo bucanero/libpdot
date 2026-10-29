@@ -5,7 +5,8 @@
 # Bulletin (no Rust build needed), starts polkadot-omni-node, then runs the
 # store / fetch / verify / renew round trip with sr25519 //Alice and with
 # ECDSA //Alice after //Eve (a registered authorizer in the dev genesis)
-# grants it storage. With KUBO=1 it also fetches through a local Kubo gateway.
+# grants it storage, and a chunked file with a DAG-PB manifest. With KUBO=1
+# it also fetches through a local Kubo gateway.
 #
 #   OMNI_NODE=/path/to/polkadot-omni-node tools/e2e-devnode.sh [build-dir]
 set -eu
@@ -26,8 +27,8 @@ EVE_SR=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
 NODE_PID=
 KUBO_PID=
 cleanup() {
-    [ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null || true
-    [ -n "$KUBO_PID" ] && kill "$KUBO_PID" 2>/dev/null || true
+    if [ -n "$NODE_PID" ]; then kill "$NODE_PID" 2>/dev/null || true; fi
+    if [ -n "$KUBO_PID" ]; then kill "$KUBO_PID" 2>/dev/null || true; fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -54,8 +55,15 @@ head -c 700000 /dev/urandom > "$WORK/700k.bin"
 
 echo "== sr25519 //Alice, 1 MiB"
 "$CLI" --rpc $RPC --seed $ALICE_SR roundtrip "$WORK/1mib.bin" | tee "$WORK/sr.out"
-[ "$(grep -c 'dispatch:   ok' "$WORK/sr.out")" = 2 ]
+grep -q 'dispatch:   ok' "$WORK/sr.out"
 grep -q 'stored as:  #' "$WORK/sr.out"
+grep -q '^renewed ' "$WORK/sr.out"
+
+echo "== sr25519 //Alice, 3.5 MiB chunked (auto: over 2 MiB)"
+head -c 3670016 /dev/urandom > "$WORK/chunked.bin"
+"$CLI" --rpc $RPC --seed $ALICE_SR roundtrip "$WORK/chunked.bin" 2>&1 | tee "$WORK/chunked.out"
+grep -q 'as 4 chunks + manifest' "$WORK/chunked.out"
+grep -q 'roundtrip ok' "$WORK/chunked.out"
 
 echo "== a failing call is reported by name"
 if "$CLI" --rpc $RPC --seed $EVE_SR authorize $ALICE_ECDSA_ADDR 1 0 > "$WORK/fail.out" 2>&1; then
@@ -68,7 +76,8 @@ echo "== //Eve authorizes ECDSA //Alice"
 
 echo "== ecdsa //Alice, 700 KB"
 "$CLI" --rpc $RPC --scheme ecdsa --seed $ALICE_ECDSA roundtrip "$WORK/700k.bin" | tee "$WORK/ecdsa.out"
-[ "$(grep -c 'dispatch:   ok' "$WORK/ecdsa.out")" = 2 ]
+grep -q 'dispatch:   ok' "$WORK/ecdsa.out"
+grep -q '^renewed ' "$WORK/ecdsa.out"
 
 if [ "${KUBO:-0}" = 1 ]; then
     echo "== fetch through a Kubo gateway"
@@ -86,6 +95,13 @@ if [ "${KUBO:-0}" = 1 ]; then
     CID=$(sed -n 's/^  cid: *//p' "$WORK/ecdsa.out")
     "$CLI" --gateway http://127.0.0.1:8283 fetch "$CID" "$WORK/700k.out"
     cmp "$WORK/700k.bin" "$WORK/700k.out"
+
+    echo "== chunked file through the gateway: libpdot (raw blocks) and plain IPFS"
+    ROOT=$(sed -n 's/^  cid: *//p' "$WORK/chunked.out")
+    "$CLI" --gateway http://127.0.0.1:8283 fetch "$ROOT" "$WORK/chunked.gw"
+    cmp "$WORK/chunked.bin" "$WORK/chunked.gw"
+    curl -fsS -m 120 "http://127.0.0.1:8283/ipfs/$ROOT" -o "$WORK/chunked.ipfs"
+    cmp "$WORK/chunked.bin" "$WORK/chunked.ipfs"
 fi
 
 echo "== e2e ok"

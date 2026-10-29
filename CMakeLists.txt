@@ -8,6 +8,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(PDOT_BUILD_TESTS  "Build unit tests" ON)
 option(PDOT_SANITIZE     "Build with ASan and UBSan" OFF)
 option(PDOT_FUZZ         "Build libFuzzer targets (clang)" OFF)
+option(PDOT_WERROR       "Treat warnings in libpdot's own code as errors" OFF)
 option(PDOT_WITH_SR25519 "Build the sr25519 signer (sr25519-donna)" ON)
 option(PDOT_WITH_ECDSA   "Build the ECDSA secp256k1 signer (mbedTLS)" ON)
 option(PDOT_SR25519_FORCE_32BIT "Use sr25519-donna's 32-bit field arithmetic" OFF)
@@ -37,6 +38,9 @@ if(MSVC)
   set(PDOT_WARNINGS /W4)
 else()
   set(PDOT_WARNINGS -Wall -Wextra -pedantic -Wshadow -Wstrict-prototypes)
+endif()
+if(PDOT_WERROR)
+  list(APPEND PDOT_WARNINGS $<IF:$<C_COMPILER_ID:MSVC>,/WX,-Werror>)
 endif()
 
 if(PDOT_SANITIZE AND NOT MSVC)
@@ -93,6 +97,7 @@ add_library(pdot
   src/metadata.c
   src/decode.c
   src/events.c
+  src/dag.c
   src/tx.c
   src/bulletin.c
   $<TARGET_OBJECTS:pdot_blake2>)
@@ -134,7 +139,7 @@ endif()
 
 if(PDOT_BUILD_TESTS)
   enable_testing()
-  set(PDOT_TESTS scale hash cid ss58 metadata events)
+  set(PDOT_TESTS scale hash cid ss58 metadata events dag)
   if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
     list(APPEND PDOT_TESTS signer tx)
   endif()

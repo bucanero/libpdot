@@ -113,6 +113,10 @@ typedef struct {
 
 /* CIDv1, raw codec, Blake2b-256 multihash of data. */
 int pdot_cid_compute(pdot_cid *cid, const uint8_t *data, size_t len);
+/* Same with another codec, e.g. PDOT_CODEC_DAG_PB for a chunked-file manifest. */
+int pdot_cid_compute_codec(pdot_cid *cid, uint64_t codec, const uint8_t *data, size_t len);
+/* Codec of a CIDv1, or 0 if cid is not one. */
+uint64_t pdot_cid_codec(const pdot_cid *cid);
 
 /* Returns 0 if data hashes to the digest in cid, PDOT_E_MISMATCH if not. */
 int pdot_cid_verify(const pdot_cid *cid, const uint8_t *data, size_t len);
@@ -197,6 +201,41 @@ int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
 int pdot_bulletin_renew(pdot_client *c, const pdot_signer *s,
                         const pdot_cid *cid, pdot_tx_result *out);
 
+/* ---- Chunked files (UnixFS / DAG-PB, compatible with the TypeScript SDK) */
+
+#define PDOT_CHUNK_SIZE_DEFAULT (1u << 20)   /* 1 MiB */
+#define PDOT_CHUNK_SIZE_MAX     (2u << 20)   /* the chain's MaxTransactionSize */
+#define PDOT_FILE_SIZE_MAX      (64u << 20)
+
+/*
+ * Called after each transaction of a multi-transaction operation: chunks
+ * 0..total-2, then the manifest at index total-1. rc is that step's result.
+ */
+typedef void (*pdot_progress_fn)(void *ud, size_t index, size_t total,
+                                 const pdot_cid *cid, const pdot_tx_result *tx, int rc);
+
+typedef struct {
+    pdot_cid          root;      /* dag-pb manifest CID: fetch and renew with this */
+    pdot_store_result manifest;
+    size_t            nchunks;
+    uint64_t          size;
+} pdot_chunked_result;
+
+/*
+ * Stores data as raw chunks of chunk_size bytes (0: 1 MiB) followed by a
+ * DAG-PB manifest stored with codec dag-pb, as the Bulletin SDKs do. The root
+ * CID matches the TypeScript SDK's for the same data and chunk size.
+ * Transactions go one at a time; on failure, out->nchunks says how far it got.
+ */
+int pdot_bulletin_store_chunked(pdot_client *c, const pdot_signer *s,
+                                const uint8_t *data, size_t len, size_t chunk_size,
+                                pdot_progress_fn progress, void *ud,
+                                pdot_chunked_result *out);
+
+/* Renews every chunk behind a manifest, then the manifest; or just root if raw. */
+int pdot_bulletin_renew_tree(pdot_client *c, const pdot_signer *s, const pdot_cid *root,
+                             pdot_progress_fn progress, void *ud);
+
 /*
  * TransactionStorage.authorize_account, signed by s. Succeeds only when s is
  * a registered authorizer (AllowedAuthorizers); Root grants go through sudo.
@@ -207,7 +246,9 @@ int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
 
 /*
  * Fetches data by CID from the gateway, or from the node when the client has
- * none, and checks it against the CID. *data is freed with pdot_free.
+ * none, and checks it against the CID. A dag-pb CID (a chunked file) is
+ * resolved through its manifest: every block is fetched and verified, and the
+ * chunks are returned concatenated. *data is freed with pdot_free.
  */
 int pdot_bulletin_fetch(pdot_client *c, const pdot_cid *cid,
                         uint8_t **data, size_t *len);

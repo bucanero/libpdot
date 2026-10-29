@@ -1,5 +1,6 @@
 /*
- * libFuzzer target: generic SCALE decoder and event scan over hostile data,
+ * libFuzzer target: generic SCALE decoder, event scan and chunked-file
+ * manifest parser over hostile data,
  * with real Bulletin metadata (PDOT_FUZZ_METADATA, default
  * tests/fixtures/metadata-v15-paseo.scale). The first 4 input bytes pick a
  * type id for pdot_decode_skip; the whole input is also scanned as events.
@@ -7,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "dag.h"
 #include "decode.h"
 #include "events.h"
 #include "metadata.h"
@@ -40,6 +42,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     pdot_ext_outcome oc;
     pdot_reader r;
+    pdot_dag_link *links;
+    size_t nlinks;
+    uint64_t filesize;
+
+    if (pdot_dag_decode(data, size, &links, &nlinks, &filesize) == 0)
+        free(links);
 
     pdot_events_outcome(md, data, size, data && size ? data[0] : 0, &oc);
     if (size >= 4) {

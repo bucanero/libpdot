@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"  # nightly: catches Westend runtime upgrades in e2e
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Every job runs a ci/ script inside debian:trixie (for mbedTLS 3.6) through
+# ci/in-docker.sh, so `ci/in-docker.sh <platform> <script>` reproduces it locally.
+
+jobs:
+  build-test:
+    name: ${{ matrix.cc }} ${{ matrix.sanitize == '1' && 'asan+ubsan' || 'release' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        sanitize: ["0", "1"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: ci/in-docker.sh linux/amd64 ci/build-test.sh CC=${{ matrix.cc }} SANITIZE=${{ matrix.sanitize }}
+
+  emulated:
+    name: ${{ matrix.platform }} (qemu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm/v7: 32-bit; s390x: big-endian.
+        platform: [linux/arm64, linux/arm/v7, linux/s390x]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: docker/setup-qemu-action@v3
+      - run: ci/in-docker.sh ${{ matrix.platform }} ci/build-test.sh
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: mkdir -p fuzz-out && OUT=$PWD/fuzz-out ci/in-docker.sh linux/amd64 ci/fuzz.sh FUZZ_SECONDS=120
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz-out
+
+  e2e:
+    name: e2e (dev node)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: ci/in-docker.sh linux/amd64 ci/e2e.sh

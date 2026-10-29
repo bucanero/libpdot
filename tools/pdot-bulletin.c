@@ -8,7 +8,8 @@
 
 #include "pdot.h"
 
-#define MAX_FILE (8u * 1024 * 1024)
+/* Larger than the library limit, so the library reports oversize files. */
+#define MAX_FILE (2 * PDOT_FILE_SIZE_MAX)
 
 static const char usage[] =
     "usage: pdot-bulletin [options] <command> [args]\n"
@@ -16,8 +17,9 @@ static const char usage[] =
     "commands:\n"
     "  address                 print the signer's account\n"
     "  authorized [ADDRESS]    check storage authorization (default: signer)\n"
-    "  store FILE              store FILE, wait for finalization, print CID\n"
-    "  renew CID               renew stored data (DataRenewal.force_renew)\n"
+    "  store FILE              store FILE, wait for finalization, print CID;\n"
+    "                          over 2 MiB it is chunked with a DAG-PB manifest\n"
+    "  renew CID               renew stored data, every chunk of a chunked file\n"
     "  fetch CID [OUT]         fetch and verify data (to OUT or stdout)\n"
     "  roundtrip FILE          authorized + store + fetch + verify + renew\n"
     "  authorize ADDRESS TXS BYTES\n"
@@ -30,12 +32,14 @@ static const char usage[] =
     "  --seed-file PATH        file holding the 32-byte hex seed\n"
     "  --seed HEX              hex seed; PDOT_SEED in the environment also works\n"
     "  --prefix N              SS58 prefix for printed addresses (default 42)\n"
-    "  --timeout MS            per-request timeout (default 60000)\n";
+    "  --timeout MS            per-request timeout (default 60000)\n"
+    "  --chunk-size BYTES      always chunk, with this chunk size (max 2 MiB)\n";
 
 struct opts {
     const char *rpc, *gateway, *scheme, *seed_hex, *seed_file;
     unsigned prefix;
     long timeout;
+    size_t chunk_size;   /* 0: chunk only above PDOT_CHUNK_SIZE_MAX */
 };
 
 static int die(const char *what, int rc, const pdot_client *c)
@@ -191,8 +195,22 @@ static int cmd_authorized(pdot_client *c, const uint8_t id[32], unsigned prefix,
     return 0;
 }
 
+static void on_progress(void *ud, size_t index, size_t total, const pdot_cid *cid,
+                        const pdot_tx_result *tx, int rc)
+{
+    char str[128];
+
+    pdot_cid_to_string(cid, str, sizeof str);
+    fprintf(stderr, "  [%zu/%zu] %s %s %s block #%u\n", index + 1, total, (const char *)ud,
+            pdot_cid_codec(cid) == PDOT_CODEC_DAG_PB ? "manifest" : total > 1 ? "chunk   " : "data    ",
+            str, tx->block);
+    if (rc)
+        fprintf(stderr, "  [%zu/%zu] failed: %s\n", index + 1, total, pdot_strerror(rc));
+}
+
+/* Stores a file whole, or chunked when it is large or chunk_size is set. */
 static int cmd_store(pdot_client *c, const pdot_signer *s, const char *path,
-                     pdot_store_result *res)
+                     size_t chunk_size, pdot_cid *root)
 {
     char cid[128];
     uint8_t *data;
@@ -201,37 +219,53 @@ static int cmd_store(pdot_client *c, const pdot_signer *s, const char *path,
 
     if (read_file(path, &data, &len))
         return 1;
-    fprintf(stderr, "storing %zu bytes, waiting for finalization...\n", len);
-    rc = pdot_bulletin_store(c, s, data, len, res);
-    free(data);
-    if (rc == PDOT_E_DISPATCH)
-        print_tx(&res->tx);
-    if (rc)
-        return die("store", rc, c);
-    pdot_cid_to_string(&res->cid, cid, sizeof cid);
-    printf("stored %zu bytes\n  cid:        %s\n", len, cid);
-    if (res->has_storage_index)
-        printf("  stored as:  #%u/%u (TransactionRef::Position)\n", res->tx.block,
-               res->storage_index);
-    print_tx(&res->tx);
-    return 0;
+    if (chunk_size || len > PDOT_CHUNK_SIZE_MAX) {
+        pdot_chunked_result res;
+        size_t cs = chunk_size ? chunk_size : PDOT_CHUNK_SIZE_DEFAULT;
+
+        fprintf(stderr, "storing %zu bytes in %zu chunks of %zu, waiting for each...\n",
+                len, (len + cs - 1) / cs, cs);
+        rc = pdot_bulletin_store_chunked(c, s, data, len, cs, on_progress, "stored ", &res);
+        free(data);
+        if (rc)
+            return die("chunked store", rc, c);
+        pdot_cid_to_string(&res.root, cid, sizeof cid);
+        printf("stored %zu bytes as %zu chunks + manifest\n  cid:        %s\n",
+               len, res.nchunks, cid);
+        printf("  manifest:   #%u/%u\n", res.manifest.tx.block, res.manifest.tx.index);
+        *root = res.root;
+        return 0;
+    } else {
+        pdot_store_result res;
+
+        fprintf(stderr, "storing %zu bytes, waiting for finalization...\n", len);
+        rc = pdot_bulletin_store(c, s, data, len, &res);
+        free(data);
+        if (rc == PDOT_E_DISPATCH)
+            print_tx(&res.tx);
+        if (rc)
+            return die("store", rc, c);
+        pdot_cid_to_string(&res.cid, cid, sizeof cid);
+        printf("stored %zu bytes\n  cid:        %s\n", len, cid);
+        if (res.has_storage_index)
+            printf("  stored as:  #%u/%u (TransactionRef::Position)\n", res.tx.block,
+                   res.storage_index);
+        print_tx(&res.tx);
+        *root = res.cid;
+        return 0;
+    }
 }
 
 static int cmd_renew(pdot_client *c, const pdot_signer *s, const pdot_cid *cid)
 {
-    pdot_tx_result tx;
     char str[128];
     int rc;
 
     pdot_cid_to_string(cid, str, sizeof str);
     fprintf(stderr, "renewing %s, waiting for finalization...\n", str);
-    if ((rc = pdot_bulletin_renew(c, s, cid, &tx))) {
-        if (rc == PDOT_E_DISPATCH)
-            print_tx(&tx);
+    if ((rc = pdot_bulletin_renew_tree(c, s, cid, on_progress, "renewed")))
         return die("renew", rc, c);
-    }
     printf("renewed %s\n", str);
-    print_tx(&tx);
     return 0;
 }
 
@@ -273,7 +307,7 @@ static int parse_u32(const char *s, uint32_t *v)
 
 int main(int argc, char **argv)
 {
-    struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0 };
+    struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0, 0 };
     pdot_client *c;
     pdot_signer s;
     const char *cmd;
@@ -296,6 +330,7 @@ int main(int argc, char **argv)
         else if (strcmp(k, "--seed-file") == 0) o.seed_file = v;
         else if (strcmp(k, "--prefix") == 0) o.prefix = (unsigned)strtoul(v, NULL, 10);
         else if (strcmp(k, "--timeout") == 0) o.timeout = strtol(v, NULL, 10);
+        else if (strcmp(k, "--chunk-size") == 0) o.chunk_size = strtoul(v, NULL, 10);
         else {
             fprintf(stderr, "error: unknown option %s\n%s", k, usage);
             return 2;
@@ -337,8 +372,8 @@ int main(int argc, char **argv)
         } else if (strcmp(cmd, "authorized") == 0) {
             rc = cmd_authorized(c, s.account_id, o.prefix, &ok) || !ok;
         } else if (strcmp(cmd, "store") == 0 && i < argc) {
-            pdot_store_result res;
-            rc = cmd_store(c, &s, argv[i], &res);
+            pdot_cid root;
+            rc = cmd_store(c, &s, argv[i], o.chunk_size, &root);
         } else if (strcmp(cmd, "renew") == 0 && i < argc) {
             pdot_cid cid;
             if ((rc = pdot_cid_from_string(&cid, argv[i])))
@@ -362,18 +397,18 @@ int main(int argc, char **argv)
                 print_tx(&tx);
             }
         } else if (strcmp(cmd, "roundtrip") == 0 && i < argc) {
-            pdot_store_result res;
+            pdot_cid root;
             size_t got;
             print_account("account:        ", s.account_id, o.prefix);
             rc = cmd_authorized(c, s.account_id, o.prefix, &ok);
             if (!rc && !ok)
                 rc = 1;
             if (!rc)
-                rc = cmd_store(c, &s, argv[i], &res);
+                rc = cmd_store(c, &s, argv[i], o.chunk_size, &root);
             if (!rc)
-                rc = cmd_fetch(c, &res.cid, NULL, &got);
+                rc = cmd_fetch(c, &root, NULL, &got);
             if (!rc)
-                rc = cmd_renew(c, &s, &res.cid);
+                rc = cmd_renew(c, &s, &root);
             if (!rc)
                 printf("roundtrip ok\n");
         } else {

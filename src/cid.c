@@ -32,12 +32,17 @@ static int get_varint(const uint8_t *p, size_t len, size_t *pos, uint64_t *v)
 
 int pdot_cid_compute(pdot_cid *cid, const uint8_t *data, size_t len)
 {
+    return pdot_cid_compute_codec(cid, PDOT_CODEC_RAW, data, len);
+}
+
+int pdot_cid_compute_codec(pdot_cid *cid, uint64_t codec, const uint8_t *data, size_t len)
+{
     size_t n = 0;
 
     if (!cid || (!data && len))
         return PDOT_E_INVALID;
     cid->bytes[n++] = 0x01;
-    n += put_varint(cid->bytes + n, PDOT_CODEC_RAW);
+    n += put_varint(cid->bytes + n, codec);
     n += put_varint(cid->bytes + n, PDOT_MH_BLAKE2B_256);
     cid->bytes[n++] = 32;
     pdot_blake2b_256(cid->bytes + n, data, len);
@@ -62,6 +67,18 @@ static int cid_parse(const pdot_cid *cid, uint64_t *mh_code,
     *digest = cid->bytes + pos;
     *digest_len = (size_t)mlen;
     return 0;
+}
+
+uint64_t pdot_cid_codec(const pdot_cid *cid)
+{
+    size_t pos = 0;
+    uint64_t version, codec;
+
+    if (!cid || cid->len > PDOT_CID_MAX ||
+        get_varint(cid->bytes, cid->len, &pos, &version) || version != 1 ||
+        get_varint(cid->bytes, cid->len, &pos, &codec))
+        return 0;
+    return codec;
 }
 
 int pdot_cid_digest(const pdot_cid *cid, uint64_t *mh_code,

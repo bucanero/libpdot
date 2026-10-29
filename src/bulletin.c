@@ -6,6 +6,7 @@
 
 #include "pdot.h"
 #include "bulletin.h"
+#include "dag.h"
 #include "decode.h"
 #include "hash.h"
 #include "hex.h"
@@ -28,6 +29,47 @@ int pdot_bulletin_store_call(pdot_client *c, const pdot_metadata *md,
         return pdot_fail(c, PDOT_E_METADATA, "metadata has no " STORAGE_PALLET ".store(data)");
     pdot_scale_u8(out, pallet);
     pdot_scale_u8(out, call);
+    pdot_scale_bytes(out, data, len);
+    return out->err;
+}
+
+/*
+ * TransactionStorage.store_with_cid_config(cid: CidConfig { codec, hashing }, data),
+ * with Blake2b-256 hashing. CidConfig is encoded field by field from metadata.
+ */
+int pdot_bulletin_store_cid_call(pdot_client *c, const pdot_metadata *md, uint64_t codec,
+                                 const uint8_t *data, size_t len, pdot_buf *out)
+{
+    uint8_t pallet, call, prim, variant;
+    uint32_t args[2];
+    size_t nfields, ncfg = 0;
+    pdot_md_iter it;
+    pdot_md_field f;
+    int rc;
+
+    if (pdot_md_call_fields(md, STORAGE_PALLET, "store_with_cid_config", &pallet, &call,
+                            args, 2, &nfields) || nfields != 2 ||
+        pdot_md_iter_fields(md, args[0], &it))
+        return pdot_fail(c, PDOT_E_METADATA,
+                         "metadata has no " STORAGE_PALLET ".store_with_cid_config(cid, data)");
+    pdot_scale_u8(out, pallet);
+    pdot_scale_u8(out, call);
+    while ((rc = pdot_md_iter_next(&it, &f)) == 1) {
+        if (pdot_md_name_eq(f.name, f.name_len, "codec") &&
+            pdot_md_primitive(md, f.ty, &prim) == 0 && prim == 6 /* u64 */) {
+            pdot_scale_u64(out, codec);
+        } else if (pdot_md_name_eq(f.name, f.name_len, "hashing") &&
+                   pdot_md_variant(md, f.ty, "Blake2b256", &variant, &nfields) == 0 &&
+                   nfields == 0) {
+            pdot_scale_u8(out, variant);
+        } else {
+            return pdot_fail(c, PDOT_E_METADATA, "unexpected CidConfig field %.*s",
+                             (int)f.name_len, f.name);
+        }
+        ncfg++;
+    }
+    if (rc < 0 || ncfg != 2)
+        return pdot_fail(c, PDOT_E_METADATA, "CidConfig is not { codec, hashing }");
     pdot_scale_bytes(out, data, len);
     return out->err;
 }
@@ -189,8 +231,9 @@ static int submit_call(pdot_client *c, const pdot_signer *s, const pdot_tx_param
     return rc;
 }
 
-int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
-                        const uint8_t *data, size_t len, pdot_store_result *out)
+/* store, or store_with_cid_config for a codec other than raw. */
+static int store_codec(pdot_client *c, const pdot_signer *s, uint64_t codec,
+                       const uint8_t *data, size_t len, pdot_store_result *out)
 {
     pdot_tx_params p;
     pdot_buf call;
@@ -199,11 +242,14 @@ int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
     if (!c || !s || (!data && len) || !out)
         return PDOT_E_INVALID;
     memset(out, 0, sizeof *out);
-    pdot_cid_compute(&out->cid, data, len);
+    pdot_cid_compute_codec(&out->cid, codec, data, len);
     if ((rc = pdot_tx_params_fetch(c, s, &p)))
         return rc;
     pdot_buf_init(&call);
-    if (!(rc = pdot_bulletin_store_call(c, p.md, data, len, &call))) {
+    rc = codec == PDOT_CODEC_RAW
+        ? pdot_bulletin_store_call(c, p.md, data, len, &call)
+        : pdot_bulletin_store_cid_call(c, p.md, codec, data, len, &call);
+    if (!rc) {
         pdot_ext_outcome oc;
         memset(&oc, 0, sizeof oc);
         rc = submit_call(c, s, &p, &call, &out->tx, &oc);
@@ -211,6 +257,62 @@ int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
         out->storage_index = oc.stored_index;
     }
     pdot_buf_free(&call);
+    return rc;
+}
+
+int pdot_bulletin_store(pdot_client *c, const pdot_signer *s,
+                        const uint8_t *data, size_t len, pdot_store_result *out)
+{
+    return store_codec(c, s, PDOT_CODEC_RAW, data, len, out);
+}
+
+int pdot_bulletin_store_chunked(pdot_client *c, const pdot_signer *s,
+                                const uint8_t *data, size_t len, size_t chunk_size,
+                                pdot_progress_fn progress, void *ud,
+                                pdot_chunked_result *out)
+{
+    pdot_dag_link *links;
+    pdot_store_result r;
+    pdot_buf manifest;
+    size_t n, i;
+    int rc = 0;
+
+    if (!c || !s || !data || !out)
+        return PDOT_E_INVALID;
+    memset(out, 0, sizeof *out);
+    if (chunk_size == 0)
+        chunk_size = PDOT_CHUNK_SIZE_DEFAULT;
+    if (len == 0 || len > PDOT_FILE_SIZE_MAX || chunk_size > PDOT_CHUNK_SIZE_MAX)
+        return pdot_fail(c, PDOT_E_INVALID, "need 1 byte to %u MiB of data and chunks of at most %u MiB",
+                         PDOT_FILE_SIZE_MAX >> 20, PDOT_CHUNK_SIZE_MAX >> 20);
+    n = (len + chunk_size - 1) / chunk_size;
+    if (!(links = calloc(n, sizeof *links)))
+        return PDOT_E_NOMEM;
+
+    for (i = 0; i < n && !rc; i++) {
+        size_t off = i * chunk_size, clen = len - off < chunk_size ? len - off : chunk_size;
+        rc = store_codec(c, s, PDOT_CODEC_RAW, data + off, clen, &r);
+        if (!rc) {
+            links[i].cid = r.cid;
+            links[i].size = clen;
+            out->nchunks = i + 1;
+        }
+        if (progress)
+            progress(ud, i, n + 1, &r.cid, &r.tx, rc);
+    }
+    if (!rc) {
+        pdot_buf_init(&manifest);
+        if (!(rc = pdot_dag_encode(links, n, &manifest))) {
+            rc = store_codec(c, s, PDOT_CODEC_DAG_PB, manifest.data, manifest.len,
+                             &out->manifest);
+            out->root = out->manifest.cid;
+            if (progress)
+                progress(ud, n, n + 1, &out->manifest.cid, &out->manifest.tx, rc);
+        }
+        pdot_buf_free(&manifest);
+    }
+    out->size = len;
+    free(links);
     return rc;
 }
 
@@ -256,27 +358,28 @@ int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
     return rc;
 }
 
-int pdot_bulletin_fetch(pdot_client *c, const pdot_cid *cid,
-                        uint8_t **data, size_t *len)
+/*
+ * One block by CID, verified against it. Gateways are asked for the raw block
+ * (?format=raw), so a manifest comes back as itself, not as the assembled file.
+ */
+static int fetch_block(pdot_client *c, const pdot_cid *cid, uint8_t **data, size_t *len)
 {
     char cid_str[PDOT_CID_MAX * 2];
     int rc;
 
-    if (!c || !cid || !data || !len)
-        return PDOT_E_INVALID;
     *data = NULL;
     *len = 0;
     if ((rc = pdot_cid_to_string(cid, cid_str, sizeof cid_str)))
         return pdot_fail(c, rc, "invalid CID");
 
     if (c->gateway_url) {
-        size_t n = strlen(c->gateway_url) + strlen(cid_str) + 8;
+        size_t n = strlen(c->gateway_url) + strlen(cid_str) + 24;
         char *url = malloc(n);
         pdot_buf body;
 
         if (!url)
             return PDOT_E_NOMEM;
-        snprintf(url, n, "%s/ipfs/%s", c->gateway_url, cid_str);
+        snprintf(url, n, "%s/ipfs/%s?format=raw", c->gateway_url, cid_str);
         pdot_buf_init(&body);
         rc = pdot_http_request(c, url, NULL, 0, &body);
         free(url);
@@ -306,4 +409,101 @@ int pdot_bulletin_fetch(pdot_client *c, const pdot_cid *cid,
                          ? "retrieved data does not match %s" : "cannot verify %s", cid_str);
     }
     return 0;
+}
+
+/* Fetches and parses a dag-pb manifest. */
+static int fetch_manifest(pdot_client *c, const pdot_cid *root, pdot_dag_link **links,
+                          size_t *nlinks, uint64_t *size)
+{
+    uint8_t *block;
+    size_t len;
+    int rc;
+
+    if ((rc = fetch_block(c, root, &block, &len)))
+        return rc;
+    rc = pdot_dag_decode(block, len, links, nlinks, size);
+    free(block);
+    if (rc)
+        return pdot_fail(c, rc, "not a single-level UnixFS file manifest");
+    return 0;
+}
+
+int pdot_bulletin_fetch(pdot_client *c, const pdot_cid *cid,
+                        uint8_t **data, size_t *len)
+{
+    pdot_dag_link *links;
+    size_t nlinks, i, off = 0;
+    uint64_t size;
+    uint8_t *file;
+    int rc;
+
+    if (!c || !cid || !data || !len)
+        return PDOT_E_INVALID;
+    if (pdot_cid_codec(cid) != PDOT_CODEC_DAG_PB)
+        return fetch_block(c, cid, data, len);
+
+    *data = NULL;
+    *len = 0;
+    if ((rc = fetch_manifest(c, cid, &links, &nlinks, &size)))
+        return rc;
+    if (size > PDOT_FILE_SIZE_MAX) {
+        free(links);
+        return pdot_fail(c, PDOT_E_UNSUPPORTED, "file of %llu bytes exceeds %u MiB",
+                         (unsigned long long)size, PDOT_FILE_SIZE_MAX >> 20);
+    }
+    if (!(file = malloc(size ? (size_t)size : 1))) {
+        free(links);
+        return PDOT_E_NOMEM;
+    }
+    for (i = 0; i < nlinks && !rc; i++) {
+        uint8_t *chunk;
+        size_t clen;
+
+        if ((rc = fetch_block(c, &links[i].cid, &chunk, &clen)))
+            break;
+        /* The manifest's size is what the root CID commits to. */
+        if (clen != links[i].size)
+            rc = pdot_fail(c, PDOT_E_MISMATCH, "chunk %u is %zu bytes, manifest says %llu",
+                           (unsigned)i, clen, (unsigned long long)links[i].size);
+        else
+            memcpy(file + off, chunk, clen);
+        off += clen;
+        free(chunk);
+    }
+    free(links);
+    if (rc) {
+        free(file);
+        return rc;
+    }
+    *data = file;
+    *len = (size_t)size;
+    return 0;
+}
+
+int pdot_bulletin_renew_tree(pdot_client *c, const pdot_signer *s, const pdot_cid *root,
+                             pdot_progress_fn progress, void *ud)
+{
+    pdot_dag_link *links = NULL;
+    pdot_tx_result tx;
+    size_t nlinks = 0, i;
+    uint64_t size;
+    int rc = 0;
+
+    if (!c || !s || !root)
+        return PDOT_E_INVALID;
+    if (pdot_cid_codec(root) == PDOT_CODEC_DAG_PB &&
+        (rc = fetch_manifest(c, root, &links, &nlinks, &size)))
+        return rc;
+    for (i = 0; i < nlinks && !rc; i++) {
+        rc = pdot_bulletin_renew(c, s, &links[i].cid, &tx);
+        if (progress)
+            progress(ud, i, nlinks + 1, &links[i].cid, &tx, rc);
+    }
+    if (!rc) {
+        rc = pdot_bulletin_renew(c, s, root, &tx);
+        if (progress)
+            progress(ud, nlinks, nlinks + 1, root, &tx, rc);
+    }
+    free(links);
+    return rc;
 }

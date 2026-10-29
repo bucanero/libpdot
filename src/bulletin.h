@@ -11,6 +11,8 @@
 
 int pdot_bulletin_store_call(pdot_client *c, const pdot_metadata *md,
                              const uint8_t *data, size_t len, pdot_buf *out);
+int pdot_bulletin_store_cid_call(pdot_client *c, const pdot_metadata *md, uint64_t codec,
+                                 const uint8_t *data, size_t len, pdot_buf *out);
 int pdot_bulletin_renew_call(pdot_client *c, const pdot_metadata *md,
                              const uint8_t content_hash[32], pdot_buf *out);
 int pdot_bulletin_authorize_call(pdot_client *c, const pdot_metadata *md,

@@ -161,7 +161,18 @@ fn golden(path: &str) {
     );
     let key = subxt_core::storage::get_address_bytes(&auth, &state.metadata).unwrap();
     println!("static const char golden_auth_key_alice[] = \"{}\";", hex::encode(key));
-    for (name, call) in [("store", &store), ("force_renew", &renew)] {
+    let store_dagpb = subxt_core::dynamic::tx(
+        "TransactionStorage",
+        "store_with_cid_config",
+        vec![
+            Value::named_composite([
+                ("codec", Value::u128(0x70)),
+                ("hashing", Value::unnamed_variant("Blake2b256", [])),
+            ]),
+            Value::from_bytes(&data[..100]),
+        ],
+    );
+    for (name, call) in [("store", &store), ("force_renew", &renew), ("store_dagpb", &store_dagpb)] {
         let tx = subxt_core::tx::create_v4_signed(call, &state, params()).unwrap().sign(&signer);
         println!("static const char golden_{name}[] = \"{}\";", hex::encode(tx.into_encoded()));
     }
