@@ -22,6 +22,8 @@ static const char usage[] =
     "  renew CID               renew stored data, every chunk of a chunked file\n"
     "  fetch CID [OUT]         fetch and verify data (to OUT or stdout)\n"
     "  roundtrip FILE          authorized + store + fetch + verify + renew\n"
+    "  verify CID              prove CID is stored and retained (needs --relay ...)\n"
+    "  checkpoint [--at N]     create --checkpoint FILE from --relay, trusting it once\n"
     "  authorize ADDRESS TXS BYTES\n"
     "                          grant storage (signer must be a registered authorizer)\n"
     "\n"
@@ -33,13 +35,20 @@ static const char usage[] =
     "  --seed HEX              hex seed; PDOT_SEED in the environment also works\n"
     "  --prefix N              SS58 prefix for printed addresses (default 42)\n"
     "  --timeout MS            per-request timeout (default 60000)\n"
-    "  --chunk-size BYTES      always chunk, with this chunk size (max 2 MiB)\n";
+    "  --chunk-size BYTES      always chunk, with this chunk size (max 2 MiB)\n"
+    "\n"
+    "verification (results are proven, not taken from the RPC node):\n"
+    "  --relay URL             relay-chain RPC (Westend, Paseo, Polkadot)\n"
+    "  --para-id N             Bulletin parachain id: Westend 2487, Paseo 1501, Polkadot 1010\n"
+    "  --checkpoint FILE       trusted GRANDPA checkpoint; updated after each run\n";
 
 struct opts {
     const char *rpc, *gateway, *scheme, *seed_hex, *seed_file;
     unsigned prefix;
     long timeout;
     size_t chunk_size;   /* 0: chunk only above PDOT_CHUNK_SIZE_MAX */
+    const char *relay, *checkpoint;
+    unsigned para_id;
 };
 
 static int die(const char *what, int rc, const pdot_client *c)
@@ -174,6 +183,8 @@ static void print_tx(const pdot_tx_result *tx)
         printf("  dispatch:   FAILED: %s\n", tx->error);
     else
         printf("  dispatch:   unknown (block state unavailable)\n");
+    if (tx->verified)
+        printf("  verified:   yes, proven from relay-chain finality\n");
 }
 
 static int cmd_authorized(pdot_client *c, const uint8_t id[32], unsigned prefix, int *ok)
@@ -192,6 +203,8 @@ static int cmd_authorized(pdot_client *c, const uint8_t id[32], unsigned prefix,
         printf("  expires:      block #%u (now #%u)%s\n", a.expiration, a.now,
                a.now >= a.expiration ? ", EXPIRED" : "");
     }
+    if (a.verified)
+        printf("  verified:     yes, proven at final Bulletin #%u\n", a.now);
     return 0;
 }
 
@@ -233,6 +246,8 @@ static int cmd_store(pdot_client *c, const pdot_signer *s, const char *path,
         printf("stored %zu bytes as %zu chunks + manifest\n  cid:        %s\n",
                len, res.nchunks, cid);
         printf("  manifest:   #%u/%u\n", res.manifest.tx.block, res.manifest.tx.index);
+        if (res.manifest.tx.verified)
+            printf("  verified:   yes, every chunk and the manifest proven stored\n");
         *root = res.root;
         return 0;
     } else {
@@ -294,6 +309,69 @@ static int cmd_fetch(pdot_client *c, const pdot_cid *cid, const char *out, size_
     return 0;
 }
 
+static int cmd_verify(pdot_client *c, const pdot_cid *cid)
+{
+    pdot_storage_proof p;
+    char str[128];
+    int rc;
+
+    pdot_cid_to_string(cid, str, sizeof str);
+    if ((rc = pdot_bulletin_verify_cid(c, cid, &p)))
+        return die("verify", rc, c);
+    printf("stored:       %s\n", str);
+    printf("  block:        #%u, entry %u\n", p.block, p.index);
+    printf("  retained to:  #%u\n", p.expires);
+    printf("  proven at:    Bulletin #%u, final by relay #%u\n", p.proven_at, p.relay_block);
+    return 0;
+}
+
+static int write_file(const char *path, const uint8_t *data, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(data, 1, len, f) == len;
+
+    if (f && fclose(f) != 0)
+        ok = 0;
+    if (!ok)
+        perror(path);
+    return ok ? 0 : 1;
+}
+
+/* Loads --checkpoint and turns verification on. */
+static int setup_verifier(pdot_client *c, const struct opts *o)
+{
+    uint8_t *ck = NULL;
+    size_t len = 0;
+    int rc;
+
+    if (!o->checkpoint || !o->para_id) {
+        fprintf(stderr, "error: --relay needs --para-id and --checkpoint\n");
+        return 2;
+    }
+    if (read_file(o->checkpoint, &ck, &len)) {
+        fprintf(stderr, "hint: create one with: pdot-bulletin --relay %s --checkpoint %s checkpoint\n",
+                o->relay, o->checkpoint);
+        return 1;
+    }
+    rc = pdot_client_set_verifier(c, o->relay, o->para_id, ck, len);
+    free(ck);
+    return rc ? die("checkpoint", rc, c) : 0;
+}
+
+/* Saves the checkpoint back if verification advanced it. */
+static void save_checkpoint(pdot_client *c, const struct opts *o)
+{
+    uint8_t *ck, *old = NULL;
+    size_t len, old_len = 0;
+
+    if (!o->relay || pdot_client_checkpoint(c, &ck, &len))
+        return;
+    if (read_file(o->checkpoint, &old, &old_len) || old_len != len || memcmp(old, ck, len) != 0)
+        write_file(o->checkpoint, ck, len);
+    free(old);
+    pdot_free(ck);
+}
+
 static int parse_u32(const char *s, uint32_t *v)
 {
     char *end;
@@ -307,7 +385,8 @@ static int parse_u32(const char *s, uint32_t *v)
 
 int main(int argc, char **argv)
 {
-    struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0, 0 };
+    struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0, 0,
+                      NULL, NULL, 0 };
     pdot_client *c;
     pdot_signer s;
     const char *cmd;
@@ -331,6 +410,9 @@ int main(int argc, char **argv)
         else if (strcmp(k, "--prefix") == 0) o.prefix = (unsigned)strtoul(v, NULL, 10);
         else if (strcmp(k, "--timeout") == 0) o.timeout = strtol(v, NULL, 10);
         else if (strcmp(k, "--chunk-size") == 0) o.chunk_size = strtoul(v, NULL, 10);
+        else if (strcmp(k, "--relay") == 0) o.relay = v;
+        else if (strcmp(k, "--para-id") == 0) o.para_id = (unsigned)strtoul(v, NULL, 10);
+        else if (strcmp(k, "--checkpoint") == 0) o.checkpoint = v;
         else {
             fprintf(stderr, "error: unknown option %s\n%s", k, usage);
             return 2;
@@ -342,13 +424,49 @@ int main(int argc, char **argv)
     }
     cmd = argv[i++];
 
+    if (strcmp(cmd, "checkpoint") == 0) {
+        uint8_t *ck;
+        size_t len;
+        if (!o.relay || !o.checkpoint) {
+            fprintf(stderr, "error: checkpoint needs --relay and --checkpoint FILE\n");
+            return 2;
+        }
+        uint32_t at = 0;
+        if (i + 1 < argc && strcmp(argv[i], "--at") == 0 && parse_u32(argv[i + 1], &at)) {
+            fprintf(stderr, "error: --at needs a relay block number\n");
+            return 2;
+        }
+        fprintf(stderr, "trusting %s for the initial GRANDPA authority set\n", o.relay);
+        if ((rc = pdot_checkpoint_fetch_at(o.relay, at, &ck, &len)))
+            return die("checkpoint", rc, NULL);
+        rc = write_file(o.checkpoint, ck, len);
+        pdot_free(ck);
+        if (!rc)
+            printf("checkpoint written to %s (%zu bytes)\n", o.checkpoint, len);
+        return rc;
+    }
+
     if (!(c = pdot_client_new(o.rpc, o.gateway))) {
         fprintf(stderr, "error: cannot create client for %s\n", o.rpc);
         return 1;
     }
     pdot_client_set_timeout(c, o.timeout);
+    if (o.relay && (rc = setup_verifier(c, &o)) != 0) {
+        pdot_client_free(c);
+        return rc;
+    }
 
-    if (strcmp(cmd, "fetch") == 0 && i < argc) {
+    if (strcmp(cmd, "verify") == 0 && i < argc) {
+        pdot_cid cid;
+        if (!o.relay) {
+            fprintf(stderr, "error: verify needs --relay, --para-id and --checkpoint\n");
+            rc = 2;
+        } else if ((rc = pdot_cid_from_string(&cid, argv[i]))) {
+            rc = die("parsing CID", rc, NULL);
+        } else {
+            rc = cmd_verify(c, &cid);
+        }
+    } else if (strcmp(cmd, "fetch") == 0 && i < argc) {
         pdot_cid cid;
         if ((rc = pdot_cid_from_string(&cid, argv[i])))
             rc = die("parsing CID", rc, NULL);
@@ -417,6 +535,7 @@ int main(int argc, char **argv)
         }
         pdot_signer_wipe(&s);
     }
+    save_checkpoint(c, &o);
     pdot_client_free(c);
     return rc;
 }

@@ -22,6 +22,8 @@ struct pdot_client {
     uint32_t spec_version;
     uint32_t tx_version;
     pdot_metadata *md;         /* parsed for spec_version */
+
+    struct pdot_verifier *verifier;  /* NULL: RPC answers are trusted */
 };
 
 /* Records a message for pdot_last_error and returns code. */

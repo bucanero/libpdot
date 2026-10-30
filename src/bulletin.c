@@ -13,6 +13,7 @@
 #include "http.h"
 #include "rpc.h"
 #include "tx.h"
+#include "verify.h"
 
 #define STORAGE_PALLET "TransactionStorage"
 #define RENEWAL_PALLET "DataRenewal"
@@ -157,8 +158,12 @@ int pdot_bulletin_auth_key(pdot_client *c, const pdot_metadata *md,
     return 0;
 }
 
-int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
-                                pdot_authorization *out)
+/*
+ * Authorizations[account], from the RPC node, or with a verifier through a
+ * read proof in a final Bulletin block at or past min_block.
+ */
+static int read_authorization(pdot_client *c, const uint8_t account_id[32], uint32_t min_block,
+                              pdot_authorization *out)
 {
     static const struct { const char *path; int wide; size_t off; } fields[] = {
         { "extent.transactions", 0, offsetof(pdot_authorization, transactions) },
@@ -173,14 +178,23 @@ int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
     size_t len, i;
     int rc;
 
-    if (!c || !account_id || !out)
-        return PDOT_E_INVALID;
+    const pdot_header *head = NULL;
+
     memset(out, 0, sizeof *out);
-    if ((rc = pdot_chain_sync(c)) || (rc = pdot_rpc_best_number(c, &out->now)))
+    if ((rc = pdot_chain_sync(c)))
         return rc;
+    if (c->verifier) {
+        if ((rc = pdot_verify_para_head(c, min_block, &head)))
+            return rc;
+        out->now = head->number;
+        out->verified = 1;
+    } else if ((rc = pdot_rpc_best_number(c, &out->now))) {
+        return rc;
+    }
     pdot_buf_init(&key);
     if (!(rc = pdot_bulletin_auth_key(c, c->md, account_id, &key)))
-        rc = pdot_rpc_storage(c, key.data, key.len, &value, &len);
+        rc = head ? pdot_verify_read(c, head, key.data, key.len, &value, &len)
+                  : pdot_rpc_storage(c, key.data, key.len, &value, &len);
     pdot_buf_free(&key);
     if (rc == PDOT_E_NOTFOUND)
         return 0;
@@ -203,6 +217,14 @@ int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
     return rc;
 }
 
+int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
+                                pdot_authorization *out)
+{
+    if (!c || !account_id || !out)
+        return PDOT_E_INVALID;
+    return read_authorization(c, account_id, 0, out);
+}
+
 int pdot_bulletin_is_authorized(pdot_client *c, const uint8_t account_id[32],
                                 int *authorized)
 {
@@ -214,6 +236,135 @@ int pdot_bulletin_is_authorized(pdot_client *c, const uint8_t account_id[32],
     if ((rc = pdot_bulletin_authorization(c, account_id, &a)))
         return rc;
     *authorized = a.exists && a.now < a.expiration;
+    return 0;
+}
+
+/* ---- Proven reads (verifier) ------------------------------------------ */
+
+/* A storage-map key for one TransactionStorage entry, hashed as metadata says. */
+static int storage_key(pdot_client *c, const pdot_metadata *md, const char *entry,
+                       const uint8_t *k, size_t klen, pdot_md_storage *st, pdot_buf *key)
+{
+    uint8_t h[16];
+
+    if (pdot_md_storage_entry(md, STORAGE_PALLET, entry, st))
+        return pdot_fail(c, PDOT_E_METADATA, "metadata has no " STORAGE_PALLET ".%s", entry);
+    pdot_twox128(h, st->prefix, st->prefix_len);
+    pdot_scale_raw(key, h, 16);
+    pdot_twox128(h, entry, strlen(entry));
+    pdot_scale_raw(key, h, 16);
+    if (k && (st->nhashers != 1 || hash_key(key, st->hashers[0], k, klen)))
+        return pdot_fail(c, PDOT_E_METADATA, STORAGE_PALLET ".%s has an unexpected key", entry);
+    return key->err;
+}
+
+/* Reads an unsigned integer field (or a whole value when path is "") of a proven value. */
+static int proven_uint(const pdot_metadata *md, uint32_t ty, const uint8_t *v, size_t len,
+                       const char *path, uint64_t *out)
+{
+    pdot_reader r;
+
+    if (*path)
+        return pdot_decode_path_uint(md, ty, v, len, path, out);
+    pdot_reader_init(&r, v, len);
+    return pdot_decode_uint(md, ty, &r, out);
+}
+
+/*
+ * Proves TransactionByContentHash[digest] = (block, index) in a final
+ * Bulletin block at or past min_block, and the retention period with it.
+ */
+static int prove_stored(pdot_client *c, const uint8_t digest[32], uint32_t min_block,
+                        pdot_storage_proof *out)
+{
+    const pdot_header *head;
+    pdot_md_storage st, rst;
+    pdot_buf key;
+    uint8_t *v;
+    size_t vlen;
+    uint64_t block = 0, index = 0, retention = 0;
+    pdot_md_field f[2];
+    size_t nf;
+    int rc;
+
+    memset(out, 0, sizeof *out);
+    if ((rc = pdot_chain_sync(c)) || (rc = pdot_verify_para_head(c, min_block, &head)))
+        return rc;
+    out->proven_at = head->number;
+    out->relay_block = c->verifier->head_relay;
+
+    pdot_buf_init(&key);
+    if (!(rc = storage_key(c, c->md, "TransactionByContentHash", digest, 32, &st, &key)))
+        rc = pdot_verify_read(c, head, key.data, key.len, &v, &vlen);
+    pdot_buf_free(&key);
+    if (rc == PDOT_E_NOTFOUND)
+        return pdot_fail(c, rc, "proven: not stored as of Bulletin #%u", head->number);
+    if (rc)
+        return rc;
+    /* (BlockNumber, u32) */
+    if (pdot_md_fields(c->md, st.value_ty, f, 2, &nf) || nf != 2) {
+        free(v);
+        return pdot_fail(c, PDOT_E_METADATA, "TransactionByContentHash is not (block, index)");
+    }
+    {
+        pdot_reader r;
+        pdot_reader_init(&r, v, vlen);
+        rc = pdot_decode_uint(c->md, f[0].ty, &r, &block) ||
+             pdot_decode_uint(c->md, f[1].ty, &r, &index);
+    }
+    free(v);
+    if (rc || block > UINT32_MAX || index > UINT32_MAX)
+        return pdot_fail(c, PDOT_E_UNVERIFIED, "proven TransactionByContentHash does not decode");
+    out->block = (uint32_t)block;
+    out->index = (uint32_t)index;
+
+    pdot_buf_init(&key);
+    if (!(rc = storage_key(c, c->md, "RetentionPeriod", NULL, 0, &rst, &key))) {
+        rc = pdot_verify_read(c, head, key.data, key.len, &v, &vlen);
+        if (rc == 0) {
+            rc = proven_uint(c->md, rst.value_ty, v, vlen, "", &retention);
+            free(v);
+        } else if (rc == PDOT_E_NOTFOUND) {
+            rc = 0;  /* ValueQuery: absent means the default, 0 */
+        }
+    }
+    pdot_buf_free(&key);
+    if (rc)
+        return rc;
+    out->expires = out->block + (uint32_t)retention;
+    return 0;
+}
+
+int pdot_bulletin_verify_cid(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out)
+{
+    const uint8_t *digest;
+    size_t dlen;
+    uint64_t code;
+
+    if (!c || !cid || !out)
+        return PDOT_E_INVALID;
+    if (!c->verifier)
+        return pdot_fail(c, PDOT_E_INVALID, "no verifier set");
+    if (pdot_cid_digest(cid, &code, &digest, &dlen) || dlen != 32)
+        return pdot_fail(c, PDOT_E_INVALID, "CID needs a 32-byte digest");
+    return prove_stored(c, digest, 0, out);
+}
+
+/* After a store or renew at tx->block: the proven newest copy is at least that new. */
+static int verify_tx_stored(pdot_client *c, const uint8_t *digest, pdot_tx_result *tx)
+{
+    pdot_storage_proof p;
+    int rc;
+
+    if (!c->verifier)
+        return 0;
+    if ((rc = prove_stored(c, digest, tx->block, &p)))
+        return rc == PDOT_E_NOTFOUND ? pdot_fail(c, PDOT_E_UNVERIFIED, "%s", c->err) : rc;
+    if (p.block < tx->block)
+        return pdot_fail(c, PDOT_E_UNVERIFIED,
+                         "proven newest copy is at Bulletin #%u, before this transaction's #%u",
+                         p.block, tx->block);
+    tx->verified = 1;
     return 0;
 }
 
@@ -257,6 +408,8 @@ static int store_codec(pdot_client *c, const pdot_signer *s, uint64_t codec,
         out->storage_index = oc.stored_index;
     }
     pdot_buf_free(&call);
+    if (!rc)
+        rc = verify_tx_stored(c, out->cid.bytes + out->cid.len - 32, &out->tx);
     return rc;
 }
 
@@ -336,6 +489,8 @@ int pdot_bulletin_renew(pdot_client *c, const pdot_signer *s,
     if (!(rc = pdot_bulletin_renew_call(c, p.md, digest, &call)))
         rc = submit_call(c, s, &p, &call, out, NULL);
     pdot_buf_free(&call);
+    if (!rc)
+        rc = verify_tx_stored(c, digest, out);
     return rc;
 }
 
@@ -355,6 +510,14 @@ int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
     if (!(rc = pdot_bulletin_authorize_call(c, p.md, who, transactions, bytes, &call)))
         rc = submit_call(c, s, &p, &call, out, NULL);
     pdot_buf_free(&call);
+    if (!rc && c->verifier) {
+        pdot_authorization a;
+        if ((rc = read_authorization(c, who, out->block, &a)))
+            return rc;
+        if (!a.exists || a.now >= a.expiration)
+            return pdot_fail(c, PDOT_E_UNVERIFIED, "proven: no active authorization after the grant");
+        out->verified = 1;
+    }
     return rc;
 }
 

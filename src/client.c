@@ -18,6 +18,7 @@
 #include "http.h"
 #include "rpc.h"
 #include "scale.h"
+#include "verify.h"
 
 static char *dup_url(const char *s)
 {
@@ -64,6 +65,7 @@ void pdot_client_free(pdot_client *c)
     if (!c)
         return;
     pdot_http_free(c);
+    pdot_verifier_free(c->verifier);
     pdot_metadata_free(c->md);
     free(c->rpc_url);
     free(c->gateway_url);
@@ -77,8 +79,11 @@ const char *pdot_last_error(const pdot_client *c)
 
 void pdot_client_set_timeout(pdot_client *c, long timeout_ms)
 {
-    if (c && timeout_ms > 0)
+    if (c && timeout_ms > 0) {
         c->timeout_ms = timeout_ms;
+        if (c->verifier)
+            c->verifier->relay->timeout_ms = timeout_ms;
+    }
 }
 
 void pdot_sleep_ms(unsigned ms)

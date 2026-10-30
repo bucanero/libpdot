@@ -35,6 +35,7 @@ extern "C" {
 #define PDOT_E_TIMEOUT     (-13) /* e.g. not included within the mortality window */
 #define PDOT_E_METADATA    (-14) /* metadata lacks or changes something we need */
 #define PDOT_E_DISPATCH    (-15) /* included, but the call failed (see error) */
+#define PDOT_E_UNVERIFIED  (-16) /* a proof from an RPC node did not verify */
 
 const char *pdot_strerror(int err);
 
@@ -56,6 +57,34 @@ void         pdot_client_free(pdot_client *c);
 const char  *pdot_last_error(const pdot_client *c);
 /* Per-request timeout; default 60 s. */
 void         pdot_client_set_timeout(pdot_client *c, long timeout_ms);
+
+/* ---- Verification without trusting RPC nodes -------------------------
+
+   With a verifier set, libpdot proves what it reports instead of believing
+   the RPC node: relay-chain finality from GRANDPA signatures, the Bulletin
+   block from the relay chain's Paras::Heads, and Bulletin storage from read
+   proofs. It starts from a checkpoint (a trusted GRANDPA authority set) and
+   advances it through authority-set changes; save it again with
+   pdot_client_checkpoint so later runs start from there.
+
+   Still trusted: the runtime metadata used to encode calls and to decode
+   proven values, and the RPC nodes' liveness (they can refuse to answer). */
+
+/*
+ * Builds a checkpoint from a relay node's newest final block, TRUSTING that
+ * node once. Ship the result with your app, or create it from a node you
+ * trust. *blob is freed with pdot_free.
+ */
+int pdot_checkpoint_fetch(const char *relay_url, uint8_t **blob, size_t *len);
+/* Same, anchored at a given final relay block (0: the newest). */
+int pdot_checkpoint_fetch_at(const char *relay_url, uint32_t block, uint8_t **blob, size_t *len);
+
+/* Turns verification on: relay_url is the relay chain's RPC, para_id the Bulletin chain's. */
+int pdot_client_set_verifier(pdot_client *c, const char *relay_url, uint32_t para_id,
+                             const uint8_t *checkpoint, size_t len);
+
+/* The current checkpoint, advanced past any set changes seen; save it. */
+int pdot_client_checkpoint(pdot_client *c, uint8_t **blob, size_t *len);
 
 /* ---- Signers -------------------------------------------------------- */
 
@@ -153,6 +182,7 @@ typedef struct {
     uint32_t index;      /* extrinsic index in the block */
     int      dispatch;   /* PDOT_DISPATCH_* */
     char     error[96];  /* "Pallet.Error" when dispatch failed */
+    int      verified;   /* 1: the effect was proven (needs a verifier) */
 } pdot_tx_result;
 
 typedef struct {
@@ -170,8 +200,18 @@ typedef struct {
     uint64_t bytes;                   /* used */
     uint64_t bytes_allowance;
     uint32_t expiration;              /* expired once the chain reaches this block */
-    uint32_t now;                     /* best block when read */
+    uint32_t now;                     /* best block when read, or the proven block */
+    int      verified;                /* 1: read through a proof (needs a verifier) */
 } pdot_authorization;
+
+/* Where data is stored, proven from chain state. */
+typedef struct {
+    uint32_t block;        /* Bulletin block of the newest stored copy */
+    uint32_t index;        /* its position in that block's stored transactions */
+    uint32_t expires;      /* retained until this block (block + RetentionPeriod) */
+    uint32_t proven_at;    /* final Bulletin block whose state was proven */
+    uint32_t relay_block;  /* relay block whose GRANDPA finality anchors the proof */
+} pdot_storage_proof;
 
 /* Reads and decodes the account's authorization, if any. */
 int pdot_bulletin_authorization(pdot_client *c, const uint8_t account_id[32],
@@ -243,6 +283,13 @@ int pdot_bulletin_renew_tree(pdot_client *c, const pdot_signer *s, const pdot_ci
 int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
                                     const uint8_t who[32], uint32_t transactions,
                                     uint64_t bytes, pdot_tx_result *out);
+
+/*
+ * Proves that the data behind cid is stored on the Bulletin chain and still
+ * retained, without trusting the RPC nodes. Needs a verifier.
+ * PDOT_E_NOTFOUND when the proof shows it is not stored.
+ */
+int pdot_bulletin_verify_cid(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out);
 
 /*
  * Fetches data by CID from the gateway, or from the node when the client has

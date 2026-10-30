@@ -21,6 +21,7 @@ pdot_bulletin_fetch(c, &res.cid, &bytes, &n);       /* verified against the CID 
 - **Renew** stored data before its retention period (about 14 days on testnets) runs out.
 - **Check and grant storage authorizations**: allowances, usage and expiry.
 - **Sign** with sr25519 (what Polkadot wallets use) or ECDSA secp256k1, or plug in your own signer: a hardware wallet, a secure enclave or a remote service.
+- **Prove results without trusting the RPC node** (optional): a built-in relay-chain light client checks GRANDPA finality signatures and storage proofs, so "stored", "renewed" and "authorized" are facts, not the node's word.
 - **Report what happened on chain**: the block and position of every transaction, and whether it succeeded. Failures come back by name, such as `TransactionStorage.BadDataSize`.
 
 Under the hood it builds and signs Substrate transactions from the chain's own metadata (v14/v15). Runtime upgrades that change call indices or transaction extensions are picked up automatically.
@@ -157,6 +158,44 @@ if (pdot_cid_verify(&cid, bytes, len) == 0) {
 }
 ```
 
+### Verify instead of trusting the node
+
+By default libpdot believes what the RPC node says about chain state. Give the client a **verifier** and it proves it instead:
+
+1. Relay-chain finality, from GRANDPA signatures by 2/3 of the validator set, following validator-set changes from a checkpoint.
+2. The Bulletin block, from the relay chain's record of parachain heads (`Paras::Heads`).
+3. Bulletin storage, from Merkle read proofs against that block.
+
+```c
+uint8_t *ck; size_t ck_len;           /* a checkpoint: load it from your app's files */
+pdot_client_set_verifier(c, "https://rpc.polkadot.io", 1010 /* Bulletin para id */, ck, ck_len);
+
+pdot_storage_proof p;
+if (pdot_bulletin_verify_cid(c, &cid, &p) == 0)
+    printf("stored at block #%u, retained until #%u\n", p.block, p.expires);
+
+/* store/renew/authorize now set res.tx.verified, or fail with PDOT_E_UNVERIFIED */
+pdot_client_checkpoint(c, &ck, &ck_len);   /* save it: later runs start from here */
+```
+
+The **checkpoint** is the one thing you must trust: a GRANDPA validator set at some relay block, a few KB. Create it once from a node you trust and ship it with your app; libpdot advances it through validator-set changes (one every few hours) and hands the newer one back for you to save. `pdot_checkpoint_fetch` creates one, trusting the given node for that call only.
+
+| Network | Relay RPC | Bulletin para id |
+| --- | --- | --- |
+| Polkadot | `https://rpc.polkadot.io` | 1010 |
+| Paseo (TestNet) | `https://pas-rpc.stakeworld.io` | 1501 |
+| Westend (TestNet) | `https://westend-rpc.polkadot.io` | 2487 |
+
+From the command line:
+
+```sh
+pdot-bulletin --relay https://rpc.polkadot.io --checkpoint dot.ck checkpoint     # once
+pdot-bulletin --rpc https://bulletin-rpc.polkadot.io --relay https://rpc.polkadot.io \
+              --para-id 1010 --checkpoint dot.ck verify <cid>
+```
+
+A proof costs a few KB to about 60 KB and 1 to 20 ms of signature checks on a desktop, depending on the network's validator count (Polkadot has 600). Still trusted with a verifier: the runtime metadata used to build transactions, and the nodes' willingness to answer. A node can refuse or stall, but it can no longer lie undetected.
+
 ### API overview
 
 | Area | Functions |
@@ -166,6 +205,7 @@ if (pdot_cid_verify(&cid, bytes, len) == 0) {
 | Addresses | `pdot_ss58_encode`, `pdot_ss58_decode` |
 | Content IDs | `pdot_cid_compute`, `pdot_cid_compute_codec`, `pdot_cid_verify`, `pdot_cid_to_string`, `pdot_cid_from_string`, `pdot_cid_codec`, `pdot_cid_digest` |
 | Authorizations | `pdot_bulletin_authorization`, `pdot_bulletin_is_authorized`, `pdot_bulletin_authorize_account` |
+| Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
 
 ### Things to know
@@ -173,7 +213,7 @@ if (pdot_cid_verify(&cid, bytes, len) == 0) {
 - **Calls block.** A store waits for finalization, a few seconds to a minute. In a game or GUI, call libpdot from a worker thread.
 - **Threads:** use one `pdot_client` per thread. Signers can be shared. The random number generator is seeded once and is thread-safe.
 - **Memory:** buffers the library returns are freed with `pdot_free`. Call `pdot_signer_wipe` when you're done with a key.
-- **Trust:** the RPC node is trusted to report chain state, such as authorizations and inclusion. Retrieved data is never trusted; it's always checked against its CID.
+- **Trust:** without a verifier, the RPC node is trusted to report chain state, such as authorizations and inclusion. With one, those are proven (see above). Retrieved data is never trusted; it's always checked against its CID.
 - **Networks:** any Bulletin node that answers JSON-RPC over HTTP works. `ws://` and `wss://` URLs are accepted and converted to HTTP.
 
 | Network | RPC endpoint |
@@ -201,6 +241,7 @@ target_link_libraries(my_game PRIVATE pdot)
 | `PDOT_BUILD_EXAMPLES` | `ON` | Programs in `examples/` |
 | `PDOT_SANITIZE` | `OFF` | Build with ASan and UBSan |
 | `PDOT_WERROR` | `OFF` | Warnings in libpdot's own code are errors (CI uses this) |
+| `PDOT_WITH_VERIFY` | `ON` | Relay-chain light client for verified results (needs `PDOT_WITH_SR25519`) |
 | `PDOT_FUZZ` | `OFF` | libFuzzer targets (clang) |
 
 ## How it is tested
@@ -210,6 +251,7 @@ Every layer is checked against Parity's own implementations before it touches a 
 - **Signatures:** against [sp-core](https://crates.io/crates/sp-core), in both directions for sr25519 and byte for byte for ECDSA.
 - **Transactions:** against [subxt](https://github.com/paritytech/subxt), byte for byte.
 - **Event decoding:** against subxt, on events from Paseo blocks.
+- **Verification:** GRANDPA justifications, validator-set handovers and storage proofs recorded from Paseo and Polkadot mainnet, plus tampered copies that must fail. [`tools/record-proofs.c`](tools/record-proofs.c) re-records them.
 - **Chunked-file manifests:** against the JavaScript libraries the Bulletin TypeScript SDK uses.
 
 [`tools/fixtures-gen`](tools/fixtures-gen) regenerates those fixtures. It is a separate Rust program; the C build never needs Rust.
@@ -217,8 +259,9 @@ Every layer is checked against Parity's own implementations before it touches a 
 [CI](.github/workflows/ci.yml) runs these jobs on every push:
 - gcc and clang, each with and without AddressSanitizer and UBSan;
 - arm64, 32-bit ARM and big-endian s390x under QEMU;
-- libFuzzer on the metadata, event and manifest parsers;
-- an end-to-end run against a dev node and an IPFS gateway.
+- libFuzzer on the metadata, event, manifest and proof parsers;
+- an end-to-end run against a dev node and an IPFS gateway;
+- nightly, read-only verification against live Paseo and Polkadot ([`ci/verify-live.sh`](ci/verify-live.sh)).
 
 Every job runs in a container, so you can reproduce one locally with Docker:
 
@@ -231,7 +274,8 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 ## Limitations
 
 - Bulletin Chain only. There is no general API for other pallets or for balance transfers yet.
-- Reading chain state relies on the RPC node. There is no light client or storage-proof verification.
+- Verification proves storage, renewals and authorizations, but not the outcome of arbitrary transactions; transaction building still trusts the node's metadata.
+- Verification needs a relay chain that has changed its GRANDPA validator set at least once: until then, nodes cannot serve `grandpa_proveFinality`. Every public network has; a fresh local relay chain has not. [`tools/e2e-relay.sh`](tools/e2e-relay.sh) schedules a change at block 1 for that reason.
 - Chunks upload one at a time, so a 64 MiB file takes about 65 transactions.
 - Polkadot mainnet is not supported; its Bulletin authorization model is not final.
 - Not tested on Windows or macOS CI. The library builds and runs on macOS.

@@ -12,6 +12,7 @@ option(PDOT_FUZZ         "Build libFuzzer targets (clang)" OFF)
 option(PDOT_WERROR       "Treat warnings in libpdot's own code as errors" OFF)
 option(PDOT_WITH_SR25519 "Build the sr25519 signer (sr25519-donna)" ON)
 option(PDOT_WITH_ECDSA   "Build the ECDSA secp256k1 signer (mbedTLS)" ON)
+option(PDOT_WITH_VERIFY  "Relay-chain light client: verify results without trusting RPC nodes" ON)
 option(PDOT_SR25519_FORCE_32BIT "Use sr25519-donna's 32-bit field arithmetic" OFF)
 
 # mbedTLS 3.6 LTS. On macOS: -DCMAKE_PREFIX_PATH=$(brew --prefix mbedtls@3)
@@ -57,12 +58,17 @@ set_target_properties(pdot_blake2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(PDOT_WITH_SR25519)
   include(cmake/PatchSr25519.cmake)  # sets SR25519_DIR
-  add_library(pdot_sr25519 OBJECT
+  set(PDOT_SR25519_SOURCES
     ${SR25519_DIR}/sr25519.c
     ${SR25519_DIR}/merlin.c
     ${SR25519_DIR}/ristretto255.c
     ${SR25519_DIR}/memzero.c
     ${SR25519_DIR}/vrf.c)
+  if(PDOT_WITH_VERIFY)
+    # ed25519 verification for GRANDPA, from the same donna code and hooks.
+    list(APPEND PDOT_SR25519_SOURCES ${SR25519_DIR}/ed25519-donna/ed25519.c)
+  endif()
+  add_library(pdot_sr25519 OBJECT ${PDOT_SR25519_SOURCES})
   target_include_directories(pdot_sr25519 PUBLIC ${SR25519_DIR})
   # Hash and RNG hooks come from our header, force-included, so the
   # submodule's placeholder hook headers stay untouched.
@@ -112,6 +118,14 @@ if(PDOT_WITH_SR25519)
   target_include_directories(pdot SYSTEM PRIVATE ${SR25519_DIR})
   target_compile_definitions(pdot PUBLIC PDOT_WITH_SR25519)
 endif()
+if(PDOT_WITH_VERIFY)
+  if(NOT PDOT_WITH_SR25519)
+    message(FATAL_ERROR "PDOT_WITH_VERIFY needs PDOT_WITH_SR25519 (for ed25519-donna)")
+  endif()
+  target_sources(pdot PRIVATE src/trie.c src/grandpa.c src/verify.c)
+  target_include_directories(pdot SYSTEM PRIVATE ${SR25519_DIR}/ed25519-donna)
+  target_compile_definitions(pdot PUBLIC PDOT_WITH_VERIFY)
+endif()
 if(PDOT_WITH_ECDSA)
   target_sources(pdot PRIVATE src/signer_ecdsa.c)
   target_compile_definitions(pdot PUBLIC PDOT_WITH_ECDSA)
@@ -136,8 +150,20 @@ if(PDOT_BUILD_EXAMPLES AND PDOT_WITH_SR25519)
   endforeach()
 endif()
 
+if(PDOT_WITH_VERIFY AND PDOT_BUILD_TESTS)
+  # Maintenance tool: records live proofs into tests/fixtures/verify-*.json.
+  add_executable(record_proofs tools/record-proofs.c)
+  target_include_directories(record_proofs PRIVATE src third_party/blake2)
+  target_link_libraries(record_proofs PRIVATE pdot ${PDOT_CJSON})
+  target_compile_options(record_proofs PRIVATE ${PDOT_WARNINGS})
+endif()
+
 if(PDOT_FUZZ)
-  foreach(f metadata decode)
+  set(PDOT_FUZZ_TARGETS metadata decode)
+  if(PDOT_WITH_VERIFY)
+    list(APPEND PDOT_FUZZ_TARGETS proof)
+  endif()
+  foreach(f ${PDOT_FUZZ_TARGETS})
     add_executable(fuzz_${f} fuzz/fuzz_${f}.c)
     target_link_libraries(fuzz_${f} PRIVATE pdot)
     target_include_directories(fuzz_${f} PRIVATE src third_party/blake2)
@@ -151,6 +177,9 @@ if(PDOT_BUILD_TESTS)
   set(PDOT_TESTS scale hash cid ss58 metadata events dag)
   if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
     list(APPEND PDOT_TESTS signer tx)
+  endif()
+  if(PDOT_WITH_VERIFY)
+    list(APPEND PDOT_TESTS verify)
   endif()
   foreach(t ${PDOT_TESTS})
     add_executable(test_${t} tests/test_${t}.c)

@@ -73,3 +73,15 @@ jobs:
         with:
           submodules: recursive
       - run: ci/in-docker.sh linux/amd64 ci/e2e.sh
+
+  verify-live:
+    name: verify (live networks)
+    # Public endpoints can be flaky: nightly and on demand, never per push.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: ci/in-docker.sh linux/amd64 ci/verify-live.sh

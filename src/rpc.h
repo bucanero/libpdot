@@ -8,6 +8,8 @@
 #include <cjson/cJSON.h>
 
 #include "client.h"
+#include "scale.h"
+#include "trie.h"
 
 /*
  * Calls method with params (a JSON array, consumed; NULL means []). On
@@ -37,6 +39,16 @@ int pdot_rpc_storage_at(pdot_client *c, const uint8_t *key, size_t key_len,
                         const uint8_t at[32], uint8_t **value, size_t *value_len);
 /* Number of the best (not necessarily finalized) block. */
 int pdot_rpc_best_number(pdot_client *c, uint32_t *number);
+/* state_call at a given block. */
+int pdot_rpc_state_call_at(pdot_client *c, const char *fn, const uint8_t *args, size_t args_len,
+                           const uint8_t at[32], uint8_t **out, size_t *out_len);
+/* chain_getHeader(hash), re-encoded to SCALE so its hash can be checked. */
+int pdot_rpc_header(pdot_client *c, const uint8_t hash[32], pdot_buf *encoded);
+/* state_getReadProof([key], at). Node hashes are computed. */
+int pdot_rpc_read_proof(pdot_client *c, const uint8_t *key, size_t key_len,
+                        const uint8_t at[32], pdot_trie_proof *proof);
+/* grandpa_proveFinality(number): an encoded FinalityProof, or PDOT_E_NOTFOUND. */
+int pdot_rpc_prove_finality(pdot_client *c, uint32_t number, uint8_t **proof, size_t *len);
 int pdot_rpc_state_call(pdot_client *c, const char *fn, const uint8_t *args,
                         size_t args_len, uint8_t **out, size_t *out_len);
 /* Extrinsics of a block, as returned by chain_getBlock (cJSON array of hex). */
