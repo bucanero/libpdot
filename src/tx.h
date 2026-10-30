@@ -23,6 +23,7 @@ typedef struct {
     uint32_t era_period;        /* 0: immortal */
     uint32_t era_block;         /* mortality checkpoint */
     uint8_t  era_block_hash[32];
+    const uint8_t *metadata_hash; /* CheckMetadataHash: NULL signs with Mode::Disabled */
 } pdot_tx_params;
 
 /* Two-byte mortal Era for a transaction checkpointed at block `current`. */

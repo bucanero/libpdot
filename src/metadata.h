@@ -27,6 +27,7 @@ typedef struct {
     size_t      storage_off;  /* offset of the storage prefix; 0 if none */
     int         has_error;
     uint32_t    error_ty;     /* the pallet's Error enum */
+    size_t      constants_off; /* offset of the constants Vec */
 } pdot_md_pallet;
 
 /* A field of a composite type or enum variant; name is empty if unnamed. */
@@ -134,6 +135,10 @@ int pdot_md_primitive(const pdot_metadata *md, uint32_t ty, uint8_t *prim);
 
 int pdot_md_storage_entry(const pdot_metadata *md, const char *pallet,
                           const char *entry, pdot_md_storage *out);
+
+/* Encoded value of constant pallet.name, pointing into the metadata copy. */
+int pdot_md_constant(const pdot_metadata *md, const char *pallet, const char *name,
+                     const uint8_t **value, size_t *len);
 
 /* Positions r at the TypeDef of ty and returns its kind. */
 int pdot_md_typedef(const pdot_metadata *md, uint32_t ty, pdot_reader *r,

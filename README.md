@@ -21,7 +21,7 @@ pdot_bulletin_fetch(c, &res.cid, &bytes, &n);       /* verified against the CID 
 - **Renew** stored data before its retention period (about 14 days on testnets) runs out.
 - **Check and grant storage authorizations**: allowances, usage and expiry.
 - **Sign** with sr25519 (what Polkadot wallets use) or ECDSA secp256k1, or plug in your own signer: a hardware wallet, a secure enclave or a remote service.
-- **Prove results without trusting the RPC node** (optional): a built-in relay-chain light client checks GRANDPA finality signatures and storage proofs, so "stored", "renewed" and "authorized" are facts, not the node's word.
+- **Prove results without trusting the RPC node** (optional): a built-in relay-chain light client checks GRANDPA finality signatures and storage proofs, so "stored", "renewed" and "authorized" are facts, not the node's word. Signing over an RFC-0078 metadata hash means a node can't trick you into signing a different call either.
 - **Report what happened on chain**: the block and position of every transaction, and whether it succeeded. Failures come back by name, such as `TransactionStorage.BadDataSize`.
 
 Under the hood it builds and signs Substrate transactions from the chain's own metadata (v14/v15). Runtime upgrades that change call indices or transaction extensions are picked up automatically.
@@ -194,7 +194,17 @@ pdot-bulletin --rpc https://bulletin-rpc.polkadot.io --relay https://rpc.polkado
               --para-id 1010 --checkpoint dot.ck verify <cid>
 ```
 
-A proof costs a few KB to about 60 KB and 1 to 20 ms of signature checks on a desktop, depending on the network's validator count (Polkadot has 600). Still trusted with a verifier: the runtime metadata used to build transactions, and the nodes' willingness to answer. A node can refuse or stall, but it can no longer lie undetected.
+A proof costs a few KB to about 60 KB and 1 to 20 ms of signature checks on a desktop, depending on the network's validator count (Polkadot has 600). Still trusted with a verifier: the nodes' willingness to answer. A node can refuse or stall, but it can no longer lie undetected. Turn on the metadata hash too (next section), so the metadata used to build transactions isn't trusted either.
+
+### Sign over the metadata
+
+Transactions are built from the chain's metadata, which comes from the RPC node. A node that serves altered metadata could make you sign a different call than the one you meant. With the metadata hash on, the signature also covers an [RFC-0078](https://polkadot-fellows.github.io/RFCs/approved/0078-merkleized-metadata.html) hash of that metadata, and the runtime checks it against the hash it was built with (`CheckMetadataHash`). Altered metadata then gets the transaction rejected, never run.
+
+```c
+pdot_client_set_metadata_hash(c, 1, NULL, -1);   /* on; token from the node's properties */
+```
+
+The hash also covers the token symbol and decimals the runtime was built with. On the public Bulletin chains these match the node's `system_properties`, so `NULL, -1` is right. A local chain spec may differ: pass the values explicitly (`"WND", 12` for the Westend runtime). A wrong value can only get transactions rejected, with a "bad signature" error that says so. The hash takes about 5 ms to compute and is cached until the next runtime upgrade. The command-line tool turns it on by default (`--metadata-hash on|off|SYMBOL:DECIMALS`), and `pdot-bulletin metadata-hash` prints it.
 
 ### API overview
 
@@ -205,6 +215,7 @@ A proof costs a few KB to about 60 KB and 1 to 20 ms of signature checks on a de
 | Addresses | `pdot_ss58_encode`, `pdot_ss58_decode` |
 | Content IDs | `pdot_cid_compute`, `pdot_cid_compute_codec`, `pdot_cid_verify`, `pdot_cid_to_string`, `pdot_cid_from_string`, `pdot_cid_codec`, `pdot_cid_digest` |
 | Authorizations | `pdot_bulletin_authorization`, `pdot_bulletin_is_authorized`, `pdot_bulletin_authorize_account` |
+| Metadata hash | `pdot_client_set_metadata_hash`, `pdot_client_metadata_hash` |
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
 
@@ -213,7 +224,7 @@ A proof costs a few KB to about 60 KB and 1 to 20 ms of signature checks on a de
 - **Calls block.** A store waits for finalization, a few seconds to a minute. In a game or GUI, call libpdot from a worker thread.
 - **Threads:** use one `pdot_client` per thread. Signers can be shared. The random number generator is seeded once and is thread-safe.
 - **Memory:** buffers the library returns are freed with `pdot_free`. Call `pdot_signer_wipe` when you're done with a key.
-- **Trust:** without a verifier, the RPC node is trusted to report chain state, such as authorizations and inclusion. With one, those are proven (see above). Retrieved data is never trusted; it's always checked against its CID.
+- **Trust:** without a verifier, the RPC node is trusted to report chain state, such as authorizations and inclusion. With one, those are proven (see above). Without the metadata hash, it is also trusted for the metadata transactions are built from. Retrieved data is never trusted; it's always checked against its CID.
 - **Networks:** any Bulletin node that answers JSON-RPC over HTTP works. `ws://` and `wss://` URLs are accepted and converted to HTTP.
 
 | Network | RPC endpoint |
@@ -251,6 +262,7 @@ Every layer is checked against Parity's own implementations before it touches a 
 - **Signatures:** against [sp-core](https://crates.io/crates/sp-core), in both directions for sr25519 and byte for byte for ECDSA.
 - **Transactions:** against [subxt](https://github.com/paritytech/subxt), byte for byte.
 - **Event decoding:** against subxt, on events from Paseo blocks.
+- **Metadata hash:** against hashes the Rust [merkleized-metadata](https://github.com/bkchr/merkleized-metadata) crate computed: the ones the Westend and Paseo Bulletin runtimes embed, and one of the crate's own test vectors. BLAKE3 against its official test vectors.
 - **Verification:** GRANDPA justifications, validator-set handovers and storage proofs recorded from Paseo and Polkadot mainnet, plus tampered copies that must fail. [`tools/record-proofs.c`](tools/record-proofs.c) re-records them.
 - **Chunked-file manifests:** against the JavaScript libraries the Bulletin TypeScript SDK uses.
 
@@ -259,9 +271,9 @@ Every layer is checked against Parity's own implementations before it touches a 
 [CI](.github/workflows/ci.yml) runs these jobs on every push:
 - gcc and clang, each with and without AddressSanitizer and UBSan;
 - arm64, 32-bit ARM and big-endian s390x under QEMU;
-- libFuzzer on the metadata, event, manifest and proof parsers;
-- an end-to-end run against a dev node and an IPFS gateway;
-- nightly, read-only verification against live Paseo and Polkadot ([`ci/verify-live.sh`](ci/verify-live.sh)).
+- libFuzzer on the metadata parser and metadata hash, and on the event, manifest and proof parsers;
+- an end-to-end run against a dev node and an IPFS gateway, signing with the metadata hash, where a transaction signed over a wrong hash must be rejected;
+- nightly, read-only verification against live Paseo and Polkadot, and a check that the Westend, Paseo and Polkadot Bulletin runtimes accept libpdot's metadata hash ([`ci/verify-live.sh`](ci/verify-live.sh)).
 
 Every job runs in a container, so you can reproduce one locally with Docker:
 
@@ -274,7 +286,8 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 ## Limitations
 
 - Bulletin Chain only. There is no general API for other pallets or for balance transfers yet.
-- Verification proves storage, renewals and authorizations, but not the outcome of arbitrary transactions; transaction building still trusts the node's metadata.
+- Verification proves storage, renewals and authorizations, but not the outcome of arbitrary transactions.
+- The metadata hash needs runtimes built with it (all Bulletin runtimes are) and v15 metadata. The token symbol and decimals in it are not in the metadata; libpdot takes them from the node unless you pass them.
 - Verification needs a relay chain that has changed its GRANDPA validator set at least once: until then, nodes cannot serve `grandpa_proveFinality`. Every public network has; a fresh local relay chain has not. [`tools/e2e-relay.sh`](tools/e2e-relay.sh) schedules a change at block 1 for that reason.
 - Chunks upload one at a time, so a 64 MiB file takes about 65 transactions.
 - Polkadot mainnet is not supported; its Bulletin authorization model is not final.
@@ -293,6 +306,7 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 - [Polkadot developer docs](https://docs.polkadot.com/)
 - [SCALE codec](https://github.com/paritytech/parity-scale-codec)
 - [Runtime metadata formats](https://github.com/paritytech/frame-metadata)
+- [RFC-0078: Merkleized Metadata](https://polkadot-fellows.github.io/RFCs/approved/0078-merkleized-metadata.html) and its reference implementation, [merkleized-metadata](https://github.com/bkchr/merkleized-metadata)
 - [subxt](https://github.com/paritytech/subxt), the Rust client libpdot is checked against
 - [polkadot-sdk](https://github.com/paritytech/polkadot-sdk): transaction extensions, `polkadot-omni-node`
 - [JSON-RPC interface spec](https://github.com/paritytech/json-rpc-interface-spec)
@@ -305,4 +319,4 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 
 ## License
 
-libpdot is licensed under the [Apache License 2.0](LICENSE). Bundled third-party code keeps its own compatible license: BLAKE2 (CC0), xxHash (BSD-2-Clause) and sr25519-donna (Apache-2.0).
+libpdot is licensed under the [Apache License 2.0](LICENSE). Bundled third-party code keeps its own compatible license: BLAKE2 (CC0), BLAKE3 (Apache-2.0), xxHash (BSD-2-Clause) and sr25519-donna (Apache-2.0).

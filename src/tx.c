@@ -82,8 +82,14 @@ static int encode_ext(pdot_client *c, const pdot_tx_params *p,
             pdot_scale_compact(explicit_, p->tip);
             break;
         case EXT_METADATA_HASH:
-            pdot_scale_u8(explicit_, 0);  /* Mode::Disabled */
-            pdot_scale_u8(implicit, 0);   /* None */
+            if (p->metadata_hash) {
+                pdot_scale_u8(explicit_, 1);  /* Mode::Enabled */
+                pdot_scale_u8(implicit, 1);   /* Some(hash) */
+                pdot_scale_raw(implicit, p->metadata_hash, 32);
+            } else {
+                pdot_scale_u8(explicit_, 0);  /* Mode::Disabled */
+                pdot_scale_u8(implicit, 0);   /* None */
+            }
             break;
         }
         return 0;
@@ -185,6 +191,7 @@ int pdot_tx_params_fetch(pdot_client *c, const pdot_signer *s, pdot_tx_params *p
     p->spec_version = c->spec_version;
     p->tx_version = c->tx_version;
     p->era_period = PDOT_ERA_PERIOD;
+    p->metadata_hash = c->have_mdhash ? c->mdhash : NULL;
     if ((rc = pdot_rpc_account_nonce(c, s->account_id, &p->nonce)) ||
         (rc = pdot_rpc_finalized_head(c, p->era_block_hash)) ||
         (rc = pdot_rpc_block_number(c, p->era_block_hash, &p->era_block)))
@@ -266,8 +273,16 @@ int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
 
     memset(out, 0, sizeof *out);
     pdot_blake2b_256(out->tx_hash, xt, len);
-    if ((rc = pdot_rpc_submit(c, xt, len, node_hash)))
+    if ((rc = pdot_rpc_submit(c, xt, len, node_hash))) {
+        /* A wrong metadata hash shows up as a bad signature. */
+        if (p->metadata_hash && strstr(c->err, "bad signature")) {
+            char why[sizeof c->err];
+            memcpy(why, c->err, sizeof why);
+            return pdot_fail(c, rc, "%s (signed with CheckMetadataHash: the node's metadata "
+                             "or token settings do not match the runtime)", why);
+        }
         return rc;
+    }
     if (memcmp(node_hash, out->tx_hash, 32) != 0)
         return pdot_fail(c, PDOT_E_RPC, "node reported a different transaction hash");
 

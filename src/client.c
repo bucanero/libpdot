@@ -16,6 +16,7 @@
 #include "pdot.h"
 #include "client.h"
 #include "http.h"
+#include "mdhash.h"
 #include "rpc.h"
 #include "scale.h"
 #include "verify.h"
@@ -50,6 +51,7 @@ pdot_client *pdot_client_new(const char *rpc_url, const char *gateway_url)
     if (!rpc_url || !(c = calloc(1, sizeof *c)))
         return NULL;
     c->timeout_ms = 60000;
+    c->token_decimals = -1;
     c->poll_ms = 2000;
     c->rpc_url = dup_url(rpc_url);
     c->gateway_url = dup_url(gateway_url);
@@ -152,6 +154,44 @@ static int fetch_metadata(pdot_client *c, pdot_metadata **md)
     return 0;
 }
 
+/* The RFC-0078 hash for the current metadata, if the runtime checks one. */
+static int refresh_mdhash(pdot_client *c)
+{
+    pdot_mdhash_info info;
+    char spec_name[64], symbol[32];
+    uint32_t spec, tx;
+    uint8_t decimals;
+    size_t i;
+    int rc;
+
+    c->have_mdhash = 0;
+    for (i = 0; i < c->md->next; i++)
+        if (pdot_md_name_eq(c->md->ext[i].name, c->md->ext[i].name_len, "CheckMetadataHash"))
+            break;
+    if (i == c->md->next)
+        return 0;
+    if ((rc = pdot_rpc_runtime_version(c, &spec, &tx, spec_name, sizeof spec_name)))
+        return rc;
+    /* Values given to the runtime build; the node's properties unless overridden. */
+    if ((!c->token_symbol[0] || c->token_decimals < 0) &&
+        (rc = pdot_rpc_token(c, symbol, sizeof symbol, &decimals)))
+        return rc;
+    if (c->token_symbol[0])
+        strcpy(symbol, c->token_symbol);
+    if (c->token_decimals >= 0)
+        decimals = (uint8_t)c->token_decimals;
+    info.spec_version = c->spec_version;
+    info.spec_name = spec_name;
+    info.decimals = decimals;
+    info.token_symbol = symbol;
+    if ((rc = pdot_md_ss58_prefix(c->md, &info.ss58_prefix)) ||
+        (rc = pdot_metadata_hash(c->md, &info, c->mdhash)))
+        return pdot_fail(c, rc, "cannot compute the metadata hash: %s", pdot_strerror(rc));
+    c->have_mdhash = 1;
+    c->mdhash_spec = c->spec_version;
+    return 0;
+}
+
 int pdot_chain_sync(pdot_client *c)
 {
     uint32_t spec, tx;
@@ -162,7 +202,7 @@ int pdot_chain_sync(pdot_client *c)
             return rc;
         c->have_chain = 1;
     }
-    if ((rc = pdot_rpc_runtime_version(c, &spec, &tx)))
+    if ((rc = pdot_rpc_runtime_version(c, &spec, &tx, NULL, 0)))
         return rc;
     if (!c->md || spec != c->spec_version) {
         pdot_metadata *md;
@@ -170,8 +210,39 @@ int pdot_chain_sync(pdot_client *c)
             return rc;
         pdot_metadata_free(c->md);
         c->md = md;
+        c->have_mdhash = 0;
     }
     c->spec_version = spec;
     c->tx_version = tx;
+    if (c->mdhash_on && !(c->have_mdhash && c->mdhash_spec == spec))
+        return refresh_mdhash(c);
+    return 0;
+}
+
+int pdot_client_set_metadata_hash(pdot_client *c, int enable, const char *token_symbol,
+                                  int decimals)
+{
+    if (!c || decimals > 255 || (token_symbol && strlen(token_symbol) >= sizeof c->token_symbol))
+        return PDOT_E_INVALID;
+    c->mdhash_on = enable;
+    strcpy(c->token_symbol, token_symbol ? token_symbol : "");
+    c->token_decimals = decimals < 0 ? -1 : decimals;
+    c->have_mdhash = 0;
+    return 0;
+}
+
+int pdot_client_metadata_hash(pdot_client *c, uint8_t out[32])
+{
+    int rc;
+
+    if (!c || !out)
+        return PDOT_E_INVALID;
+    if (!c->mdhash_on)
+        return pdot_fail(c, PDOT_E_NOTFOUND, "metadata hash is off");
+    if ((rc = pdot_chain_sync(c)))
+        return rc;
+    if (!c->have_mdhash)
+        return pdot_fail(c, PDOT_E_NOTFOUND, "the runtime has no CheckMetadataHash extension");
+    memcpy(out, c->mdhash, 32);
     return 0;
 }

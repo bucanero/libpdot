@@ -58,6 +58,21 @@ const char  *pdot_last_error(const pdot_client *c);
 /* Per-request timeout; default 60 s. */
 void         pdot_client_set_timeout(pdot_client *c, long timeout_ms);
 
+/*
+ * Signs with CheckMetadataHash (RFC-0078): the signature also covers a hash
+ * of the metadata the transaction was built from, so if a node serves false
+ * metadata the chain rejects the transaction instead of running a call you
+ * did not mean. The hash includes the token symbol and decimals the runtime
+ * was built with: NULL and -1 take them from the node's system_properties,
+ * which match on the public Bulletin chains. A wrong value of any input only
+ * gets transactions rejected. Off by default; ignored on runtimes without
+ * the extension.
+ */
+int pdot_client_set_metadata_hash(pdot_client *c, int enable, const char *token_symbol,
+                                  int decimals);
+/* The hash transactions are signed with; PDOT_E_NOTFOUND if off or unsupported. */
+int pdot_client_metadata_hash(pdot_client *c, uint8_t out[32]);
+
 /* ---- Verification without trusting RPC nodes -------------------------
 
    With a verifier set, libpdot proves what it reports instead of believing

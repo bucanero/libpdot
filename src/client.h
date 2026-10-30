@@ -23,6 +23,14 @@ struct pdot_client {
     uint32_t tx_version;
     pdot_metadata *md;         /* parsed for spec_version */
 
+    /* CheckMetadataHash (RFC-0078), refreshed with the metadata. */
+    int      mdhash_on;
+    char     token_symbol[32];  /* empty: from system_properties */
+    int      token_decimals;    /* -1: from system_properties */
+    int      have_mdhash;       /* 0 if off or the runtime lacks the extension */
+    uint32_t mdhash_spec;       /* spec_version the hash was computed for */
+    uint8_t  mdhash[32];
+
     struct pdot_verifier *verifier;  /* NULL: RPC answers are trusted */
 };
 

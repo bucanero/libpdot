@@ -1,11 +1,12 @@
 #!/bin/sh
 # Read-only verification against live networks: proves Bulletin storage from
 # relay-chain GRANDPA finality, trusting the relay node once for the
-# checkpoint. Network-dependent, so CI runs it nightly, not per push.
+# checkpoint, and checks that each runtime accepts libpdot's RFC-0078
+# metadata hash. Network-dependent, so CI runs it nightly, not per push.
 set -eu
 sh ci/deps.sh curl python3
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPDOT_BUILD_TESTS=OFF -DPDOT_BUILD_EXAMPLES=OFF >/dev/null
-cmake --build build -j "$(nproc)" --target pdot-bulletin >/dev/null
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPDOT_BUILD_TESTS=ON -DPDOT_BUILD_EXAMPLES=OFF >/dev/null
+cmake --build build -j "$(nproc)" --target pdot-bulletin check_mdhash >/dev/null
 CLI=build/pdot-bulletin
 ABSENT=bafk2bzacea3q4eyq7pnoumsahvo6dvqbupmuydbzeso2c4xjfkekvytu6m4xe
 
@@ -39,6 +40,10 @@ check() {  # name relay para para_id
     fi
     rm -f "$ck"
 }
+
+echo "== metadata hash accepted by each runtime (validate_transaction, nothing submitted)"
+build/check_mdhash https://westend-bulletin-rpc.polkadot.io \
+    https://paseo-bulletin-next-rpc.polkadot.io https://bulletin-rpc.polkadot.io
 
 check "Paseo Bulletin Next" https://pas-rpc.stakeworld.io https://paseo-bulletin-next-rpc.polkadot.io 1501
 check "Polkadot Bulletin" https://rpc.polkadot.io https://bulletin-rpc.polkadot.io 1010

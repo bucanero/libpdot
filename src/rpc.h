@@ -30,7 +30,11 @@ cJSON *pdot_rpc_hex_param(const uint8_t *p, size_t len);
 int pdot_rpc_block_hash(pdot_client *c, uint32_t number, uint8_t hash[32]);
 int pdot_rpc_finalized_head(pdot_client *c, uint8_t hash[32]);
 int pdot_rpc_block_number(pdot_client *c, const uint8_t hash[32], uint32_t *number);
-int pdot_rpc_runtime_version(pdot_client *c, uint32_t *spec, uint32_t *tx);
+/* spec_name may be NULL; otherwise it gets the NUL-terminated specName. */
+int pdot_rpc_runtime_version(pdot_client *c, uint32_t *spec, uint32_t *tx,
+                             char *spec_name, size_t cap);
+/* The first token's symbol and decimals from system_properties. */
+int pdot_rpc_token(pdot_client *c, char *symbol, size_t cap, uint8_t *decimals);
 int pdot_rpc_account_nonce(pdot_client *c, const uint8_t account_id[32], uint32_t *nonce);
 int pdot_rpc_storage(pdot_client *c, const uint8_t *key, size_t key_len,
                      uint8_t **value, size_t *value_len);

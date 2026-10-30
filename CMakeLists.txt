@@ -56,6 +56,17 @@ add_library(pdot_blake2 OBJECT third_party/blake2/blake2b-ref.c)
 target_include_directories(pdot_blake2 PUBLIC third_party/blake2)
 set_target_properties(pdot_blake2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# BLAKE3 for the RFC-0078 metadata hash: the portable code path only.
+add_library(pdot_blake3 OBJECT
+  third_party/blake3/blake3.c
+  third_party/blake3/blake3_dispatch.c
+  third_party/blake3/blake3_portable.c)
+target_include_directories(pdot_blake3 PUBLIC third_party/blake3)
+target_compile_definitions(pdot_blake3 PRIVATE
+  BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+  BLAKE3_USE_NEON=0 BLAKE3_ATOMICS=0)
+set_target_properties(pdot_blake3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 if(PDOT_WITH_SR25519)
   include(cmake/PatchSr25519.cmake)  # sets SR25519_DIR
   set(PDOT_SR25519_SOURCES
@@ -107,7 +118,9 @@ add_library(pdot
   src/dag.c
   src/tx.c
   src/bulletin.c
-  $<TARGET_OBJECTS:pdot_blake2>)
+  src/mdhash.c
+  $<TARGET_OBJECTS:pdot_blake2>
+  $<TARGET_OBJECTS:pdot_blake3>)
 target_link_libraries(pdot PUBLIC MbedTLS::mbedcrypto PRIVATE CURL::libcurl ${PDOT_CJSON})
 if(NOT WIN32)
   find_package(Threads REQUIRED)
@@ -133,7 +146,7 @@ endif()
 target_include_directories(pdot
   PUBLIC  include
   PRIVATE src)
-target_include_directories(pdot SYSTEM PRIVATE third_party/blake2 third_party/xxhash)
+target_include_directories(pdot SYSTEM PRIVATE third_party/blake2 third_party/blake3 third_party/xxhash)
 target_compile_options(pdot PRIVATE ${PDOT_WARNINGS})
 
 if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
@@ -158,6 +171,14 @@ if(PDOT_WITH_VERIFY AND PDOT_BUILD_TESTS)
   target_compile_options(record_proofs PRIVATE ${PDOT_WARNINGS})
 endif()
 
+if(PDOT_WITH_SR25519 AND PDOT_BUILD_TESTS)
+  # Read-only check that live runtimes accept the metadata hash (ci/verify-live.sh).
+  add_executable(check_mdhash tools/check-mdhash.c)
+  target_include_directories(check_mdhash PRIVATE src)
+  target_link_libraries(check_mdhash PRIVATE pdot ${PDOT_CJSON})
+  target_compile_options(check_mdhash PRIVATE ${PDOT_WARNINGS})
+endif()
+
 if(PDOT_FUZZ)
   set(PDOT_FUZZ_TARGETS metadata decode)
   if(PDOT_WITH_VERIFY)
@@ -174,7 +195,7 @@ endif()
 
 if(PDOT_BUILD_TESTS)
   enable_testing()
-  set(PDOT_TESTS scale hash cid ss58 metadata events dag)
+  set(PDOT_TESTS scale hash cid ss58 metadata mdhash events dag)
   if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
     list(APPEND PDOT_TESTS signer tx)
   endif()

@@ -26,6 +26,7 @@ static const char usage[] =
     "  checkpoint [--at N]     create --checkpoint FILE from --relay, trusting it once\n"
     "  authorize ADDRESS TXS BYTES\n"
     "                          grant storage (signer must be a registered authorizer)\n"
+    "  metadata-hash           print the RFC-0078 metadata hash transactions are signed with\n"
     "\n"
     "options:\n"
     "  --rpc URL               node RPC (default http://127.0.0.1:9944)\n"
@@ -36,6 +37,10 @@ static const char usage[] =
     "  --prefix N              SS58 prefix for printed addresses (default 42)\n"
     "  --timeout MS            per-request timeout (default 60000)\n"
     "  --chunk-size BYTES      always chunk, with this chunk size (max 2 MiB)\n"
+    "  --metadata-hash MODE    on (default): sign with CheckMetadataHash, so a node serving\n"
+    "                          false metadata gets the transaction rejected; off; or\n"
+    "                          SYMBOL:DECIMALS when the node's token properties differ\n"
+    "                          from the runtime build (local dev chains)\n"
     "\n"
     "verification (results are proven, not taken from the RPC node):\n"
     "  --relay URL             relay-chain RPC (Westend, Paseo, Polkadot)\n"
@@ -49,6 +54,7 @@ struct opts {
     size_t chunk_size;   /* 0: chunk only above PDOT_CHUNK_SIZE_MAX */
     const char *relay, *checkpoint;
     unsigned para_id;
+    const char *mdhash;  /* "on", "off" or SYMBOL:DECIMALS */
 };
 
 static int die(const char *what, int rc, const pdot_client *c)
@@ -372,6 +378,30 @@ static void save_checkpoint(pdot_client *c, const struct opts *o)
     pdot_free(ck);
 }
 
+/* --metadata-hash on | off | SYMBOL:DECIMALS */
+static int setup_metadata_hash(pdot_client *c, const char *mode)
+{
+    char symbol[32];
+    const char *colon = strchr(mode, ':');
+    char *end;
+    long dec;
+
+    if (strcmp(mode, "off") == 0)
+        return 0;
+    if (strcmp(mode, "on") == 0)
+        return pdot_client_set_metadata_hash(c, 1, NULL, -1) ? 2 : 0;
+    if (colon && colon > mode && (size_t)(colon - mode) < sizeof symbol) {
+        dec = strtol(colon + 1, &end, 10);
+        if (colon[1] && *end == '\0' && dec >= 0 && dec <= 255) {
+            memcpy(symbol, mode, (size_t)(colon - mode));
+            symbol[colon - mode] = '\0';
+            return pdot_client_set_metadata_hash(c, 1, symbol, (int)dec) ? 2 : 0;
+        }
+    }
+    fprintf(stderr, "error: --metadata-hash takes on, off or SYMBOL:DECIMALS\n");
+    return 2;
+}
+
 static int parse_u32(const char *s, uint32_t *v)
 {
     char *end;
@@ -386,7 +416,7 @@ static int parse_u32(const char *s, uint32_t *v)
 int main(int argc, char **argv)
 {
     struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0, 0,
-                      NULL, NULL, 0 };
+                      NULL, NULL, 0, "on" };
     pdot_client *c;
     pdot_signer s;
     const char *cmd;
@@ -413,6 +443,7 @@ int main(int argc, char **argv)
         else if (strcmp(k, "--relay") == 0) o.relay = v;
         else if (strcmp(k, "--para-id") == 0) o.para_id = (unsigned)strtoul(v, NULL, 10);
         else if (strcmp(k, "--checkpoint") == 0) o.checkpoint = v;
+        else if (strcmp(k, "--metadata-hash") == 0) o.mdhash = v;
         else {
             fprintf(stderr, "error: unknown option %s\n%s", k, usage);
             return 2;
@@ -451,12 +482,22 @@ int main(int argc, char **argv)
         return 1;
     }
     pdot_client_set_timeout(c, o.timeout);
+    if ((rc = setup_metadata_hash(c, o.mdhash)) != 0) {
+        pdot_client_free(c);
+        return rc;
+    }
     if (o.relay && (rc = setup_verifier(c, &o)) != 0) {
         pdot_client_free(c);
         return rc;
     }
 
-    if (strcmp(cmd, "verify") == 0 && i < argc) {
+    if (strcmp(cmd, "metadata-hash") == 0) {
+        uint8_t h[32];
+        if ((rc = pdot_client_metadata_hash(c, h)))
+            rc = die("metadata hash", rc, c);
+        else
+            print_hex("metadata hash: ", h, 32);
+    } else if (strcmp(cmd, "verify") == 0 && i < argc) {
         pdot_cid cid;
         if (!o.relay) {
             fprintf(stderr, "error: verify needs --relay, --para-id and --checkpoint\n");

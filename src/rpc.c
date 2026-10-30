@@ -155,16 +155,49 @@ int pdot_rpc_block_number(pdot_client *c, const uint8_t hash[32], uint32_t *numb
     return rc;
 }
 
-int pdot_rpc_runtime_version(pdot_client *c, uint32_t *spec, uint32_t *tx)
+int pdot_rpc_runtime_version(pdot_client *c, uint32_t *spec, uint32_t *tx,
+                             char *spec_name, size_t cap)
 {
-    cJSON *res;
+    cJSON *res, *name;
     int rc;
 
     if ((rc = pdot_rpc(c, "state_getRuntimeVersion", NULL, &res)))
         return rc;
+    name = cJSON_GetObjectItemCaseSensitive(res, "specName");
     if (json_u32(cJSON_GetObjectItemCaseSensitive(res, "specVersion"), spec) ||
         json_u32(cJSON_GetObjectItemCaseSensitive(res, "transactionVersion"), tx))
         rc = pdot_fail(c, PDOT_E_RPC, "state_getRuntimeVersion: missing versions");
+    else if (spec_name && (!cJSON_IsString(name) || strlen(name->valuestring) >= cap))
+        rc = pdot_fail(c, PDOT_E_RPC, "state_getRuntimeVersion: bad specName");
+    else if (spec_name)
+        strcpy(spec_name, name->valuestring);
+    cJSON_Delete(res);
+    return rc;
+}
+
+/* A property that is a value, or an array of them for multi-token chains. */
+static const cJSON *first_of(const cJSON *v)
+{
+    return cJSON_IsArray(v) ? cJSON_GetArrayItem(v, 0) : v;
+}
+
+int pdot_rpc_token(pdot_client *c, char *symbol, size_t cap, uint8_t *decimals)
+{
+    const cJSON *sym, *dec;
+    cJSON *res;
+    int rc;
+
+    if ((rc = pdot_rpc(c, "system_properties", NULL, &res)))
+        return rc;
+    sym = first_of(cJSON_GetObjectItemCaseSensitive(res, "tokenSymbol"));
+    dec = first_of(cJSON_GetObjectItemCaseSensitive(res, "tokenDecimals"));
+    if (!cJSON_IsString(sym) || strlen(sym->valuestring) >= cap ||
+        !cJSON_IsNumber(dec) || dec->valuedouble < 0 || dec->valuedouble > 255)
+        rc = pdot_fail(c, PDOT_E_RPC, "system_properties: no tokenSymbol/tokenDecimals");
+    else {
+        strcpy(symbol, sym->valuestring);
+        *decimals = (uint8_t)dec->valuedouble;
+    }
     cJSON_Delete(res);
     return rc;
 }

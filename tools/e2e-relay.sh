@@ -56,12 +56,15 @@ curl -fsS -m 120 -H 'Content-Type: application/json' \
     "$RUNTIME_RPC" | sed 's/.*"result":"0x\([0-9a-f]*\)".*/\1/' | xxd -r -p > "$WORK/runtime.wasm"
 "$OMNI_NODE" chain-spec-builder -c "$WORK/para.json" create -p $PARA_ID -c westend_local_testnet \
     -i bulletin-westend -n Bulletin -t local -r "$WORK/runtime.wasm" named-preset local_testnet >/dev/null
-# The preset's own parachain id (1010) must match the id the relay schedules.
+# The preset's own parachain id (1010) must match the id the relay schedules,
+# and the token properties the runtime build (see CheckMetadataHash).
 python3 - "$WORK/para.json" $PARA_ID <<'EOF'
 import json, sys
 path, para = sys.argv[1], int(sys.argv[2])
 spec = json.load(open(path))
 spec["genesis"]["runtimeGenesis"]["patch"]["parachainInfo"] = {"parachainId": para}
+# The token the runtime was built with, which CheckMetadataHash covers.
+spec["properties"] = {"tokenSymbol": "WND", "tokenDecimals": 12}
 json.dump(spec, open(path, "w"))
 EOF
 "$OMNI_NODE" export-genesis-head --chain "$WORK/para.json" > "$WORK/head.hex" 2>/dev/null

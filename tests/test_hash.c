@@ -52,9 +52,35 @@ static void test_storage_keys(void)
         "d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d");
 }
 
+/* BLAKE3 test_vectors.json: input byte i is i % 251; lengths around chunk edges. */
+static void test_blake3(void)
+{
+    static const struct {
+        size_t      len;
+        const char *hash;
+    } v[] = {
+        { 0, "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262" },
+        { 1, "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213" },
+        { 1024, "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7" },
+        { 1025, "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444" },
+        { 8193, "bab6c09cb8ce8cf459261398d2e7aef35700bf488116ceb94a36d0f5f1b7bc3b" },
+    };
+    static uint8_t in[8193];
+    uint8_t out[32];
+    size_t i;
+
+    for (i = 0; i < sizeof in; i++)
+        in[i] = (uint8_t)(i % 251);
+    for (i = 0; i < sizeof v / sizeof v[0]; i++) {
+        pdot_blake3(out, in, v[i].len);
+        CHECK_HEX(out, 32, v[i].hash);
+    }
+}
+
 int main(void)
 {
     test_blake2b();
+    test_blake3();
     test_storage_keys();
     TEST_DONE();
 }
