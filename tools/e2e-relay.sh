@@ -2,7 +2,8 @@
 # End-to-end test of verification on a local relay chain: a westend-local
 # relay (validators //Alice and //Bob) with the Bulletin chain as parachain
 # 2487, then store, renew and authorize with results proven from GRANDPA
-# finality instead of taken from the RPC node.
+# finality instead of taken from the RPC node. Transactions are signed with
+# CheckMetadataHash, and one over a wrong hash must be rejected.
 #
 #   POLKADOT=/path/to/polkadot OMNI_NODE=/path/to/polkadot-omni-node \
 #     tools/e2e-relay.sh [build-dir]
@@ -147,6 +148,18 @@ head -c 2500000 /dev/urandom > "$WORK/big.bin"
 # shellcheck disable=SC2086
 "$CLI" $V --seed $ALICE_SR store "$WORK/big.bin" | tee "$WORK/big.out"
 grep -q 'every chunk and the manifest proven' "$WORK/big.out"
+
+echo "== CheckMetadataHash: a hash over the wrong inputs is rejected by the chain"
+# shellcheck disable=SC2086
+"$CLI" $V metadata-hash
+head -c 1000 /dev/urandom > "$WORK/small.bin"
+# shellcheck disable=SC2086
+if "$CLI" $V --seed $ALICE_SR --metadata-hash UNIT:12 store "$WORK/small.bin" \
+        > "$WORK/mdh.out" 2>&1; then
+    echo "expected a transaction signed over another metadata hash to be rejected"; exit 1
+fi
+cat "$WORK/mdh.out"
+grep -q 'signed with CheckMetadataHash' "$WORK/mdh.out"
 
 echo "== proven grant to ECDSA //Alice by //Eve"
 # shellcheck disable=SC2086
