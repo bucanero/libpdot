@@ -22,6 +22,7 @@ const char *pdot_strerror(int err)
     case PDOT_E_METADATA:    return "unexpected runtime metadata";
     case PDOT_E_DISPATCH:    return "transaction failed on chain";
     case PDOT_E_UNVERIFIED:  return "proof did not verify";
+    case PDOT_E_CANCELLED:   return "cancelled";
     default:                 return "unknown error";
     }
 }

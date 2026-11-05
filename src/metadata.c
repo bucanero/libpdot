@@ -334,6 +334,7 @@ int pdot_metadata_parse(const uint8_t *blob, size_t len, pdot_metadata **out)
         free(md);
         return PDOT_E_NOMEM;
     }
+    md->refs = 1;
     memcpy(md->blob, blob, len);
     md->len = len;
 
@@ -358,7 +359,7 @@ int pdot_metadata_parse(const uint8_t *blob, size_t len, pdot_metadata **out)
 
 void pdot_metadata_free(pdot_metadata *md)
 {
-    if (!md)
+    if (!md || --md->refs > 0)
         return;
     free(md->blob);
     free(md->type_off);

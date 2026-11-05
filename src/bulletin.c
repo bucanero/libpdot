@@ -12,6 +12,7 @@
 #include "hex.h"
 #include "http.h"
 #include "rpc.h"
+#include "storage.h"
 #include "tx.h"
 #include "verify.h"
 
@@ -115,25 +116,6 @@ int pdot_bulletin_authorize_call(pdot_client *c, const pdot_metadata *md,
     return out->err;
 }
 
-static int hash_key(pdot_buf *key, uint8_t hasher, const uint8_t *k, size_t len)
-{
-    uint8_t h[32];
-
-    switch (hasher) {
-    case PDOT_HASHER_BLAKE2_128:        pdot_blake2b_128(h, k, len); pdot_scale_raw(key, h, 16); break;
-    case PDOT_HASHER_BLAKE2_256:        pdot_blake2b_256(h, k, len); pdot_scale_raw(key, h, 32); break;
-    case PDOT_HASHER_BLAKE2_128_CONCAT: pdot_blake2b_128(h, k, len); pdot_scale_raw(key, h, 16);
-                                        pdot_scale_raw(key, k, len); break;
-    case PDOT_HASHER_TWOX128:           pdot_twox(h, 16, k, len); pdot_scale_raw(key, h, 16); break;
-    case PDOT_HASHER_TWOX256:           pdot_twox(h, 32, k, len); pdot_scale_raw(key, h, 32); break;
-    case PDOT_HASHER_TWOX64_CONCAT:     pdot_twox(h, 8, k, len); pdot_scale_raw(key, h, 8);
-                                        pdot_scale_raw(key, k, len); break;
-    case PDOT_HASHER_IDENTITY:          pdot_scale_raw(key, k, len); break;
-    default:                            return PDOT_E_UNSUPPORTED;
-    }
-    return key->err;
-}
-
 /* twox128(prefix) | twox128("Authorizations") | hasher(AuthorizationScope::Account(id)) */
 int pdot_bulletin_auth_key(pdot_client *c, const pdot_metadata *md,
                            const uint8_t account_id[32], pdot_buf *key)
@@ -153,7 +135,7 @@ int pdot_bulletin_auth_key(pdot_client *c, const pdot_metadata *md,
     pdot_scale_raw(key, h, 16);
     pdot_twox128(h, "Authorizations", 14);
     pdot_scale_raw(key, h, 16);
-    if (hash_key(key, st.hashers[0], scope, sizeof scope))
+    if (pdot_storage_hash(key, st.hashers[0], scope, sizeof scope))
         return pdot_fail(c, PDOT_E_UNSUPPORTED, "unsupported storage hasher");
     return 0;
 }
@@ -253,7 +235,7 @@ static int storage_key(pdot_client *c, const pdot_metadata *md, const char *entr
     pdot_scale_raw(key, h, 16);
     pdot_twox128(h, entry, strlen(entry));
     pdot_scale_raw(key, h, 16);
-    if (k && (st->nhashers != 1 || hash_key(key, st->hashers[0], k, klen)))
+    if (k && (st->nhashers != 1 || pdot_storage_hash(key, st->hashers[0], k, klen)))
         return pdot_fail(c, PDOT_E_METADATA, STORAGE_PALLET ".%s has an unexpected key", entry);
     return key->err;
 }

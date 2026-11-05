@@ -38,6 +38,17 @@ static size_t on_data(char *p, size_t size, size_t n, void *userdata)
     return b->err ? 0 : len;
 }
 
+/* Aborts a transfer once the client is stopped. */
+static int on_progress(void *ud, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal,
+                       curl_off_t ulnow)
+{
+    (void)dltotal;
+    (void)dlnow;
+    (void)ultotal;
+    (void)ulnow;
+    return pdot_client_stopped(ud);
+}
+
 int pdot_http_request(pdot_client *c, const char *url, const char *body,
                       size_t body_len, pdot_buf *resp)
 {
@@ -46,6 +57,8 @@ int pdot_http_request(pdot_client *c, const char *url, const char *body,
     CURLcode rc;
     long status = 0;
 
+    if (pdot_client_stopped(c))
+        return pdot_fail(c, PDOT_E_CANCELLED, "cancelled");
     curl_easy_reset(h);
     curl_easy_setopt(h, CURLOPT_URL, url);
     curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, c->timeout_ms);
@@ -55,6 +68,11 @@ int pdot_http_request(pdot_client *c, const char *url, const char *body,
     curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_data);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, resp);
+    if (c->stop) {
+        curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, on_progress);
+        curl_easy_setopt(h, CURLOPT_XFERINFODATA, c);
+        curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    }
     if (body) {
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
@@ -68,6 +86,8 @@ int pdot_http_request(pdot_client *c, const char *url, const char *body,
 
     if (resp->err)
         return pdot_fail(c, resp->err, "HTTP response from %s too large", url);
+    if (rc == CURLE_ABORTED_BY_CALLBACK)
+        return pdot_fail(c, PDOT_E_CANCELLED, "cancelled");
     if (rc != CURLE_OK)
         return pdot_fail(c, rc == CURLE_OPERATION_TIMEDOUT ? PDOT_E_TIMEOUT : PDOT_E_NETWORK,
                          "%s: %s", url, curl_easy_strerror(rc));

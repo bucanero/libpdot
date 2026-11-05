@@ -4,7 +4,7 @@
 
 **Store and retrieve data on Polkadot from plain C.** libpdot is a portable C99 library, plus a small command-line tool, for the [Polkadot Bulletin Chain](https://github.com/paritytech/polkadot-bulletin-chain): a chain that stores files, content-addressed by CID and served over IPFS.
 
-It is for C programs that want Polkadot without a Rust toolchain or a JavaScript runtime: games, desktop apps, embedded and IoT devices, emulators, command-line tools, and bindings for other languages through C's ABI.
+It is for C programs that want Polkadot without a Rust toolchain or a JavaScript runtime: games, desktop apps, embedded and IoT devices, emulators, command-line tools, and bindings for other languages through C's ABI. It also reads balances, assets and NFTs on [Asset Hub](https://docs.polkadot.com/polkadot-protocol/architecture/system-chains/asset-hub/), proven from relay-chain finality if you want, and has a non-blocking API for game loops and UI threads.
 
 ```c
 pdot_client *c = pdot_client_new("https://paseo-bulletin-next-rpc.polkadot.io", NULL);
@@ -12,7 +12,7 @@ pdot_bulletin_store(c, &signer, data, len, &res);   /* waits for finalization  *
 pdot_bulletin_fetch(c, &res.cid, &bytes, &n);       /* verified against the CID */
 ```
 
-> **Status: proof of concept.** It works end to end on a local dev node and on Paseo Bulletin (TestNet), and is tested on x86_64, arm64, 32-bit ARM and big-endian s390x. The API may still change, it has not been audited, and Polkadot mainnet is not supported yet.
+> **Status: proof of concept.** It works end to end on a local dev node and on Paseo Bulletin (TestNet), and is tested on x86_64, arm64, 32-bit ARM and big-endian s390x. The API may still change, and it has not been audited. Storing on Polkadot mainnet's Bulletin chain is not supported yet; reads and proofs work on mainnet.
 
 ## What it does
 
@@ -22,6 +22,8 @@ pdot_bulletin_fetch(c, &res.cid, &bytes, &n);       /* verified against the CID 
 - **Check and grant storage authorizations**: allowances, usage and expiry.
 - **Sign** with sr25519 (what Polkadot wallets use) or ECDSA secp256k1, or plug in your own signer: a hardware wallet, a secure enclave or a remote service.
 - **Prove results without trusting the RPC node** (optional): a built-in relay-chain light client checks GRANDPA finality signatures and storage proofs, so "stored", "renewed" and "authorized" are facts, not the node's word. Signing over an RFC-0078 metadata hash means a node can't trick you into signing a different call either.
+- **Read balances, assets and NFTs** on Asset Hub, or any chain with those pallets: native and asset balances, asset details, NFT owners, metadata and attributes, and the items of a collection an account owns. Each value is read at a final block, and proven like everything else when a verifier is set.
+- **Never block your frame loop**: `pdot_async` runs calls on a worker thread and hands results to callbacks when you poll, once per frame. Watches report a balance, an asset holding or an NFT owner again whenever a new final block changes it.
 - **Report what happened on chain**: the block and position of every transaction, and whether it succeeded. Failures come back by name, such as `TransactionStorage.BadDataSize`.
 
 Under the hood it builds and signs Substrate transactions from the chain's own metadata (v14/v15). Runtime upgrades that change call indices or transaction extensions are picked up automatically.
@@ -206,6 +208,70 @@ pdot_client_set_metadata_hash(c, 1, NULL, -1);   /* on; token from the node's pr
 
 The hash also covers the token symbol and decimals the runtime was built with. On the public Bulletin chains these match the node's `system_properties`, so `NULL, -1` is right. A local chain spec may differ: pass the values explicitly (`"WND", 12` for the Westend runtime). A wrong value can only get transactions rejected, with a "bad signature" error that says so. The hash takes about 5 ms to compute and is cached until the next runtime upgrade. The command-line tool turns it on by default (`--metadata-hash on|off|SYMBOL:DECIMALS`), and `pdot-bulletin metadata-hash` prints it.
 
+### Read balances, assets and NFTs
+
+Point a client at Asset Hub (or any chain with `pallet-balances`, `pallet-assets` or `pallet-nfts`) and read its state. Values come from the newest final block, and the result says which.
+
+```c
+pdot_client *c = pdot_client_new("https://polkadot-asset-hub-rpc.polkadot.io", NULL);
+
+pdot_asset_info usdt;
+pdot_asset_info_get(c, 1984, &usdt);                  /* "Tether USD", USDt, 6 decimals */
+
+pdot_nft_item sword;
+pdot_nft_item_get(c, 752, 56, &sword);                /* owner and metadata (often ipfs://...) */
+int owns = sword.exists && memcmp(sword.owner, player, 32) == 0;
+
+pdot_balance b;
+char text[64];
+pdot_balance_get(c, player, &b);
+pdot_u128_format(b.free, 10, text, sizeof text);      /* balances are 128-bit: "293.325" */
+```
+
+With a verifier (relay chain plus `1000`, Asset Hub's parachain id on every network), each value is proven, absence included. All the keys of one read share a single proof. `pdot_nft_owned` lists the items of a collection an account owns: the node does the listing, so it could leave items out, but every item it returns is proven owned. Also available: `pdot_asset_balance_get`, `pdot_nft_attribute_get` for item and collection attributes (game stats, for example), and `pdot_storage_get` for any other storage key.
+
+```sh
+pdot-bulletin --rpc https://polkadot-asset-hub-rpc.polkadot.io --relay https://rpc.polkadot.io \
+              --para-id 1000 --checkpoint dot.ck nft 752 56
+```
+
+### Without blocking: `pdot_async`
+
+Every call above blocks: a store waits for finalization, and a proven read takes a few round trips. `pdot_async` takes over a configured client, runs calls on a worker thread in order, and runs your callbacks inside `pdot_async_poll`, on your thread. Call that once per frame.
+
+```c
+pdot_async *a = pdot_async_new(c);                    /* c is now owned by a */
+
+pdot_async_store(a, &signer, replay, len, on_stored, game);         /* -> pdot_store_result */
+pdot_async_watch_nft_item(a, 752, 56, on_sword, game);              /* now, and on each change */
+pdot_async_watch_balance(a, player, on_balance, game);
+
+while (running) {
+    pdot_async_poll(a);           /* callbacks run here; never blocks */
+    update();
+    render();
+}
+pdot_async_free(a);               /* runs every callback still owed, with PDOT_E_CANCELLED */
+```
+
+```c
+static void on_sword(void *ud, int rc, const char *error, const void *result)
+{
+    const pdot_nft_item *item = result;   /* valid during the callback only */
+    if (rc == 0)
+        show_sword(ud, item->exists && memcmp(item->owner, player, 32) == 0);
+}
+```
+
+- **One callback signature** for everything: `(ud, rc, error, result)`, with `result` pointing to the type documented for each call. That keeps bindings simple (one delegate type in C#).
+- **Each job's callback runs exactly once**, cancelled or not, including from `pdot_async_free`. Watches end with one `PDOT_E_CANCELLED` call, so `ud` can always be released there.
+- **Cancel** with `pdot_async_cancel(a, id)`. A queued job never runs; a running one stops at its next network call or wait. A store may still land on chain.
+- **Watches** live on a second thread with their own connection. Each new final block triggers one batched read of every watched key (one proof with a verifier), and a callback runs only when a value changed. A failed read is reported once and retried. New blocks are announced over a WebSocket subscription (`chain_subscribeFinalizedHeads`, on the relay chain when verifying) if libcurl supports WebSockets, and found by polling every 2 s otherwise.
+- **Wake-ups**: `pdot_async_set_wake` lets a loop that sleeps be woken when results are waiting.
+- `pdot_async_run(a, work, done, ud)` runs any blocking libpdot code of your own on the worker.
+
+[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line.
+
 ### API overview
 
 | Area | Functions |
@@ -218,11 +284,15 @@ The hash also covers the token symbol and decimals the runtime was built with. O
 | Metadata hash | `pdot_client_set_metadata_hash`, `pdot_client_metadata_hash` |
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
+| Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
+| Amounts | `pdot_u128_format`, `pdot_u128_to_double` |
+| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify and read calls |
+| Watches | `pdot_async_watch_head`, `pdot_async_watch_storage`, `pdot_async_watch_balance`, `pdot_async_watch_asset_balance`, `pdot_async_watch_nft_item` |
 
 ### Things to know
 
-- **Calls block.** A store waits for finalization, a few seconds to a minute. In a game or GUI, call libpdot from a worker thread.
-- **Threads:** use one `pdot_client` per thread. Signers can be shared. The random number generator is seeded once and is thread-safe.
+- **Calls block.** A store waits for finalization, a few seconds to a minute. In a game or GUI, use `pdot_async` (above).
+- **Threads:** use one `pdot_client` per thread; `pdot_async` keeps its own two. Signers can be shared. The random number generator is seeded once and is thread-safe.
 - **Memory:** buffers the library returns are freed with `pdot_free`. Call `pdot_signer_wipe` when you're done with a key.
 - **Trust:** without a verifier, the RPC node is trusted to report chain state, such as authorizations and inclusion. With one, those are proven (see above). Without the metadata hash, it is also trusted for the metadata transactions are built from. Retrieved data is never trusted; it's always checked against its CID.
 - **Networks:** any Bulletin node that answers JSON-RPC over HTTP works. `ws://` and `wss://` URLs are accepted and converted to HTTP.
@@ -264,6 +334,8 @@ Every layer is checked against Parity's own implementations before it touches a 
 - **Event decoding:** against subxt, on events from Paseo blocks.
 - **Metadata hash:** against hashes the Rust [merkleized-metadata](https://github.com/bkchr/merkleized-metadata) crate computed: the ones the Westend and Paseo Bulletin runtimes embed, and one of the crate's own test vectors. BLAKE3 against its official test vectors.
 - **Verification:** GRANDPA justifications, validator-set handovers and storage proofs recorded from Paseo and Polkadot mainnet, plus tampered copies that must fail. [`tools/record-proofs.c`](tools/record-proofs.c) re-records them.
+- **Asset Hub reads:** keys compared byte for byte with keys a Polkadot Asset Hub node listed, then balances, USDt, an NFT and its attributes decoded from one recorded read proof, checked against the block's state root. A proof with any byte changed must fail. [`tools/record-assets.c`](tools/record-assets.c) re-records it.
+- **`pdot_async`:** ordering, callbacks only inside `pdot_async_poll`, cancelling queued and running jobs, callbacks owed at `pdot_async_free`, and one report per failure streak for watches. Also run under ThreadSanitizer.
 - **Chunked-file manifests:** against the JavaScript libraries the Bulletin TypeScript SDK uses.
 
 [`tools/fixtures-gen`](tools/fixtures-gen) regenerates those fixtures. It is a separate Rust program; the C build never needs Rust.
@@ -271,9 +343,10 @@ Every layer is checked against Parity's own implementations before it touches a 
 [CI](.github/workflows/ci.yml) runs these jobs on every push:
 - gcc and clang, each with and without AddressSanitizer and UBSan;
 - arm64, 32-bit ARM and big-endian s390x under QEMU;
-- libFuzzer on the metadata parser and metadata hash, and on the event, manifest and proof parsers;
-- an end-to-end run against a dev node and an IPFS gateway, signing with the metadata hash, where a transaction signed over a wrong hash must be rejected;
-- nightly, read-only verification against live Paseo and Polkadot, and a check that the Westend, Paseo and Polkadot Bulletin runtimes accept libpdot's metadata hash ([`ci/verify-live.sh`](ci/verify-live.sh)).
+- ThreadSanitizer on the unit tests, for `pdot_async`;
+- libFuzzer on the metadata parser and metadata hash, on the event, manifest and proof parsers, and on balance, asset and NFT decoding;
+- an end-to-end run against a dev node and an IPFS gateway, signing with the metadata hash, where a transaction signed over a wrong hash must be rejected, and a `pdot_async` balance watch must see a store change the account's nonce;
+- nightly, read-only verification against live Paseo and Polkadot, including proven Asset Hub reads and a proven watch over WebSocket, and a check that the Westend, Paseo and Polkadot Bulletin runtimes accept libpdot's metadata hash ([`ci/verify-live.sh`](ci/verify-live.sh)).
 
 Every job runs in a container, so you can reproduce one locally with Docker:
 
@@ -285,13 +358,16 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 
 ## Limitations
 
-- Bulletin Chain only. There is no general API for other pallets or for balance transfers yet.
+- Beyond the Bulletin Chain, only reads: balances, `pallet-assets` and `pallet-nfts`. No transfers yet, and no foreign (XCM-location) assets.
+- `pdot_nft_owned` cannot prove that a node listed every item, only that each listed item is owned.
+- The first call on a chain downloads its metadata, about 0.7 MB on Asset Hub, so the first result takes a few seconds. `pdot_async`'s two connections share that download, and a runtime upgrade triggers one new download.
+- Watches are woken by WebSocket only where libcurl supports it (Debian 13 does; the macOS system libcurl does not); otherwise they poll every 2 s.
 - Verification proves storage, renewals and authorizations, but not the outcome of arbitrary transactions.
 - The metadata hash needs runtimes built with it (all Bulletin runtimes are) and v15 metadata. The token symbol and decimals in it are not in the metadata; libpdot takes them from the node unless you pass them.
 - Verification needs a relay chain that has changed its GRANDPA validator set at least once: until then, nodes cannot serve `grandpa_proveFinality`. Every public network has; a fresh local relay chain has not. [`tools/e2e-relay.sh`](tools/e2e-relay.sh) schedules a change at block 1 for that reason.
 - Chunks upload one at a time, so a 64 MiB file takes about 65 transactions.
 - Polkadot mainnet is not supported; its Bulletin authorization model is not final.
-- Not tested on Windows or macOS CI. The library builds and runs on macOS.
+- Not tested on Windows or macOS CI. The library builds and runs on macOS. `pdot_async` has Win32 threads, but they have never been compiled.
 - sr25519 uses [sr25519-donna](https://github.com/TerenceGe/sr25519-donna) with fixes applied at build time ([`cmake/PatchSr25519.cmake`](cmake/PatchSr25519.cmake)). These include big-endian fixes, without which sr25519 signatures fail on those platforms.
 
 ## References

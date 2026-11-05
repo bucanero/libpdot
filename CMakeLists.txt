@@ -119,6 +119,12 @@ add_library(pdot
   src/tx.c
   src/bulletin.c
   src/mdhash.c
+  src/amount.c
+  src/storage.c
+  src/assets.c
+  src/thread.c
+  src/ws.c
+  src/async.c
   $<TARGET_OBJECTS:pdot_blake2>
   $<TARGET_OBJECTS:pdot_blake3>)
 target_link_libraries(pdot PUBLIC MbedTLS::mbedcrypto PRIVATE CURL::libcurl ${PDOT_CJSON})
@@ -156,7 +162,7 @@ if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
 endif()
 
 if(PDOT_BUILD_EXAMPLES AND PDOT_WITH_SR25519)
-  foreach(e store_and_fetch chunked_upload custom_signer)
+  foreach(e store_and_fetch chunked_upload custom_signer game_loop)
     add_executable(example_${e} examples/${e}.c)
     target_link_libraries(example_${e} PRIVATE pdot)
     target_compile_options(example_${e} PRIVATE ${PDOT_WARNINGS})
@@ -169,6 +175,11 @@ if(PDOT_WITH_VERIFY AND PDOT_BUILD_TESTS)
   target_include_directories(record_proofs PRIVATE src third_party/blake2)
   target_link_libraries(record_proofs PRIVATE pdot ${PDOT_CJSON})
   target_compile_options(record_proofs PRIVATE ${PDOT_WARNINGS})
+  # Records Asset Hub state into tests/fixtures/assets-polkadot.json.
+  add_executable(record_assets tools/record-assets.c)
+  target_include_directories(record_assets PRIVATE src)
+  target_link_libraries(record_assets PRIVATE pdot ${PDOT_CJSON})
+  target_compile_options(record_assets PRIVATE ${PDOT_WARNINGS})
 endif()
 
 if(PDOT_WITH_SR25519 AND PDOT_BUILD_TESTS)
@@ -180,7 +191,7 @@ if(PDOT_WITH_SR25519 AND PDOT_BUILD_TESTS)
 endif()
 
 if(PDOT_FUZZ)
-  set(PDOT_FUZZ_TARGETS metadata decode)
+  set(PDOT_FUZZ_TARGETS metadata decode assets)
   if(PDOT_WITH_VERIFY)
     list(APPEND PDOT_FUZZ_TARGETS proof)
   endif()
@@ -188,6 +199,7 @@ if(PDOT_FUZZ)
     add_executable(fuzz_${f} fuzz/fuzz_${f}.c)
     target_link_libraries(fuzz_${f} PRIVATE pdot)
     target_include_directories(fuzz_${f} PRIVATE src third_party/blake2)
+    target_link_libraries(fuzz_${f} PRIVATE ${PDOT_CJSON})
     target_compile_options(fuzz_${f} PRIVATE -fsanitize=fuzzer,address,undefined)
     target_link_options(fuzz_${f} PRIVATE -fsanitize=fuzzer,address,undefined)
   endforeach()
@@ -200,7 +212,7 @@ if(PDOT_BUILD_TESTS)
     list(APPEND PDOT_TESTS signer tx)
   endif()
   if(PDOT_WITH_VERIFY)
-    list(APPEND PDOT_TESTS verify)
+    list(APPEND PDOT_TESTS verify assets async)
   endif()
   foreach(t ${PDOT_TESTS})
     add_executable(test_${t} tests/test_${t}.c)

@@ -150,6 +150,7 @@ static int read_uint(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
         if (pdot_read_u8(&t, &prim))
             return PDOT_E_DECODE;
         switch (prim) {
+        case 0:
         case 3: if (pdot_read_u8(r, &u8)) return PDOT_E_DECODE; *v = u8; return 0;
         case 4: if (pdot_read_u16(r, &u16)) return PDOT_E_DECODE; *v = u16; return 0;
         case 5: if (pdot_read_u32(r, &u32)) return PDOT_E_DECODE; *v = u32; return 0;
@@ -235,4 +236,164 @@ int pdot_decode_path_uint(const pdot_metadata *md, uint32_t ty, const uint8_t *p
     if ((rc = pdot_decode_seek(md, ty, &r, path, &fty)))
         return rc;
     return pdot_decode_uint(md, fty, &r, v);
+}
+
+/* Compact<u128>: the big-integer mode carries up to 16 bytes here. */
+static int read_compact_u128(pdot_reader *r, pdot_u128 *v)
+{
+    const uint8_t *p;
+    uint8_t b;
+    size_t n, i;
+
+    if (pdot_reader_remaining(r) < 1)
+        return PDOT_E_DECODE;
+    b = r->p[r->pos];
+    if ((b & 3) != 3) {
+        v->hi = 0;
+        return pdot_read_compact(r, &v->lo) ? PDOT_E_DECODE : 0;
+    }
+    n = (size_t)(b >> 2) + 4;
+    if (n > 16 || pdot_read_skip(r, 1) || pdot_read_raw(r, n, &p))
+        return PDOT_E_DECODE;
+    v->lo = v->hi = 0;
+    for (i = 0; i < n; i++) {
+        if (i < 8)
+            v->lo |= (uint64_t)p[i] << (8 * i);
+        else
+            v->hi |= (uint64_t)p[i] << (8 * (i - 8));
+    }
+    return 0;
+}
+
+static int read_u128(const pdot_metadata *md, uint32_t ty, pdot_reader *r, pdot_u128 *v,
+                     int depth)
+{
+    enum pdot_typedef kind;
+    pdot_reader t;
+    pdot_md_iter it;
+    pdot_md_field f;
+    uint8_t prim;
+
+    if (depth > MAX_DEPTH || pdot_md_typedef(md, ty, &t, &kind))
+        return PDOT_E_DECODE;
+    switch (kind) {
+    case PDOT_TYPE_PRIMITIVE:
+        if (pdot_read_u8(&t, &prim))
+            return PDOT_E_DECODE;
+        if (prim == 7) {  /* u128 */
+            if (pdot_read_u64(r, &v->lo) || pdot_read_u64(r, &v->hi))
+                return PDOT_E_DECODE;
+            return 0;
+        }
+        v->hi = 0;
+        return read_uint(md, ty, r, &v->lo, depth);
+    case PDOT_TYPE_COMPACT:
+        return read_compact_u128(r, v);
+    case PDOT_TYPE_COMPOSITE:
+        if (pdot_md_iter_fields(md, ty, &it) || it.left != 1 || pdot_md_iter_next(&it, &f) != 1)
+            return PDOT_E_UNSUPPORTED;
+        return read_u128(md, f.ty, r, v, depth + 1);
+    default:
+        return PDOT_E_UNSUPPORTED;
+    }
+}
+
+int pdot_decode_u128(const pdot_metadata *md, uint32_t ty, pdot_reader *r, pdot_u128 *v)
+{
+    size_t start = r->pos;
+    int rc = read_u128(md, ty, r, v, 0);
+
+    if (rc)
+        r->pos = start;
+    return rc;
+}
+
+static int read_byte_string(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
+                            const uint8_t **p, size_t *n, int depth)
+{
+    enum pdot_typedef kind;
+    pdot_reader t;
+    pdot_md_iter it;
+    pdot_md_field f;
+    uint64_t elem;
+    uint32_t len;
+    uint8_t prim;
+
+    if (depth > MAX_DEPTH || pdot_md_typedef(md, ty, &t, &kind))
+        return PDOT_E_DECODE;
+    switch (kind) {
+    case PDOT_TYPE_SEQUENCE:
+        if (pdot_read_compact(&t, &elem) || elem > UINT32_MAX ||
+            pdot_md_primitive(md, (uint32_t)elem, &prim) || prim != PDOT_PRIM_U8)
+            return PDOT_E_UNSUPPORTED;
+        return pdot_read_bytes(r, p, n) ? PDOT_E_DECODE : 0;
+    case PDOT_TYPE_ARRAY:
+        if (pdot_read_u32(&t, &len) || pdot_read_compact(&t, &elem) || elem > UINT32_MAX ||
+            pdot_md_primitive(md, (uint32_t)elem, &prim) || prim != PDOT_PRIM_U8)
+            return PDOT_E_UNSUPPORTED;
+        *n = len;
+        return pdot_read_raw(r, len, p) ? PDOT_E_DECODE : 0;
+    case PDOT_TYPE_PRIMITIVE:
+        if (pdot_read_u8(&t, &prim) || prim != 2)  /* str */
+            return PDOT_E_UNSUPPORTED;
+        return pdot_read_bytes(r, p, n) ? PDOT_E_DECODE : 0;
+    case PDOT_TYPE_COMPOSITE:
+        /* BoundedVec, AccountId32 and other one-field wrappers. */
+        if (pdot_md_iter_fields(md, ty, &it) || it.left != 1 || pdot_md_iter_next(&it, &f) != 1)
+            return PDOT_E_UNSUPPORTED;
+        return read_byte_string(md, f.ty, r, p, n, depth + 1);
+    default:
+        return PDOT_E_UNSUPPORTED;
+    }
+}
+
+int pdot_decode_bytes(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
+                      const uint8_t **p, size_t *n)
+{
+    size_t start = r->pos;
+    int rc = read_byte_string(md, ty, r, p, n, 0);
+
+    if (rc)
+        r->pos = start;
+    return rc;
+}
+
+int pdot_decode_path_u128(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
+                          size_t len, const char *path, pdot_u128 *v)
+{
+    pdot_reader r;
+    uint32_t fty;
+    int rc;
+
+    pdot_reader_init(&r, p, len);
+    if ((rc = pdot_decode_seek(md, ty, &r, path, &fty)))
+        return rc;
+    return pdot_decode_u128(md, fty, &r, v);
+}
+
+int pdot_decode_path_bytes(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
+                           size_t len, const char *path, const uint8_t **out, size_t *n)
+{
+    pdot_reader r;
+    uint32_t fty;
+    int rc;
+
+    pdot_reader_init(&r, p, len);
+    if ((rc = pdot_decode_seek(md, ty, &r, path, &fty)))
+        return rc;
+    return pdot_decode_bytes(md, fty, &r, out, n);
+}
+
+int pdot_decode_path_variant(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
+                             size_t len, const char *path, const char **name, size_t *name_len)
+{
+    pdot_reader r;
+    pdot_md_iter it;
+    uint32_t fty;
+    int rc;
+
+    pdot_reader_init(&r, p, len);
+    if ((rc = pdot_decode_seek(md, ty, &r, path, &fty)))
+        return rc;
+    return pdot_decode_variant(md, fty, &r, &it, name, name_len);
 }

@@ -36,6 +36,7 @@ extern "C" {
 #define PDOT_E_METADATA    (-14) /* metadata lacks or changes something we need */
 #define PDOT_E_DISPATCH    (-15) /* included, but the call failed (see error) */
 #define PDOT_E_UNVERIFIED  (-16) /* a proof from an RPC node did not verify */
+#define PDOT_E_CANCELLED   (-17) /* abandoned through pdot_async_cancel or pdot_async_free */
 
 const char *pdot_strerror(int err);
 
@@ -72,6 +73,12 @@ int pdot_client_set_metadata_hash(pdot_client *c, int enable, const char *token_
                                   int decimals);
 /* The hash transactions are signed with; PDOT_E_NOTFOUND if off or unsupported. */
 int pdot_client_metadata_hash(pdot_client *c, uint8_t out[32]);
+
+/* 1 when pdot_async asks the job running on c to stop (cancel or free). */
+int pdot_client_cancelled(pdot_client *c);
+
+/* The chain's native token symbol and decimals, from the node's system_properties. */
+int pdot_client_token(pdot_client *c, char *symbol, size_t cap, uint8_t *decimals);
 
 /* ---- Verification without trusting RPC nodes -------------------------
 
@@ -314,6 +321,252 @@ int pdot_bulletin_verify_cid(pdot_client *c, const pdot_cid *cid, pdot_storage_p
  */
 int pdot_bulletin_fetch(pdot_client *c, const pdot_cid *cid,
                         uint8_t **data, size_t *len);
+
+/* ---- Amounts -------------------------------------------------------- */
+
+/* An unsigned 128-bit integer, as balances are on chain. */
+typedef struct {
+    uint64_t lo, hi;
+} pdot_u128;
+
+/*
+ * Decimal text of v scaled down by `decimals` places, trailing zeros trimmed:
+ * 12345 with 3 decimals is "12.345". PDOT_E_BUFFER if out is too small; 64
+ * bytes fit any amount with up to 20 decimals.
+ */
+int pdot_u128_format(pdot_u128 v, uint8_t decimals, char *out, size_t out_len);
+/* v / 10^decimals as a double, for display; may round. */
+double pdot_u128_to_double(pdot_u128 v, uint8_t decimals);
+
+/* ---- Chain state at a final block ----------------------------------- */
+
+/*
+ * The block a value was read at. Reads happen at the newest final block:
+ * with a verifier, one proven from relay-chain finality, with the value
+ * proven against its state root; without one, the RPC node's finalized head.
+ */
+typedef struct {
+    uint32_t number;
+    uint8_t  hash[32];
+    int      verified;     /* 1: proven (needs a verifier) */
+    uint32_t relay_block;  /* with verified: the relay block whose finality anchors it */
+} pdot_final_block;
+
+/* A raw storage value. With pdot_storage_get, data is freed with pdot_free. */
+typedef struct {
+    int              exists;
+    uint8_t         *data;
+    size_t           len;
+    pdot_final_block at;
+} pdot_storage_value;
+
+/* Reads any storage key; use it for state the typed calls below do not cover. */
+int pdot_storage_get(pdot_client *c, const uint8_t *key, size_t key_len,
+                     pdot_storage_value *out);
+
+/* ---- Asset Hub: balances, assets and NFTs ----------------------------
+
+   Reads of the chain the client points at; any chain with these pallets
+   works. To prove them, set a verifier with the relay chain and the
+   parachain's id (Asset Hub is 1000 on Polkadot, Kusama, Westend and Paseo). */
+
+/* System.Account: the native token. Amounts are in the token's smallest unit. */
+typedef struct {
+    int              exists;
+    uint32_t         nonce;
+    pdot_u128        free, reserved, frozen;
+    pdot_final_block at;
+} pdot_balance;
+
+int pdot_balance_get(pdot_client *c, const uint8_t account_id[32], pdot_balance *out);
+
+/* Assets.Account: an account's holding of a fungible asset (pallet-assets). */
+typedef struct {
+    int              exists;
+    pdot_u128        balance;
+    int              frozen;  /* the account's holding is frozen or blocked */
+    pdot_final_block at;
+} pdot_asset_balance;
+
+int pdot_asset_balance_get(pdot_client *c, uint32_t asset_id, const uint8_t account_id[32],
+                           pdot_asset_balance *out);
+
+/* Assets.Asset and Assets.Metadata of a fungible asset. */
+typedef struct {
+    int              exists;
+    uint8_t          owner[32], issuer[32], admin[32], freezer[32];
+    pdot_u128        supply, min_balance;
+    uint32_t         accounts;    /* holders */
+    int              sufficient;  /* can keep an account alive on its own */
+    int              live;        /* not frozen or being destroyed */
+    char             name[64];    /* from Metadata, NUL-terminated, may be cut short */
+    char             symbol[32];
+    uint8_t          decimals;
+    pdot_final_block at;
+} pdot_asset_info;
+
+int pdot_asset_info_get(pdot_client *c, uint32_t asset_id, pdot_asset_info *out);
+
+/* Nfts.Item and Nfts.ItemMetadataOf (pallet-nfts). */
+#define PDOT_NFT_DATA_MAX 256
+
+typedef struct {
+    int              exists;
+    uint8_t          owner[32];
+    uint8_t          metadata[PDOT_NFT_DATA_MAX];  /* often an IPFS CID or a URL */
+    size_t           metadata_len;
+    int              has_metadata;
+    pdot_final_block at;
+} pdot_nft_item;
+
+int pdot_nft_item_get(pdot_client *c, uint32_t collection, uint32_t item, pdot_nft_item *out);
+
+/* Who set an attribute (AttributeNamespace). */
+#define PDOT_NFT_NS_PALLET           0
+#define PDOT_NFT_NS_COLLECTION_OWNER 1
+#define PDOT_NFT_NS_ITEM_OWNER       2
+#define PDOT_NFT_NS_ACCOUNT          3  /* an account approved to set attributes */
+
+typedef struct {
+    int              exists;
+    uint8_t          value[PDOT_NFT_DATA_MAX];
+    size_t           len;
+    pdot_final_block at;
+} pdot_nft_attribute;
+
+/*
+ * Nfts.Attribute: a key/value pair on an item (has_item 1) or on the
+ * collection itself. ns_account is the account for PDOT_NFT_NS_ACCOUNT.
+ */
+int pdot_nft_attribute_get(pdot_client *c, uint32_t collection, int has_item, uint32_t item,
+                           int ns, const uint8_t ns_account[32], const uint8_t *key,
+                           size_t key_len, pdot_nft_attribute *out);
+
+/*
+ * Items of a collection the account owns (Nfts.Account), up to max. The node
+ * lists them; with a verifier each one is then proven owned, so a node can
+ * leave items out but cannot add any. *items is freed with pdot_free.
+ */
+int pdot_nft_owned(pdot_client *c, const uint8_t account_id[32], uint32_t collection,
+                   size_t max, uint32_t **items, size_t *n, pdot_final_block *at);
+
+/* ---- Non-blocking use: pdot_async -----------------------------------
+
+   For game loops and UI threads. pdot_async takes over a configured client
+   and runs its blocking calls on a worker thread, one at a time in order.
+   Results come back through callbacks that run inside pdot_async_poll, on
+   whichever thread calls it (say once per frame), so callbacks can touch
+   engine state without locking.
+
+   Each call returns a job id (0 if it could not be queued) and invokes its
+   callback exactly once. `result` points to the type named at each call,
+   valid only during the callback; it is NULL when rc is not 0, except where
+   noted. `error` is the message for rc. Requests can be made from any
+   thread; pdot_async_poll from one thread at a time.
+
+   Watches report a value when first read and again whenever it changes, at
+   each new final block (proven with a verifier). They run on a second
+   thread with their own connection, woken by a WebSocket subscription to
+   finalized heads when libcurl supports WebSockets, else by polling. */
+
+typedef struct pdot_async pdot_async;
+
+typedef void (*pdot_result_fn)(void *ud, int rc, const char *error, const void *result);
+
+/* Takes ownership of c, configured beforehand (verifier, metadata hash). */
+pdot_async *pdot_async_new(pdot_client *c);
+
+/*
+ * Cancels everything and joins the threads, then runs every callback still
+ * owed on the calling thread (unfinished jobs and watches with
+ * PDOT_E_CANCELLED) so their user data can be released. Frees the client.
+ */
+void pdot_async_free(pdot_async *a);
+
+/* Runs the callbacks for everything finished so far; returns how many ran. */
+int pdot_async_poll(pdot_async *a);
+
+/*
+ * Optional: wake(ud) is called from a background thread whenever callbacks
+ * are waiting, for loops that sleep instead of polling every frame.
+ */
+void pdot_async_set_wake(pdot_async *a, void (*wake)(void *ud), void *ud);
+
+/*
+ * Cancels a queued or running job (its callback gets PDOT_E_CANCELLED) or
+ * ends a watch (one final callback with PDOT_E_CANCELLED). A running store
+ * may still land on chain. PDOT_E_NOTFOUND if the id is not pending.
+ */
+int pdot_async_cancel(pdot_async *a, uint64_t id);
+
+/*
+ * Runs work(c, ud) on the worker thread with the async's client; the callback
+ * gets its return code and no result. Long-running work should return
+ * PDOT_E_CANCELLED once pdot_client_cancelled(c) is 1; library calls made
+ * inside it already do. pdot_client_checkpoint inside work saves the
+ * verifier's progress.
+ */
+uint64_t pdot_async_run(pdot_async *a, int (*work)(pdot_client *c, void *ud),
+                        pdot_result_fn done, void *ud);
+
+/* Bulletin Chain. Data and signers are copied; an external signer's ctx must outlive the job. */
+uint64_t pdot_async_store(pdot_async *a, const pdot_signer *s, const uint8_t *data,
+                          size_t len, pdot_result_fn done, void *ud);       /* pdot_store_result */
+/* progress (may be NULL) also runs inside pdot_async_poll. */
+uint64_t pdot_async_store_chunked(pdot_async *a, const pdot_signer *s, const uint8_t *data,
+                                  size_t len, size_t chunk_size, pdot_progress_fn progress,
+                                  pdot_result_fn done, void *ud);           /* pdot_chunked_result */
+uint64_t pdot_async_renew(pdot_async *a, const pdot_signer *s, const pdot_cid *cid,
+                          pdot_result_fn done, void *ud);                   /* pdot_tx_result */
+uint64_t pdot_async_verify_cid(pdot_async *a, const pdot_cid *cid,
+                               pdot_result_fn done, void *ud);              /* pdot_storage_proof */
+uint64_t pdot_async_authorization(pdot_async *a, const uint8_t account_id[32],
+                                  pdot_result_fn done, void *ud);           /* pdot_authorization */
+
+/* Fetched data, for pdot_async_fetch. */
+typedef struct {
+    const uint8_t *data;
+    size_t         len;
+} pdot_bytes;
+
+uint64_t pdot_async_fetch(pdot_async *a, const pdot_cid *cid,
+                          pdot_result_fn done, void *ud);                   /* pdot_bytes */
+
+/* Asset Hub reads. */
+uint64_t pdot_async_balance(pdot_async *a, const uint8_t account_id[32],
+                            pdot_result_fn done, void *ud);                 /* pdot_balance */
+uint64_t pdot_async_asset_balance(pdot_async *a, uint32_t asset_id, const uint8_t account_id[32],
+                                  pdot_result_fn done, void *ud);           /* pdot_asset_balance */
+uint64_t pdot_async_asset_info(pdot_async *a, uint32_t asset_id,
+                               pdot_result_fn done, void *ud);              /* pdot_asset_info */
+uint64_t pdot_async_nft_item(pdot_async *a, uint32_t collection, uint32_t item,
+                             pdot_result_fn done, void *ud);                /* pdot_nft_item */
+
+/* Owned items, for pdot_async_nft_owned. */
+typedef struct {
+    const uint32_t  *items;
+    size_t           n;
+    pdot_final_block at;
+} pdot_nft_list;
+
+uint64_t pdot_async_nft_owned(pdot_async *a, const uint8_t account_id[32], uint32_t collection,
+                              size_t max, pdot_result_fn done, void *ud);   /* pdot_nft_list */
+
+/*
+ * Watches: the callback runs repeatedly until pdot_async_cancel or
+ * pdot_async_free. A failed read is reported too (rc < 0, no result) and
+ * retried; the value is reported again once reads work.
+ */
+uint64_t pdot_async_watch_head(pdot_async *a, pdot_result_fn fn, void *ud); /* pdot_final_block */
+uint64_t pdot_async_watch_storage(pdot_async *a, const uint8_t *key, size_t key_len,
+                                  pdot_result_fn fn, void *ud);             /* pdot_storage_value */
+uint64_t pdot_async_watch_balance(pdot_async *a, const uint8_t account_id[32],
+                                  pdot_result_fn fn, void *ud);             /* pdot_balance */
+uint64_t pdot_async_watch_asset_balance(pdot_async *a, uint32_t asset_id,
+                                        const uint8_t account_id[32],
+                                        pdot_result_fn fn, void *ud);       /* pdot_asset_balance */
+uint64_t pdot_async_watch_nft_item(pdot_async *a, uint32_t collection, uint32_t item,
+                                   pdot_result_fn fn, void *ud);            /* pdot_nft_item */
 
 #ifdef __cplusplus
 }

@@ -2,9 +2,19 @@
  * pdot-bulletin: store and retrieve data on the Polkadot Bulletin Chain.
  * SPDX-License-Identifier: Apache-2.0
  */
+/* nanosleep is POSIX; strict -std=c99 hides it on glibc without this. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 #include "pdot.h"
 
@@ -28,6 +38,17 @@ static const char usage[] =
     "                          grant storage (signer must be a registered authorizer)\n"
     "  metadata-hash           print the RFC-0078 metadata hash transactions are signed with\n"
     "\n"
+    "chain state at the newest final block (Asset Hub, or any chain with these pallets):\n"
+    "  balance ADDRESS         native token balance\n"
+    "  asset ID [ADDRESS]      a fungible asset, and ADDRESS's holding of it\n"
+    "  nft COLLECTION ITEM     an NFT's owner and metadata\n"
+    "  nft-attr COLLECTION ITEM|- KEY\n"
+    "                          an attribute set by the collection owner (- for the collection)\n"
+    "  nfts ADDRESS COLLECTION [MAX]\n"
+    "                          items of a collection ADDRESS owns (default MAX 100)\n"
+    "  watch head | balance ADDRESS | asset ID ADDRESS | nft COLLECTION ITEM\n"
+    "                          report the value at each change (through pdot_async)\n"
+    "\n"
     "options:\n"
     "  --rpc URL               node RPC (default http://127.0.0.1:9944)\n"
     "  --gateway URL           IPFS HTTP gateway (default: bitswap_v1_get on the node)\n"
@@ -45,7 +66,9 @@ static const char usage[] =
     "verification (results are proven, not taken from the RPC node):\n"
     "  --relay URL             relay-chain RPC (Westend, Paseo, Polkadot)\n"
     "  --para-id N             Bulletin parachain id: Westend 2487, Paseo 1501, Polkadot 1010\n"
-    "  --checkpoint FILE       trusted GRANDPA checkpoint; updated after each run\n";
+    "  --checkpoint FILE       trusted GRANDPA checkpoint; updated after each run\n"
+    "                          (Asset Hub is --para-id 1000 under every relay chain)\n"
+    "  --count N               watch: stop after N reports (default: run until killed)\n";
 
 struct opts {
     const char *rpc, *gateway, *scheme, *seed_hex, *seed_file;
@@ -55,6 +78,7 @@ struct opts {
     const char *relay, *checkpoint;
     unsigned para_id;
     const char *mdhash;  /* "on", "off" or SYMBOL:DECIMALS */
+    unsigned count;      /* watch: stop after this many reports; 0: never */
 };
 
 static int die(const char *what, int rc, const pdot_client *c)
@@ -413,10 +437,293 @@ static int parse_u32(const char *s, uint32_t *v)
     return 0;
 }
 
+/* ---- Chain state ---------------------------------------------------------- */
+
+static void print_at(const pdot_final_block *at)
+{
+    if (at->verified)
+        printf("  at:         final #%u, proven from relay #%u\n", at->number, at->relay_block);
+    else
+        printf("  at:         final #%u (the RPC node's finalized head)\n", at->number);
+}
+
+static void print_amount(const char *label, pdot_u128 v, uint8_t decimals, const char *symbol)
+{
+    char text[96];
+
+    if (pdot_u128_format(v, decimals, text, sizeof text))
+        strcpy(text, "?");
+    printf("%s%s %s\n", label, text, symbol);
+}
+
+static void print_balance(const pdot_balance *b, uint8_t decimals, const char *symbol)
+{
+    if (!b->exists) {
+        printf("  no account\n");
+    } else {
+        print_amount("  free:       ", b->free, decimals, symbol);
+        print_amount("  reserved:   ", b->reserved, decimals, symbol);
+        print_amount("  frozen:     ", b->frozen, decimals, symbol);
+        printf("  nonce:      %u\n", b->nonce);
+    }
+    print_at(&b->at);
+}
+
+static void print_nft(const pdot_nft_item *n, unsigned prefix)
+{
+    if (!n->exists) {
+        printf("  no such item\n");
+    } else {
+        print_account("  owner:      ", n->owner, prefix);
+        if (n->has_metadata)
+            printf("  metadata:   %.*s\n", (int)n->metadata_len, (const char *)n->metadata);
+    }
+    print_at(&n->at);
+}
+
+static int cmd_balance(pdot_client *c, const uint8_t id[32], unsigned prefix)
+{
+    pdot_balance b;
+    char symbol[32];
+    uint8_t decimals;
+    int rc;
+
+    if ((rc = pdot_client_token(c, symbol, sizeof symbol, &decimals)) ||
+        (rc = pdot_balance_get(c, id, &b)))
+        return die("balance", rc, c);
+    print_account("account:    ", id, prefix);
+    print_balance(&b, decimals, symbol);
+    return 0;
+}
+
+static int cmd_asset(pdot_client *c, uint32_t asset, const uint8_t *who, unsigned prefix)
+{
+    pdot_asset_info info;
+    pdot_asset_balance bal;
+    char supply[96];
+    int rc;
+
+    if ((rc = pdot_asset_info_get(c, asset, &info)))
+        return die("asset", rc, c);
+    printf("asset:      %u\n", asset);
+    if (!info.exists) {
+        printf("  no such asset\n");
+        print_at(&info.at);
+        return 1;
+    }
+    printf("  name:       %s\n  symbol:     %s\n  decimals:   %u\n", info.name, info.symbol,
+           info.decimals);
+    if (pdot_u128_format(info.supply, info.decimals, supply, sizeof supply))
+        strcpy(supply, "?");
+    printf("  supply:     %s %s\n  holders:    %u\n", supply, info.symbol, info.accounts);
+    print_account("  owner:      ", info.owner, prefix);
+    printf("  status:     %s%s\n", info.live ? "live" : "frozen or being destroyed",
+           info.sufficient ? ", sufficient" : "");
+    print_at(&info.at);
+    if (!who)
+        return 0;
+    if ((rc = pdot_asset_balance_get(c, asset, who, &bal)))
+        return die("asset balance", rc, c);
+    print_account("holder:     ", who, prefix);
+    if (bal.exists)
+        print_amount(bal.frozen ? "  balance:    (frozen) " : "  balance:    ", bal.balance,
+                     info.decimals, info.symbol);
+    else
+        printf("  holds none\n");
+    print_at(&bal.at);
+    return 0;
+}
+
+static int cmd_nft(pdot_client *c, uint32_t collection, uint32_t item, unsigned prefix)
+{
+    pdot_nft_item n;
+    int rc;
+
+    if ((rc = pdot_nft_item_get(c, collection, item, &n)))
+        return die("nft", rc, c);
+    printf("nft:        collection %u, item %u\n", collection, item);
+    print_nft(&n, prefix);
+    return n.exists ? 0 : 1;
+}
+
+static int cmd_nft_attr(pdot_client *c, uint32_t collection, const char *item, const char *key)
+{
+    pdot_nft_attribute a;
+    uint32_t id = 0;
+    int has_item = strcmp(item, "-") != 0, rc;
+
+    if (has_item && parse_u32(item, &id)) {
+        fprintf(stderr, "error: ITEM is a number or -\n");
+        return 2;
+    }
+    if ((rc = pdot_nft_attribute_get(c, collection, has_item, id, PDOT_NFT_NS_COLLECTION_OWNER,
+                                     NULL, (const uint8_t *)key, strlen(key), &a)))
+        return die("nft attribute", rc, c);
+    if (a.exists)
+        printf("%s = %.*s\n", key, (int)a.len, (const char *)a.value);
+    else
+        printf("%s is not set\n", key);
+    print_at(&a.at);
+    return a.exists ? 0 : 1;
+}
+
+static int cmd_nfts(pdot_client *c, const uint8_t who[32], uint32_t collection, size_t max,
+                    unsigned prefix)
+{
+    pdot_final_block at;
+    uint32_t *items;
+    size_t n, i;
+    int rc;
+
+    if ((rc = pdot_nft_owned(c, who, collection, max, &items, &n, &at)))
+        return die("owned nfts", rc, c);
+    print_account("owner:      ", who, prefix);
+    printf("  collection %u: %zu item%s%s\n", collection, n, n == 1 ? "" : "s",
+           n == max ? " (limit reached)" : "");
+    for (i = 0; i < n; i++)
+        printf("  item %u\n", items[i]);
+    if (at.verified)
+        printf("  each proven owned; the node could still leave items out\n");
+    print_at(&at);
+    pdot_free(items);
+    return 0;
+}
+
+/* ---- watch: pdot_async ---------------------------------------------------- */
+
+struct watch_ctx {
+    unsigned seen, count;
+    unsigned prefix;
+    int      kind;  /* 0 head, 1 balance, 2 asset, 3 nft */
+    uint8_t  decimals;
+    char     symbol[32];
+};
+
+static void on_watch(void *ud, int rc, const char *error, const void *result)
+{
+    struct watch_ctx *w = ud;
+
+    if (rc == PDOT_E_CANCELLED)
+        return;
+    if (rc) {
+        fprintf(stderr, "watch: %s (retrying)\n", error);
+        return;
+    }
+    w->seen++;
+    switch (w->kind) {
+    case 0: {
+        const pdot_final_block *b = result;
+        if (b->verified)
+            printf("final #%u, proven from relay #%u\n", b->number, b->relay_block);
+        else
+            printf("final #%u\n", b->number);
+        break;
+    }
+    case 1:
+        printf("balance:\n");
+        print_balance(result, w->decimals, w->symbol);
+        break;
+    case 2: {
+        const pdot_asset_balance *b = result;
+        printf("asset holding:\n");
+        if (b->exists)
+            print_amount("  balance:    ", b->balance, w->decimals, w->symbol);
+        else
+            printf("  holds none\n");
+        print_at(&b->at);
+        break;
+    }
+    case 3:
+        printf("nft:\n");
+        print_nft(result, w->prefix);
+        break;
+    }
+    fflush(stdout);
+}
+
+static void sleep_ms(unsigned ms)
+{
+#if defined(_WIN32)
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
+/* Picks the watch from argv; 0, or an exit code. */
+static int parse_watch(pdot_client *c, int argc, char **argv, int i, struct watch_ctx *w,
+                       uint8_t who[32], uint32_t *x, uint32_t *y)
+{
+    int rc;
+
+    if (i < argc && strcmp(argv[i], "head") == 0) {
+        w->kind = 0;
+    } else if (i + 1 < argc && strcmp(argv[i], "balance") == 0) {
+        w->kind = 1;
+        if (pdot_ss58_decode(argv[i + 1], who, NULL))
+            return die("parsing address", PDOT_E_INVALID, NULL);
+        if ((rc = pdot_client_token(c, w->symbol, sizeof w->symbol, &w->decimals)))
+            return die("token", rc, c);
+    } else if (i + 2 < argc && strcmp(argv[i], "asset") == 0) {
+        pdot_asset_info info;
+        w->kind = 2;
+        if (parse_u32(argv[i + 1], x) || pdot_ss58_decode(argv[i + 2], who, NULL))
+            return die("parsing ID ADDRESS", PDOT_E_INVALID, NULL);
+        if ((rc = pdot_asset_info_get(c, *x, &info)))
+            return die("asset", rc, c);
+        w->decimals = info.decimals;
+        strcpy(w->symbol, info.symbol);
+    } else if (i + 2 < argc && strcmp(argv[i], "nft") == 0) {
+        w->kind = 3;
+        if (parse_u32(argv[i + 1], x) || parse_u32(argv[i + 2], y))
+            return die("parsing COLLECTION ITEM", PDOT_E_INVALID, NULL);
+    } else {
+        fputs(usage, stderr);
+        return 2;
+    }
+    return 0;
+}
+
+/* Watches until --count reports. Takes over the client. */
+static int cmd_watch(pdot_client *c, int argc, char **argv, int i, const struct opts *o)
+{
+    struct watch_ctx w;
+    pdot_async *a;
+    uint8_t who[32];
+    uint32_t x = 0, y = 0;
+    uint64_t id = 0;
+    int rc;
+
+    memset(&w, 0, sizeof w);
+    w.count = o->count;
+    w.prefix = o->prefix;
+    if ((rc = parse_watch(c, argc, argv, i, &w, who, &x, &y)) != 0 ||
+        !(a = pdot_async_new(c))) {
+        pdot_client_free(c);
+        return rc ? rc : die("async", PDOT_E_NOMEM, NULL);
+    }
+    switch (w.kind) {
+    case 0: id = pdot_async_watch_head(a, on_watch, &w); break;
+    case 1: id = pdot_async_watch_balance(a, who, on_watch, &w); break;
+    case 2: id = pdot_async_watch_asset_balance(a, x, who, on_watch, &w); break;
+    case 3: id = pdot_async_watch_nft_item(a, x, y, on_watch, &w); break;
+    }
+    /* A stand-in for a game loop: poll each frame, render, sleep. */
+    while (id && (!w.count || w.seen < w.count)) {
+        pdot_async_poll(a);
+        sleep_ms(16);
+    }
+    pdot_async_free(a);
+    return id ? 0 : die("watch", PDOT_E_NOMEM, NULL);
+}
+
 int main(int argc, char **argv)
 {
     struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0, 0,
-                      NULL, NULL, 0, "on" };
+                      NULL, NULL, 0, "on", 0 };
     pdot_client *c;
     pdot_signer s;
     const char *cmd;
@@ -444,6 +751,7 @@ int main(int argc, char **argv)
         else if (strcmp(k, "--para-id") == 0) o.para_id = (unsigned)strtoul(v, NULL, 10);
         else if (strcmp(k, "--checkpoint") == 0) o.checkpoint = v;
         else if (strcmp(k, "--metadata-hash") == 0) o.mdhash = v;
+        else if (strcmp(k, "--count") == 0) o.count = (unsigned)strtoul(v, NULL, 10);
         else {
             fprintf(stderr, "error: unknown option %s\n%s", k, usage);
             return 2;
@@ -513,6 +821,51 @@ int main(int argc, char **argv)
             rc = die("parsing CID", rc, NULL);
         else
             rc = cmd_fetch(c, &cid, i + 1 < argc ? argv[i + 1] : "-", NULL);
+    } else if (strcmp(cmd, "balance") == 0 && i < argc) {
+        uint8_t id[32];
+        if ((rc = pdot_ss58_decode(argv[i], id, NULL)))
+            rc = die("parsing address", rc, NULL);
+        else
+            rc = cmd_balance(c, id, o.prefix);
+    } else if (strcmp(cmd, "asset") == 0 && i < argc) {
+        uint8_t id[32];
+        uint32_t asset;
+        if (parse_u32(argv[i], &asset) ||
+            (i + 1 < argc && pdot_ss58_decode(argv[i + 1], id, NULL))) {
+            fprintf(stderr, "error: expected ID [ADDRESS]\n");
+            rc = 2;
+        } else {
+            rc = cmd_asset(c, asset, i + 1 < argc ? id : NULL, o.prefix);
+        }
+    } else if (strcmp(cmd, "nft") == 0 && i + 1 < argc) {
+        uint32_t coll, item;
+        if (parse_u32(argv[i], &coll) || parse_u32(argv[i + 1], &item)) {
+            fprintf(stderr, "error: expected COLLECTION ITEM\n");
+            rc = 2;
+        } else {
+            rc = cmd_nft(c, coll, item, o.prefix);
+        }
+    } else if (strcmp(cmd, "nft-attr") == 0 && i + 2 < argc) {
+        uint32_t coll;
+        if (parse_u32(argv[i], &coll)) {
+            fprintf(stderr, "error: expected COLLECTION ITEM|- KEY\n");
+            rc = 2;
+        } else {
+            rc = cmd_nft_attr(c, coll, argv[i + 1], argv[i + 2]);
+        }
+    } else if (strcmp(cmd, "nfts") == 0 && i + 1 < argc) {
+        uint8_t id[32];
+        uint32_t coll, max = 100;
+        if (pdot_ss58_decode(argv[i], id, NULL) || parse_u32(argv[i + 1], &coll) ||
+            (i + 2 < argc && parse_u32(argv[i + 2], &max))) {
+            fprintf(stderr, "error: expected ADDRESS COLLECTION [MAX]\n");
+            rc = 2;
+        } else {
+            rc = cmd_nfts(c, id, coll, max, o.prefix);
+        }
+    } else if (strcmp(cmd, "watch") == 0) {
+        rc = cmd_watch(c, argc, argv, i, &o);
+        return rc;  /* pdot_async_free freed the client */
     } else if (strcmp(cmd, "authorized") == 0 && i < argc) {
         uint8_t id[32];
         if ((rc = pdot_ss58_decode(argv[i], id, NULL)))

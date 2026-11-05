@@ -229,9 +229,10 @@ static int change_enacted_at(pdot_client *c, const uint8_t t_hash[32], int max_w
 
 /*
  * Proves the newest final relay block reachable from the anchor, advancing
- * the trusted set through every change on the way.
+ * the trusted set through every change on the way. With wait 0 the anchor
+ * itself is the answer when no newer proof is available yet.
  */
-static int relay_final(pdot_client *c, uint8_t hash[32], uint32_t *number)
+static int relay_final(pdot_client *c, uint8_t hash[32], uint32_t *number, int wait)
 {
     pdot_verifier *v = c->verifier;
     time_t deadline = time(NULL) + VERIFY_TIMEOUT_S;
@@ -250,10 +251,16 @@ static int relay_final(pdot_client *c, uint8_t hash[32], uint32_t *number)
         /* The set's latest justification, or the one ending it. */
         rc = pdot_rpc_prove_finality(v->relay, v->anchor_number + 1, &proof, &plen);
         if (rc == PDOT_E_RPC || rc == PDOT_E_NOTFOUND) {
+            if (!wait) {  /* the anchor is the newest final block */
+                memcpy(hash, v->anchor_hash, 32);
+                *number = v->anchor_number;
+                return 0;
+            }
             if (time(NULL) > deadline)
                 return pdot_fail(c, PDOT_E_TIMEOUT, "no relay finality proof after #%u: %s",
                                  v->anchor_number, pdot_last_error(v->relay));
-            pdot_sleep_ms(c->poll_ms);  /* the anchor is the newest final block */
+            if ((rc = pdot_client_wait(c, c->poll_ms)))
+                return pdot_fail(c, rc, "cancelled");
             walked--;
             continue;
         }
@@ -342,6 +349,40 @@ static int read_proven(pdot_client *c, pdot_client *rpc, const uint8_t root[32],
     return rc;
 }
 
+/* Proves the parachain head stored in final relay block rhash. */
+static int prove_para_head(pdot_client *c, const uint8_t rhash[32], uint32_t rnum)
+{
+    pdot_verifier *v = c->verifier;
+    uint8_t key[44], *value = NULL;
+    size_t vlen = 0;
+    pdot_buf enc;
+    pdot_header rh, ph;
+    pdot_reader r;
+    const uint8_t *hd;
+    size_t hdlen;
+    int rc;
+
+    if ((rc = proven_header(c, v->relay, rhash, &enc, &rh)))
+        return rc;
+    pdot_buf_free(&enc);
+
+    paras_heads_key(v->para_id, key);
+    rc = read_proven(c, v->relay, rh.state_root, rhash, key, sizeof key, &value, &vlen);
+    if (rc == PDOT_E_NOTFOUND)
+        return pdot_fail(c, PDOT_E_UNVERIFIED, "relay chain has no parachain %u", v->para_id);
+    if (rc)
+        return rc;
+    pdot_reader_init(&r, value, vlen);
+    rc = pdot_read_bytes(&r, &hd, &hdlen) || pdot_header_decode(hd, hdlen, &ph);
+    free(value);
+    if (rc)
+        return pdot_fail(c, PDOT_E_UNVERIFIED, "parachain head does not decode");
+    v->head = ph;
+    v->head_relay = rnum;
+    v->have_head = 1;
+    return 0;
+}
+
 int pdot_verify_para_head(pdot_client *c, uint32_t min_number, const pdot_header **head)
 {
     pdot_verifier *v = c->verifier;
@@ -350,14 +391,8 @@ int pdot_verify_para_head(pdot_client *c, uint32_t min_number, const pdot_header
     if (!v)
         return PDOT_E_INVALID;
     for (;;) {
-        uint8_t rhash[32], key[44], *value = NULL;
+        uint8_t rhash[32];
         uint32_t rnum = 0;
-        size_t vlen = 0;
-        pdot_buf enc;
-        pdot_header rh, ph;
-        pdot_reader r;
-        const uint8_t *hd;
-        size_t hdlen;
         int rc;
 
         if (v->have_head && v->head.number >= min_number) {
@@ -366,33 +401,35 @@ int pdot_verify_para_head(pdot_client *c, uint32_t min_number, const pdot_header
         }
         if (v->have_head && time(NULL) > deadline)
             return pdot_fail(c, PDOT_E_TIMEOUT,
-                             "no final Bulletin block at or past #%u (newest proven #%u)",
+                             "no final parachain block at or past #%u (newest proven #%u)",
                              min_number, v->head.number);
-        if ((rc = relay_final(c, rhash, &rnum)))
+        if ((rc = relay_final(c, rhash, &rnum, 1)))
             return rc;
         if (v->have_head && rnum == v->head_relay) {
-            pdot_sleep_ms(c->poll_ms);
+            if ((rc = pdot_client_wait(c, c->poll_ms)))
+                return pdot_fail(c, rc, "cancelled");
             continue;
         }
-        if ((rc = proven_header(c, v->relay, rhash, &enc, &rh)))
+        if ((rc = prove_para_head(c, rhash, rnum)))
             return rc;
-        pdot_buf_free(&enc);
-
-        paras_heads_key(v->para_id, key);
-        rc = read_proven(c, v->relay, rh.state_root, rhash, key, sizeof key, &value, &vlen);
-        if (rc == PDOT_E_NOTFOUND)
-            return pdot_fail(c, PDOT_E_UNVERIFIED, "relay chain has no parachain %u", v->para_id);
-        if (rc)
-            return rc;
-        pdot_reader_init(&r, value, vlen);
-        rc = pdot_read_bytes(&r, &hd, &hdlen) || pdot_header_decode(hd, hdlen, &ph);
-        free(value);
-        if (rc)
-            return pdot_fail(c, PDOT_E_UNVERIFIED, "parachain head does not decode");
-        v->head = ph;
-        v->head_relay = rnum;
-        v->have_head = 1;
     }
+}
+
+int pdot_verify_newest_head(pdot_client *c, const pdot_header **head)
+{
+    pdot_verifier *v = c->verifier;
+    uint8_t rhash[32];
+    uint32_t rnum = 0;
+    int rc;
+
+    if (!v)
+        return PDOT_E_INVALID;
+    if ((rc = relay_final(c, rhash, &rnum, 0)))
+        return rc;
+    if (!(v->have_head && rnum == v->head_relay) && (rc = prove_para_head(c, rhash, rnum)))
+        return rc;
+    *head = &v->head;
+    return 0;
 }
 
 int pdot_verify_read(pdot_client *c, const pdot_header *head, const uint8_t *key,
@@ -401,4 +438,37 @@ int pdot_verify_read(pdot_client *c, const pdot_header *head, const uint8_t *key
     *value = NULL;
     *value_len = 0;
     return read_proven(c, c, head->state_root, head->hash, key, key_len, value, value_len);
+}
+
+int pdot_verify_read_many(pdot_client *c, const pdot_header *head, const uint8_t *const *keys,
+                          const size_t *lens, size_t nkeys, pdot_value *values)
+{
+    pdot_trie_proof proof;
+    size_t i;
+    int rc;
+
+    memset(values, 0, nkeys * sizeof *values);
+    if ((rc = pdot_rpc_read_proof_keys(c, keys, lens, nkeys, head->hash, &proof)))
+        return rc;
+    for (i = 0; i < nkeys && !rc; i++) {
+        const uint8_t *v;
+        size_t vl;
+
+        rc = pdot_trie_read(head->state_root, proof.nodes, proof.n, keys[i], lens[i], &v, &vl);
+        if (rc == PDOT_E_NOTFOUND) {
+            rc = 0;
+        } else if (rc) {
+            rc = pdot_fail(c, PDOT_E_UNVERIFIED, "read proof does not verify against the state root");
+        } else if (!(values[i].data = malloc(vl ? vl : 1))) {
+            rc = PDOT_E_NOMEM;
+        } else {
+            memcpy(values[i].data, v, vl);
+            values[i].len = vl;
+            values[i].present = 1;
+        }
+    }
+    pdot_trie_proof_free(&proof);
+    if (rc)
+        pdot_values_free(values, nkeys);
+    return rc;
 }

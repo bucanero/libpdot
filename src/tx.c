@@ -299,6 +299,7 @@ int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
                 return pdot_fail(c, PDOT_E_TIMEOUT,
                                  "not included by block %u (mortality window)", last);
         }
-        pdot_sleep_ms(c->poll_ms);
+        if ((rc = pdot_client_wait(c, c->poll_ms)))
+            return pdot_fail(c, rc, "cancelled");
     }
 }

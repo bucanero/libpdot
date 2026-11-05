@@ -77,10 +77,15 @@ typedef struct pdot_metadata {
     int                have_xt_types;  /* v15 only */
     uint32_t           address_ty, call_ty, signature_ty;
     size_t             parsed_len;  /* bytes read; runtime APIs etc. follow */
+    unsigned           refs;        /* holders; pdot_metadata_free releases one */
 } pdot_metadata;
 
 /* Parses a "meta"-prefixed blob. Copies it. Returns PDOT_E_DECODE/UNSUPPORTED. */
 int  pdot_metadata_parse(const uint8_t *blob, size_t len, pdot_metadata **out);
+/*
+ * Releases one holder and frees md with the last. Holders on different
+ * threads serialize this themselves (client.c does, under its share lock).
+ */
 void pdot_metadata_free(pdot_metadata *md);
 
 const pdot_md_pallet *pdot_md_find_pallet(const pdot_metadata *md, const char *name);

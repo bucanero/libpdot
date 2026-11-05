@@ -22,6 +22,7 @@ struct pdot_client {
     uint32_t spec_version;
     uint32_t tx_version;
     pdot_metadata *md;         /* parsed for spec_version */
+    struct pdot_md_share *share;  /* metadata shared with clones; NULL if none */
 
     /* CheckMetadataHash (RFC-0078), refreshed with the metadata. */
     int      mdhash_on;
@@ -32,6 +33,10 @@ struct pdot_client {
     uint8_t  mdhash[32];
 
     struct pdot_verifier *verifier;  /* NULL: RPC answers are trusted */
+
+    /* Nonzero from stop(stop_ud) abandons the current call (pdot_async). */
+    int    (*stop)(void *ud);
+    void    *stop_ud;
 };
 
 /* Records a message for pdot_last_error and returns code. */
@@ -42,6 +47,19 @@ int pdot_fail(pdot_client *c, int code, const char *fmt, ...)
     ;
 
 void pdot_sleep_ms(unsigned ms);
+
+/* 1 once c->stop asks the current call to give up. */
+int  pdot_client_stopped(pdot_client *c);
+/* Sleeps up to ms, or PDOT_E_CANCELLED as soon as the client is stopped. */
+int  pdot_client_wait(pdot_client *c, unsigned ms);
+/* Sets the stop hook on c and on its verifier's relay client. */
+void pdot_client_set_stop(pdot_client *c, int (*stop)(void *), void *ud);
+/*
+ * A second client with the same endpoints, settings and verifier state. The
+ * two (and further clones) share downloaded metadata, so each runtime
+ * version is fetched once, by whichever syncs first.
+ */
+pdot_client *pdot_client_clone(pdot_client *c);
 
 /* Fetches genesis and runtime version; refetches metadata if specVersion changed. */
 int pdot_chain_sync(pdot_client *c);

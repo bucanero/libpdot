@@ -51,6 +51,28 @@ int pdot_rpc_header(pdot_client *c, const uint8_t hash[32], pdot_buf *encoded);
 /* state_getReadProof([key], at). Node hashes are computed. */
 int pdot_rpc_read_proof(pdot_client *c, const uint8_t *key, size_t key_len,
                         const uint8_t at[32], pdot_trie_proof *proof);
+/* One proof covering several keys. */
+int pdot_rpc_read_proof_keys(pdot_client *c, const uint8_t *const *keys, const size_t *lens,
+                             size_t nkeys, const uint8_t at[32], pdot_trie_proof *proof);
+
+/* A storage value read by key; data is NULL and present 0 when absent. */
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+    int      present;
+} pdot_value;
+
+void pdot_values_free(pdot_value *values, size_t n);
+
+/* state_queryStorageAt(keys, at): values[i] for keys[i]. */
+int pdot_rpc_query_storage_at(pdot_client *c, const uint8_t *const *keys, const size_t *lens,
+                              size_t nkeys, const uint8_t at[32], pdot_value *values);
+
+/* state_getKeysPaged(prefix, count, start, at): a cJSON array of hex keys. */
+int pdot_rpc_keys_paged(pdot_client *c, const uint8_t *prefix, size_t prefix_len,
+                        uint32_t count, const uint8_t *start, size_t start_len,
+                        const uint8_t at[32], cJSON **keys);
+
 /* grandpa_proveFinality(number): an encoded FinalityProof, or PDOT_E_NOTFOUND. */
 int pdot_rpc_prove_finality(pdot_client *c, uint32_t number, uint8_t **proof, size_t *len);
 int pdot_rpc_state_call(pdot_client *c, const char *fn, const uint8_t *args,
