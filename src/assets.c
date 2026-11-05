@@ -132,6 +132,11 @@ int pdot_query_keys(pdot_client *c, const pdot_query *q, pdot_buf keys[PDOT_Q_MA
             rc = full_key(c, "Nfts", "ItemMetadataOf", p, 2, 3, &keys[1]);
         *nkeys = 2;
         return rc;
+    case PDOT_Q_PROXIES:
+        p[0].p = q->account; p[0].len = 32;
+        rc = full_key(c, "Proxy", "Proxies", p, 1, 0, &keys[0]);
+        *nkeys = 1;
+        return rc;
     case PDOT_Q_NFT_ATTRIBUTE: {
         pdot_buf opt, ns, k;
 
@@ -308,6 +313,91 @@ static int decode_nft_attribute(const pdot_metadata *md, const pdot_value *v,
     return 0;
 }
 
+/* Element type of a Vec<T>, or of a one-field wrapper of one (BoundedVec). */
+static int seq_elem(const pdot_metadata *md, uint32_t ty, uint32_t *elem)
+{
+    enum pdot_typedef kind;
+    pdot_reader t;
+    pdot_md_field f;
+    size_t nf;
+    uint64_t n;
+    int depth;
+
+    for (depth = 0; depth < 4; depth++) {
+        if (pdot_md_typedef(md, ty, &t, &kind))
+            return PDOT_E_METADATA;
+        if (kind == PDOT_TYPE_SEQUENCE) {
+            if (pdot_read_compact(&t, &n) || n >= md->ntypes)
+                return PDOT_E_METADATA;
+            *elem = (uint32_t)n;
+            return 0;
+        }
+        if (kind != PDOT_TYPE_COMPOSITE || pdot_md_fields(md, ty, &f, 1, &nf) || nf != 1)
+            return PDOT_E_METADATA;
+        ty = f.ty;
+    }
+    return PDOT_E_METADATA;
+}
+
+/* (BoundedVec<ProxyDefinition { delegate, proxy_type, delay }>, deposit) */
+static int decode_proxies(const pdot_metadata *md, const pdot_value *v, pdot_proxies *out)
+{
+    pdot_md_field f[2], df;
+    pdot_md_iter it;
+    pdot_reader r;
+    uint32_t elem;
+    uint64_t n, i, delay;
+    size_t nf;
+    int rc;
+
+    if (!v->present)
+        return 0;
+    if (pdot_md_fields(md, value_type(md, "Proxy", "Proxies"), f, 2, &nf) || nf != 2 ||
+        seq_elem(md, f[0].ty, &elem))
+        return PDOT_E_METADATA;
+    pdot_reader_init(&r, v->data, v->len);
+    if (pdot_read_compact(&r, &n))
+        return PDOT_E_DECODE;
+    for (i = 0; i < n; i++) {
+        pdot_proxy_def def;
+
+        memset(&def, 0, sizeof def);
+        if (pdot_md_iter_fields(md, elem, &it))
+            return PDOT_E_METADATA;
+        while ((rc = pdot_md_iter_next(&it, &df)) == 1) {
+            if (pdot_md_name_eq(df.name, df.name_len, "delegate")) {
+                const uint8_t *p;
+                size_t len;
+                if ((rc = pdot_decode_bytes(md, df.ty, &r, &p, &len)) || len != 32)
+                    return rc ? rc : PDOT_E_METADATA;
+                memcpy(def.delegate, p, 32);
+            } else if (pdot_md_name_eq(df.name, df.name_len, "proxy_type")) {
+                pdot_md_iter vf;
+                pdot_md_field x;
+                const char *name;
+                size_t len;
+                if ((rc = pdot_decode_variant(md, df.ty, &r, &vf, &name, &len)))
+                    return rc;
+                copy_text(def.type, sizeof def.type, (const uint8_t *)name, len);
+                while ((rc = pdot_md_iter_next(&vf, &x)) == 1)
+                    if ((rc = pdot_decode_skip(md, x.ty, &r)))
+                        return rc;
+            } else if (pdot_md_name_eq(df.name, df.name_len, "delay")) {
+                if ((rc = pdot_decode_uint(md, df.ty, &r, &delay)))
+                    return rc;
+                def.delay = (uint32_t)delay;
+            } else if ((rc = pdot_decode_skip(md, df.ty, &r))) {
+                return rc;
+            }
+        }
+        if (rc < 0)
+            return rc;
+        if (out->n < PDOT_PROXIES_MAX)
+            out->list[out->n++] = def;
+    }
+    return pdot_decode_u128(md, f[1].ty, &r, &out->deposit);
+}
+
 size_t pdot_query_result_size(int kind)
 {
     switch (kind) {
@@ -317,6 +407,7 @@ size_t pdot_query_result_size(int kind)
     case PDOT_Q_ASSET_INFO:    return sizeof(pdot_asset_info);
     case PDOT_Q_NFT_ITEM:      return sizeof(pdot_nft_item);
     case PDOT_Q_NFT_ATTRIBUTE: return sizeof(pdot_nft_attribute);
+    case PDOT_Q_PROXIES:       return sizeof(pdot_proxies);
     default:                   return 0;
     }
 }
@@ -326,7 +417,7 @@ int pdot_query_decode(pdot_client *c, const pdot_query *q, pdot_value *values,
 {
     static const char *const what[] = {
         "storage", "System.Account", "Assets.Account", "Assets.Asset", "Nfts.Item",
-        "Nfts.Attribute"
+        "Nfts.Attribute", "Proxy.Proxies"
     };
     int rc;
 
@@ -360,6 +451,10 @@ int pdot_query_decode(pdot_client *c, const pdot_query *q, pdot_value *values,
     case PDOT_Q_NFT_ATTRIBUTE:
         rc = decode_nft_attribute(c->md, values, out);
         ((pdot_nft_attribute *)out)->at = *at;
+        break;
+    case PDOT_Q_PROXIES:
+        rc = decode_proxies(c->md, values, out);
+        ((pdot_proxies *)out)->at = *at;
         break;
     default:
         return PDOT_E_INVALID;
@@ -467,6 +562,18 @@ int pdot_nft_attribute_get(pdot_client *c, uint32_t collection, int has_item, ui
         memcpy(q.account, ns_account, 32);
     q.bytes = key;
     q.len = key_len;
+    return pdot_query_run(c, &q, out);
+}
+
+int pdot_proxies_get(pdot_client *c, const uint8_t account_id[32], pdot_proxies *out)
+{
+    pdot_query q;
+
+    if (!c || !account_id || !out)
+        return PDOT_E_INVALID;
+    memset(&q, 0, sizeof q);
+    q.kind = PDOT_Q_PROXIES;
+    memcpy(q.account, account_id, 32);
     return pdot_query_run(c, &q, out);
 }
 

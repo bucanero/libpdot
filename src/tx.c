@@ -25,7 +25,7 @@ uint16_t pdot_era_mortal(uint32_t period, uint32_t current)
 
 enum ext_kind {
     EXT_NONE, EXT_SPEC, EXT_TXVER, EXT_GENESIS, EXT_MORTALITY, EXT_NONCE,
-    EXT_TIP, EXT_METADATA_HASH
+    EXT_TIP, EXT_ASSET_TIP, EXT_METADATA_HASH
 };
 
 static const struct {
@@ -41,8 +41,41 @@ static const struct {
     { "CheckNonce", EXT_NONCE },
     { "CheckWeight", EXT_NONE },
     { "ChargeTransactionPayment", EXT_TIP },
+    { "ChargeAssetTxPayment", EXT_ASSET_TIP },
     { "CheckMetadataHash", EXT_METADATA_HASH },
 };
+
+/*
+ * ChargeAssetTxPayment { tip: Compact<u128>, asset_id: Option<_> }, and the
+ * asset-conversion variant of it: the tip, and fees paid in the native token.
+ */
+static int asset_tip(pdot_client *c, const pdot_tx_params *p, const pdot_md_extension *e,
+                     pdot_buf *explicit_)
+{
+    pdot_md_iter it;
+    pdot_md_field f;
+    enum pdot_typedef kind;
+    pdot_reader t;
+    const char *name;
+    size_t len;
+    int rc;
+
+    if (pdot_md_iter_fields(p->md, e->ty, &it))
+        return pdot_fail(c, PDOT_E_METADATA, "ChargeAssetTxPayment is not a struct");
+    while ((rc = pdot_md_iter_next(&it, &f)) == 1) {
+        if (pdot_md_name_eq(f.name, f.name_len, "tip") &&
+            pdot_md_typedef(p->md, f.ty, &t, &kind) == 0 && kind == PDOT_TYPE_COMPACT) {
+            pdot_scale_compact128(explicit_, p->tip.lo, p->tip.hi);
+        } else if (pdot_md_type_name(p->md, f.ty, &name, &len) == 0 &&
+                   pdot_md_name_eq(name, len, "Option")) {
+            pdot_scale_u8(explicit_, 0);  /* None: pay in the native token */
+        } else {
+            return pdot_fail(c, PDOT_E_METADATA, "ChargeAssetTxPayment field %.*s is unexpected",
+                             (int)f.name_len, f.name);
+        }
+    }
+    return rc < 0 ? pdot_fail(c, PDOT_E_METADATA, "ChargeAssetTxPayment fields") : 0;
+}
 
 /* Appends one extension's explicit and implicit data, by the rules in the plan. */
 static int encode_ext(pdot_client *c, const pdot_tx_params *p,
@@ -79,8 +112,10 @@ static int encode_ext(pdot_client *c, const pdot_tx_params *p,
             pdot_scale_compact(explicit_, p->nonce);
             break;
         case EXT_TIP:
-            pdot_scale_compact(explicit_, p->tip);
+            pdot_scale_compact128(explicit_, p->tip.lo, p->tip.hi);
             break;
+        case EXT_ASSET_TIP:
+            return asset_tip(c, p, e, explicit_);
         case EXT_METADATA_HASH:
             if (p->metadata_hash) {
                 pdot_scale_u8(explicit_, 1);  /* Mode::Enabled */
@@ -251,7 +286,11 @@ static int read_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result 
     if (rc)
         return pdot_fail(c, rc, "cannot decode events of block #%u: %s", out->block,
                          pdot_strerror(rc));
-    if (oc->failed) {
+    if (oc->has_fee) {
+        out->has_fee = 1;
+        out->fee = oc->fee;
+    }
+    if (oc->failed || oc->proxy_failed) {
         out->dispatch = PDOT_DISPATCH_FAILED;
         snprintf(out->error, sizeof out->error, "%s", oc->error);
         return pdot_fail(c, PDOT_E_DISPATCH, "%s", oc->error);

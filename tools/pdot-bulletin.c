@@ -48,6 +48,20 @@ static const char usage[] =
     "                          items of a collection ADDRESS owns (default MAX 100)\n"
     "  watch head | balance ADDRESS | asset ID ADDRESS | nft COLLECTION ITEM\n"
     "                          report the value at each change (through pdot_async)\n"
+    "  proxies ADDRESS         accounts that may act for ADDRESS\n"
+    "\n"
+    "transactions (Asset Hub, or any chain with these pallets; --fee only estimates):\n"
+    "  transfer ADDRESS AMOUNT native token, AMOUNT in whole tokens (\"1.5\")\n"
+    "  transfer-all ADDRESS    all of the native token, closing the signer's account\n"
+    "  transfer-asset ID ADDRESS AMOUNT\n"
+    "                          a pallet-assets asset, AMOUNT in its decimals\n"
+    "  transfer-nft COLLECTION ITEM ADDRESS\n"
+    "  call PALLET CALL [JSON] any call, arguments as a JSON array or object\n"
+    "  session-key             print a new random sr25519 seed and its address\n"
+    "  proxy-add ADDRESS TYPE [FUND]\n"
+    "                          let ADDRESS act for the signer as TYPE (Any, NonTransfer,\n"
+    "                          Assets, ...), sending it FUND tokens for fees in the same tx\n"
+    "  proxy-remove ADDRESS TYPE\n"
     "\n"
     "options:\n"
     "  --rpc URL               node RPC (default http://127.0.0.1:9944)\n"
@@ -68,7 +82,13 @@ static const char usage[] =
     "  --para-id N             Bulletin parachain id: Westend 2487, Paseo 1501, Polkadot 1010\n"
     "  --checkpoint FILE       trusted GRANDPA checkpoint; updated after each run\n"
     "                          (Asset Hub is --para-id 1000 under every relay chain)\n"
-    "  --count N               watch: stop after N reports (default: run until killed)\n";
+    "  --count N               watch: stop after N reports (default: run until killed)\n"
+    "\n"
+    "transaction options:\n"
+    "  --tip AMOUNT            tip in whole tokens, for priority\n"
+    "  --as ADDRESS            sign as a proxy of ADDRESS: the call runs as ADDRESS\n"
+    "  --fee                   print what the transaction would pay; submit nothing\n"
+    "  --async                 submit through pdot_async, polling as a game loop would\n";
 
 struct opts {
     const char *rpc, *gateway, *scheme, *seed_hex, *seed_file;
@@ -79,12 +99,14 @@ struct opts {
     unsigned para_id;
     const char *mdhash;  /* "on", "off" or SYMBOL:DECIMALS */
     unsigned count;      /* watch: stop after this many reports; 0: never */
+    const char *tip, *as;
+    int fee_only, async;
 };
 
 static int die(const char *what, int rc, const pdot_client *c)
 {
     fprintf(stderr, "error: %s: %s", what, pdot_strerror(rc));
-    if (c && rc != PDOT_E_INVALID)
+    if (c && strcmp(pdot_last_error(c), "no error") != 0)
         fprintf(stderr, " (%s)", pdot_last_error(c));
     fputc('\n', stderr);
     return 1;
@@ -215,6 +237,11 @@ static void print_tx(const pdot_tx_result *tx)
         printf("  dispatch:   unknown (block state unavailable)\n");
     if (tx->verified)
         printf("  verified:   yes, proven from relay-chain finality\n");
+    if (tx->has_fee) {
+        char text[64];
+        pdot_u128_format(tx->fee, 0, text, sizeof text);
+        printf("  fee:        %s (smallest units, tip included)\n", text);
+    }
 }
 
 static int cmd_authorized(pdot_client *c, const uint8_t id[32], unsigned prefix, int *ok)
@@ -720,13 +747,239 @@ static int cmd_watch(pdot_client *c, int argc, char **argv, int i, const struct 
     return id ? 0 : die("watch", PDOT_E_NOMEM, NULL);
 }
 
+/* ---- Transactions --------------------------------------------------------- */
+
+struct tx_wait {
+    int            done, rc;
+    char           err[256];
+    pdot_tx_result tx;
+};
+
+static void on_tx(void *ud, int rc, const char *error, const void *result)
+{
+    struct tx_wait *w = ud;
+
+    w->done = 1;
+    w->rc = rc;
+    snprintf(w->err, sizeof w->err, "%s", error ? error : "");
+    if (result)
+        w->tx = *(const pdot_tx_result *)result;
+}
+
+/* Through pdot_async: submit, then poll once per "frame" until the callback ran. */
+static int submit_async(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
+                        const pdot_tx_options *to, pdot_tx_result *tx, char *err, size_t cap)
+{
+    struct tx_wait w;
+    pdot_async *a = pdot_async_new(c);
+    unsigned frames = 0;
+
+    memset(&w, 0, sizeof w);
+    if (!a || !pdot_async_submit(a, s, call, len, to, on_tx, &w)) {
+        pdot_async_free(a);
+        snprintf(err, cap, "cannot queue the transaction");
+        return PDOT_E_NOMEM;
+    }
+    while (!w.done) {
+        pdot_async_poll(a);
+        if (!w.done) {
+            sleep_ms(16);
+            frames++;
+        }
+    }
+    pdot_async_free(a);
+    fprintf(stderr, "async: done after %u frames\n", frames);
+    *tx = w.tx;
+    snprintf(err, cap, "%s", w.err);
+    return w.rc;
+}
+
+/*
+ * Estimates or submits call. With async the client is handed to pdot_async
+ * and freed; *client_gone tells the caller.
+ */
+static int run_tx(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
+                  const struct opts *o, int *client_gone)
+{
+    pdot_tx_options to;
+    uint8_t real[32];
+    char symbol[32], text[64], err[256];
+    uint8_t decimals;
+    pdot_tx_result tx;
+    int rc;
+
+    memset(&to, 0, sizeof to);
+    if ((rc = pdot_client_token(c, symbol, sizeof symbol, &decimals)))
+        return die("token", rc, c);
+    if (o->tip && pdot_u128_parse(o->tip, decimals, &to.tip)) {
+        fprintf(stderr, "error: --tip %s is not an amount of %s\n", o->tip, symbol);
+        return 2;
+    }
+    if (o->as) {
+        if (pdot_ss58_decode(o->as, real, NULL)) {
+            fprintf(stderr, "error: --as needs an SS58 address\n");
+            return 2;
+        }
+        to.proxy_for = real;
+        print_account("acting for: ", real, o->prefix);
+    }
+    if (o->fee_only) {
+        pdot_fee fee;
+        if ((rc = pdot_tx_fee(c, s, call, len, &to, &fee)))
+            return die("fee", rc, c);
+        pdot_u128_format(fee.partial_fee, decimals, text, sizeof text);
+        printf("fee:        %s %s (+ tip)\n", text, symbol);
+        pdot_u128_format(fee.partial_fee, 0, text, sizeof text);
+        printf("  units:      %s\n", text);
+        printf("  weight:     ref_time %llu, proof_size %llu, class %u\n",
+               (unsigned long long)fee.ref_time, (unsigned long long)fee.proof_size,
+               fee.dispatch_class);
+        return 0;
+    }
+    if (o->async) {
+        *client_gone = 1;
+        rc = submit_async(c, s, call, len, &to, &tx, err, sizeof err);
+    } else {
+        rc = pdot_tx_submit(c, s, call, len, &to, &tx);
+        snprintf(err, sizeof err, "%s", rc ? pdot_last_error(c) : "");
+    }
+    if (rc == 0 || rc == PDOT_E_DISPATCH)
+        print_tx(&tx);
+    if (rc) {
+        fprintf(stderr, "error: transaction: %s (%s)\n", pdot_strerror(rc), err);
+        return 1;
+    }
+    if (tx.has_fee) {
+        pdot_u128_format(tx.fee, decimals, text, sizeof text);
+        printf("paid:       %s %s\n", text, symbol);
+    }
+    return 0;
+}
+
+/* Builds the call for a transaction command; 2 on bad arguments. */
+static int tx_call(pdot_client *c, const char *cmd, int argc, char **argv, int i,
+                   uint8_t **call, size_t *len)
+{
+    pdot_transfer t;
+    char symbol[32];
+    uint8_t decimals;
+    int rc;
+
+    memset(&t, 0, sizeof t);
+    if (strcmp(cmd, "call") == 0 && i + 1 < argc) {
+        if ((rc = pdot_call_from_json(c, argv[i], argv[i + 1], i + 2 < argc ? argv[i + 2] : NULL,
+                                      call, len)))
+            return die("call", rc, c);
+        return 0;
+    }
+    if (strcmp(cmd, "transfer") == 0 && i + 1 < argc) {
+        t.kind = PDOT_TRANSFER_NATIVE;
+        if ((rc = pdot_client_token(c, symbol, sizeof symbol, &decimals)))
+            return die("token", rc, c);
+        if (pdot_ss58_decode(argv[i], t.dest, NULL) ||
+            pdot_u128_parse(argv[i + 1], decimals, &t.amount)) {
+            fprintf(stderr, "error: expected ADDRESS AMOUNT (in %s, up to %u decimals)\n",
+                    symbol, decimals);
+            return 2;
+        }
+    } else if (strcmp(cmd, "transfer-all") == 0 && i < argc) {
+        t.kind = PDOT_TRANSFER_ALL;
+        if (pdot_ss58_decode(argv[i], t.dest, NULL)) {
+            fprintf(stderr, "error: expected ADDRESS\n");
+            return 2;
+        }
+    } else if (strcmp(cmd, "transfer-asset") == 0 && i + 2 < argc) {
+        pdot_asset_info info;
+        t.kind = PDOT_TRANSFER_ASSET;
+        if (parse_u32(argv[i], &t.id) || pdot_ss58_decode(argv[i + 1], t.dest, NULL)) {
+            fprintf(stderr, "error: expected ID ADDRESS AMOUNT\n");
+            return 2;
+        }
+        if ((rc = pdot_asset_info_get(c, t.id, &info)))
+            return die("asset", rc, c);
+        if (!info.exists) {
+            fprintf(stderr, "error: asset %u does not exist\n", t.id);
+            return 1;
+        }
+        if (pdot_u128_parse(argv[i + 2], info.decimals, &t.amount)) {
+            fprintf(stderr, "error: AMOUNT must have up to %u decimals\n", info.decimals);
+            return 2;
+        }
+    } else if (strcmp(cmd, "transfer-nft") == 0 && i + 2 < argc) {
+        t.kind = PDOT_TRANSFER_NFT;
+        if (parse_u32(argv[i], &t.id) || parse_u32(argv[i + 1], &t.item) ||
+            pdot_ss58_decode(argv[i + 2], t.dest, NULL)) {
+            fprintf(stderr, "error: expected COLLECTION ITEM ADDRESS\n");
+            return 2;
+        }
+    } else {
+        return -1;  /* not a transaction command */
+    }
+    if ((rc = pdot_transfer_call(c, &t, call, len)))
+        return die(cmd, rc, c);
+    return 0;
+}
+
+static int cmd_proxies(pdot_client *c, const uint8_t who[32], unsigned prefix)
+{
+    pdot_proxies p;
+    char text[64];
+    size_t i;
+    int rc;
+
+    if ((rc = pdot_proxies_get(c, who, &p)))
+        return die("proxies", rc, c);
+    print_account("account:    ", who, prefix);
+    if (!p.n)
+        printf("  no proxies\n");
+    for (i = 0; i < p.n; i++) {
+        char addr[PDOT_SS58_MAX_LEN];
+        pdot_ss58_encode(p.list[i].delegate, (uint16_t)prefix, addr, sizeof addr);
+        printf("  proxy:      %s %s delay %u\n", addr, p.list[i].type, p.list[i].delay);
+    }
+    if (p.n) {
+        pdot_u128_format(p.deposit, 0, text, sizeof text);
+        printf("  deposit:    %s (smallest units)\n", text);
+    }
+    print_at(&p.at);
+    return 0;
+}
+
+static int cmd_proxy(pdot_client *c, const pdot_signer *s, int add, int argc, char **argv,
+                     int i, unsigned prefix)
+{
+    uint8_t who[32], decimals;
+    pdot_u128 fund = { 0, 0 };
+    char symbol[32];
+    pdot_tx_result tx;
+    int rc;
+
+    if ((rc = pdot_client_token(c, symbol, sizeof symbol, &decimals)))
+        return die("token", rc, c);
+    if (pdot_ss58_decode(argv[i], who, NULL) ||
+        (add && i + 2 < argc && pdot_u128_parse(argv[i + 2], decimals, &fund))) {
+        fprintf(stderr, "error: expected ADDRESS TYPE%s\n", add ? " [FUND]" : "");
+        return 2;
+    }
+    rc = add ? pdot_proxy_add(c, s, who, argv[i + 1], fund, &tx)
+             : pdot_proxy_remove(c, s, who, argv[i + 1], &tx);
+    if (rc == 0 || rc == PDOT_E_DISPATCH)
+        print_tx(&tx);
+    if (rc)
+        return die(add ? "proxy-add" : "proxy-remove", rc, c);
+    print_account(add ? "proxy added:   " : "proxy removed: ", who, prefix);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct opts o = { "http://127.0.0.1:9944", NULL, "sr25519", NULL, NULL, 42, 0, 0,
-                      NULL, NULL, 0, "on", 0 };
+                      NULL, NULL, 0, "on", 0, NULL, NULL, 0, 0 };
     pdot_client *c;
     pdot_signer s;
     const char *cmd;
+    uint8_t *call = NULL;
+    size_t call_len = 0;
     int i, rc = 1, ok;
 
     for (i = 1; i < argc && strncmp(argv[i], "--", 2) == 0; i += 2) {
@@ -734,6 +987,11 @@ int main(int argc, char **argv)
         if (strcmp(k, "--help") == 0) {
             fputs(usage, stdout);
             return 0;
+        }
+        if (strcmp(k, "--fee") == 0 || strcmp(k, "--async") == 0) {  /* flags */
+            *(k[2] == 'f' ? &o.fee_only : &o.async) = 1;
+            i--;
+            continue;
         }
         if (!v) {
             fprintf(stderr, "error: %s needs a value\n", k);
@@ -752,6 +1010,8 @@ int main(int argc, char **argv)
         else if (strcmp(k, "--checkpoint") == 0) o.checkpoint = v;
         else if (strcmp(k, "--metadata-hash") == 0) o.mdhash = v;
         else if (strcmp(k, "--count") == 0) o.count = (unsigned)strtoul(v, NULL, 10);
+        else if (strcmp(k, "--tip") == 0) o.tip = v;
+        else if (strcmp(k, "--as") == 0) o.as = v;
         else {
             fprintf(stderr, "error: unknown option %s\n%s", k, usage);
             return 2;
@@ -783,6 +1043,17 @@ int main(int argc, char **argv)
         if (!rc)
             printf("checkpoint written to %s (%zu bytes)\n", o.checkpoint, len);
         return rc;
+    }
+
+    if (strcmp(cmd, "session-key") == 0) {
+        uint8_t seed[32];
+        if ((rc = pdot_signer_sr25519_random(&s, seed)))
+            return die("session key", rc, NULL);
+        print_hex("seed:       ", seed, 32);
+        print_account("address:    ", s.account_id, o.prefix);
+        memset(seed, 0, sizeof seed);
+        pdot_signer_wipe(&s);
+        return 0;
     }
 
     if (!(c = pdot_client_new(o.rpc, o.gateway))) {
@@ -866,6 +1137,12 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "watch") == 0) {
         rc = cmd_watch(c, argc, argv, i, &o);
         return rc;  /* pdot_async_free freed the client */
+    } else if (strcmp(cmd, "proxies") == 0 && i < argc) {
+        uint8_t id[32];
+        if ((rc = pdot_ss58_decode(argv[i], id, NULL)))
+            rc = die("parsing address", rc, NULL);
+        else
+            rc = cmd_proxies(c, id, o.prefix);
     } else if (strcmp(cmd, "authorized") == 0 && i < argc) {
         uint8_t id[32];
         if ((rc = pdot_ss58_decode(argv[i], id, NULL)))
@@ -907,6 +1184,21 @@ int main(int argc, char **argv)
             } else {
                 print_account("authorized:     ", who, o.prefix);
                 print_tx(&tx);
+            }
+        } else if (strcmp(cmd, "proxy-add") == 0 && i + 1 < argc) {
+            rc = cmd_proxy(c, &s, 1, argc, argv, i, o.prefix);
+        } else if (strcmp(cmd, "proxy-remove") == 0 && i + 1 < argc) {
+            rc = cmd_proxy(c, &s, 0, argc, argv, i, o.prefix);
+        } else if ((rc = tx_call(c, cmd, argc, argv, i, &call, &call_len)) != -1) {
+            if (rc == 0) {
+                int gone = 0;
+                print_account("signer:     ", s.account_id, o.prefix);
+                rc = run_tx(c, &s, call, call_len, &o, &gone);
+                free(call);
+                if (gone) {
+                    pdot_signer_wipe(&s);
+                    return rc;  /* pdot_async_free freed the client */
+                }
             }
         } else if (strcmp(cmd, "roundtrip") == 0 && i < argc) {
             pdot_cid root;

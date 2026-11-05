@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pdot.h"
 #include "metadata.h"
 #include "scale.h"
 
@@ -15,6 +16,9 @@ typedef struct {
     int      has_stored;
     uint32_t stored_index;     /* TransactionStorage.Stored { index } */
     size_t   nevents;          /* events attributed to the extrinsic */
+    int      has_fee;
+    pdot_u128 fee;             /* actual_fee of a *FeePaid event, tip included */
+    int      proxy_failed;     /* Proxy.ProxyExecuted with Err: error names it */
 } pdot_ext_outcome;
 
 /* twox128("System") | twox128("Events") */

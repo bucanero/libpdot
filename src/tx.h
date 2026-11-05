@@ -19,7 +19,7 @@ typedef struct {
     uint32_t spec_version;
     uint32_t tx_version;
     uint32_t nonce;
-    uint64_t tip;
+    pdot_u128 tip;              /* goes to the block author, on top of the fee */
     uint32_t era_period;        /* 0: immortal */
     uint32_t era_block;         /* mortality checkpoint */
     uint8_t  era_block_hash[32];

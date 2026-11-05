@@ -4,7 +4,7 @@
 
 **Store and retrieve data on Polkadot from plain C.** libpdot is a portable C99 library, plus a small command-line tool, for the [Polkadot Bulletin Chain](https://github.com/paritytech/polkadot-bulletin-chain): a chain that stores files, content-addressed by CID and served over IPFS.
 
-It is for C programs that want Polkadot without a Rust toolchain or a JavaScript runtime: games, desktop apps, embedded and IoT devices, emulators, command-line tools, and bindings for other languages through C's ABI. It also reads balances, assets and NFTs on [Asset Hub](https://docs.polkadot.com/polkadot-protocol/architecture/system-chains/asset-hub/), proven from relay-chain finality if you want, and has a non-blocking API for game loops and UI threads.
+It is for C programs that want Polkadot without a Rust toolchain or a JavaScript runtime: games, desktop apps, embedded and IoT devices, emulators, command-line tools, and bindings for other languages through C's ABI. It also reads balances, assets and NFTs on [Asset Hub](https://docs.polkadot.com/polkadot-protocol/architecture/system-chains/asset-hub/), proven from relay-chain finality if you want; sends tokens, assets and NFTs, with fee estimates and proxy session keys; and has a non-blocking API for game loops and UI threads.
 
 ```c
 pdot_client *c = pdot_client_new("https://paseo-bulletin-next-rpc.polkadot.io", NULL);
@@ -23,6 +23,8 @@ pdot_bulletin_fetch(c, &res.cid, &bytes, &n);       /* verified against the CID 
 - **Sign** with sr25519 (what Polkadot wallets use) or ECDSA secp256k1, or plug in your own signer: a hardware wallet, a secure enclave or a remote service.
 - **Prove results without trusting the RPC node** (optional): a built-in relay-chain light client checks GRANDPA finality signatures and storage proofs, so "stored", "renewed" and "authorized" are facts, not the node's word. Signing over an RFC-0078 metadata hash means a node can't trick you into signing a different call either.
 - **Read balances, assets and NFTs** on Asset Hub, or any chain with those pallets: native and asset balances, asset details, NFT owners, metadata and attributes, and the items of a collection an account owns. Each value is read at a final block, and proven like everything else when a verifier is set.
+- **Transfer tokens, assets and NFTs**, estimate fees first, and submit any other call from JSON arguments, encoded from the runtime's own metadata.
+- **Session keys** for games: the player signs once to let a fresh key act for their account (a proxy), and the game signs every move after that by itself. Proxy types limit what the key can do.
 - **Never block your frame loop**: `pdot_async` runs calls on a worker thread and hands results to callbacks when you poll, once per frame. Watches report a balance, an asset holding or an NFT owner again whenever a new final block changes it.
 - **Report what happened on chain**: the block and position of every transaction, and whether it succeeded. Failures come back by name, such as `TransactionStorage.BadDataSize`.
 
@@ -235,6 +237,61 @@ pdot-bulletin --rpc https://polkadot-asset-hub-rpc.polkadot.io --relay https://r
               --para-id 1000 --checkpoint dot.ck nft 752 56
 ```
 
+### Transfers, fees and any other call
+
+The same client sends transactions. Amounts are in the token's smallest unit; `pdot_u128_parse` turns `"1.5"` into one, given the decimals.
+
+```c
+pdot_transfer t = { PDOT_TRANSFER_ASSET, {0}, {0, 0}, 1984, 0 };  /* USDt */
+memcpy(t.dest, friend_account, 32);
+pdot_u128_parse("2.5", 6, &t.amount);
+
+uint8_t *call; size_t len;
+pdot_fee fee;
+pdot_transfer_call(c, &t, &call, &len);
+pdot_tx_fee(c, &signer, call, len, NULL, &fee);           /* what it would cost now */
+pdot_tx_submit(c, &signer, call, len, NULL, &res);       /* waits for finalization */
+pdot_free(call);                                         /* res.fee: what it did cost */
+```
+
+`pdot_transfer_submit` does both steps. Kinds: `PDOT_TRANSFER_NATIVE` (DOT, keeping the sender above the existential deposit), `_ASSET`, `_NFT`, and `_ALL` (every native token, closing the account). Options add a tip, or sign as a proxy (below).
+
+Anything else is one `pdot_call_from_json` away. Arguments are an array in order or an object by name. Integers are numbers or decimal strings. Accounts are SS58 or `0x` hex, and bytes are `0x` hex or text. Enums are written `"Variant"` or `{"Variant": value}`, with `null` for None. Encoding follows the runtime's metadata, and errors name the argument (`Balances.transfer_keep_alive.value: expected an unsigned integer`).
+
+```c
+pdot_call_from_json(c, "Nfts", "mint", "[0, 7, \"5Grwva...\", null]", &call, &len);
+```
+
+### Session keys: proxies
+
+A game asks the player to sign once. That adds a fresh session key as a proxy of the player's account and funds it for fees, both in one transaction. After that, the game signs each move with the session key alone: `proxy_for` wraps the call in `Proxy.proxy`, so it runs as the player while the session key pays the fee. When the session ends, the key sends its leftover funds back (`PDOT_TRANSFER_ALL`) and the player removes it.
+
+```c
+uint8_t seed[32];
+pdot_signer session;
+pdot_signer_sr25519_random(&session, seed);              /* keep seed to resume later */
+
+pdot_u128 fund;
+pdot_u128_parse("0.1", 10, &fund);
+pdot_proxy_add(c, &player, session.account_id, "Assets", fund, &res);  /* player signs */
+
+pdot_tx_options o = { {0, 0}, player.account_id };
+pdot_transfer_submit(c, &session, &t, &o, &res);        /* session signs, runs as player */
+```
+
+The proxy type limits the key: `"Any"`, `"NonTransfer"` (anything but moving DOT), `"Assets"` (asset and NFT calls), and the rest of the runtime's `ProxyType`. A call outside its type still lands on chain and pays its fee. It then comes back as `PDOT_E_DISPATCH` with `System.CallFiltered (in the proxied call)`, read from the `Proxy.ProxyExecuted` event, so a failure is never reported as success. `pdot_proxies_get` lists an account's proxies, proven like any other read. Adding a proxy reserves a deposit from the player (about 0.2 DOT on Polkadot Asset Hub), returned on removal.
+
+```sh
+pdot-bulletin session-key                                     # seed and address
+pdot-bulletin --seed $PLAYER proxy-add $SESSION Any 1         # adds it and sends 1 token
+pdot-bulletin --seed $SESSION --as $PLAYER --fee transfer $FRIEND 2   # estimate
+pdot-bulletin --seed $SESSION --as $PLAYER transfer $FRIEND 2
+pdot-bulletin --seed $SESSION transfer-all $PLAYER            # end of session
+pdot-bulletin --seed $PLAYER proxy-remove $SESSION Any
+```
+
+Inclusion, the dispatch outcome and the fee come from the RPC node's blocks and events, even with a verifier. To prove a transfer's effect, read the balance afterwards with a verifier set.
+
 ### Without blocking: `pdot_async`
 
 Every call above blocks: a store waits for finalization, and a proven read takes a few round trips. `pdot_async` takes over a configured client, runs calls on a worker thread in order, and runs your callbacks inside `pdot_async_poll`, on your thread. Call that once per frame.
@@ -285,8 +342,10 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
 | Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
-| Amounts | `pdot_u128_format`, `pdot_u128_to_double` |
-| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify and read calls |
+| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit` |
+| Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |
+| Amounts | `pdot_u128_format`, `pdot_u128_parse`, `pdot_u128_to_double` |
+| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
 | Watches | `pdot_async_watch_head`, `pdot_async_watch_storage`, `pdot_async_watch_balance`, `pdot_async_watch_asset_balance`, `pdot_async_watch_nft_item` |
 
 ### Things to know
@@ -335,6 +394,7 @@ Every layer is checked against Parity's own implementations before it touches a 
 - **Metadata hash:** against hashes the Rust [merkleized-metadata](https://github.com/bkchr/merkleized-metadata) crate computed: the ones the Westend and Paseo Bulletin runtimes embed, and one of the crate's own test vectors. BLAKE3 against its official test vectors.
 - **Verification:** GRANDPA justifications, validator-set handovers and storage proofs recorded from Paseo and Polkadot mainnet, plus tampered copies that must fail. [`tools/record-proofs.c`](tools/record-proofs.c) re-records them.
 - **Asset Hub reads:** keys compared byte for byte with keys a Polkadot Asset Hub node listed, then balances, USDt, an NFT and its attributes decoded from one recorded read proof, checked against the block's state root. A proof with any byte changed must fail. [`tools/record-assets.c`](tools/record-assets.c) re-records it.
+- **Transactions:** calls encoded from JSON against Polkadot Asset Hub metadata, compared with bytes worked out by hand from the SCALE rules, plus error messages for bad arguments. Also the `ChargeAssetTxPayment` extension layout, the fee and the inner result of a proxied call read from events, and `Proxy.Proxies` decoding. The live checks below are what show a real runtime accepts them.
 - **`pdot_async`:** ordering, callbacks only inside `pdot_async_poll`, cancelling queued and running jobs, callbacks owed at `pdot_async_free`, and one report per failure streak for watches. Also run under ThreadSanitizer.
 - **Chunked-file manifests:** against the JavaScript libraries the Bulletin TypeScript SDK uses.
 
@@ -344,11 +404,11 @@ Every layer is checked against Parity's own implementations before it touches a 
 - gcc and clang, each with and without AddressSanitizer and UBSan;
 - arm64, 32-bit ARM and big-endian s390x under QEMU;
 - ThreadSanitizer on the unit tests, for `pdot_async`;
-- libFuzzer on the metadata parser and metadata hash, on the event, manifest and proof parsers, and on balance, asset and NFT decoding;
+- libFuzzer on the metadata parser and metadata hash, on the event, manifest and proof parsers, on balance, asset and NFT decoding, and on calls encoded from JSON;
 - an end-to-end run against a dev node and an IPFS gateway, signing with the metadata hash, where a transaction signed over a wrong hash must be rejected, and a `pdot_async` balance watch must see a store change the account's nonce;
-- nightly, read-only verification against live Paseo and Polkadot, including proven Asset Hub reads and a proven watch over WebSocket, and a check that the Westend, Paseo and Polkadot Bulletin runtimes accept libpdot's metadata hash ([`ci/verify-live.sh`](ci/verify-live.sh)).
+- an end-to-end run against an Asset Hub dev node built from the live Westend Asset Hub runtime ([`tools/e2e-assethub.sh`](tools/e2e-assethub.sh)). It checks fee estimates against fees paid, with and without a tip. It moves WND, an asset and an NFT, including through a session key acting for `//Alice` via `pdot_async`. A `NonTransfer` key trying to move WND must be reported as failed, and closing the session must reap the key's account;
 
-Every job runs in a container, so you can reproduce one locally with Docker:
+Every job runs in a container, so you can reproduce one locally with Docker. [`ci/verify-live.sh`](ci/verify-live.sh) runs only when CI is started by hand (or locally): a read-only check against live Paseo and Polkadot, including proven Asset Hub reads, fee estimates that are signed but never submitted, a proven watch over WebSocket, and that the Westend, Paseo and Polkadot Bulletin runtimes accept libpdot's metadata hash.
 
 ```sh
 ci/in-docker.sh linux/amd64 ci/build-test.sh CC=clang SANITIZE=1
@@ -358,7 +418,9 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 
 ## Limitations
 
-- Beyond the Bulletin Chain, only reads: balances, `pallet-assets` and `pallet-nfts`. No transfers yet, and no foreign (XCM-location) assets.
+- Fees are paid in the native token. Paying them in an asset such as USDt (`ChargeAssetTxPayment` with an asset id) is not supported yet. Foreign (XCM-location) assets can be moved through `pdot_call_from_json`, but have no typed helpers.
+- Transaction results (inclusion, outcome, fee) are taken from the RPC node even with a verifier; balances read afterwards are proven.
+- The JSON encoder does not handle bit sequences, `char`, or 256-bit integers. No common call uses them.
 - `pdot_nft_owned` cannot prove that a node listed every item, only that each listed item is owned.
 - The first call on a chain downloads its metadata, about 0.7 MB on Asset Hub, so the first result takes a few seconds. `pdot_async`'s two connections share that download, and a runtime upgrade triggers one new download.
 - Watches are woken by WebSocket only where libcurl supports it (Debian 13 does; the macOS system libcurl does not); otherwise they poll every 2 s.

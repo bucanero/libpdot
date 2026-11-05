@@ -20,7 +20,8 @@ enum pdot_query_kind {
     PDOT_Q_ASSET_BALANCE,  /* pdot_asset_balance */
     PDOT_Q_ASSET_INFO,     /* pdot_asset_info */
     PDOT_Q_NFT_ITEM,       /* pdot_nft_item */
-    PDOT_Q_NFT_ATTRIBUTE   /* pdot_nft_attribute */
+    PDOT_Q_NFT_ATTRIBUTE,  /* pdot_nft_attribute */
+    PDOT_Q_PROXIES         /* pdot_proxies */
 };
 
 #define PDOT_Q_MAX_KEYS 2

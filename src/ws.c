@@ -39,9 +39,9 @@ static char *ws_url(const char *http_url)
     if (!u)
         return NULL;
     if (strncmp(http_url, "https://", 8) == 0)
-        sprintf(u, "wss://%s", http_url + 8);
+        snprintf(u, n + 1, "wss://%s", http_url + 8);
     else if (strncmp(http_url, "http://", 7) == 0)
-        sprintf(u, "ws://%s", http_url + 7);
+        snprintf(u, n + 1, "ws://%s", http_url + 7);
     else
         memcpy(u, http_url, n + 1);
     return u;

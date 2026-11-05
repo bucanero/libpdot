@@ -71,3 +71,57 @@ double pdot_u128_to_double(pdot_u128 v, uint8_t decimals)
         d /= 10.0;
     return d;
 }
+
+/* v = v * 10 + d; PDOT_E_INVALID on overflow. */
+static int mul10_add(pdot_u128 *v, unsigned d)
+{
+    uint32_t limb[4];
+    uint64_t carry = d;
+    int i;
+
+    limb[0] = (uint32_t)v->lo;
+    limb[1] = (uint32_t)(v->lo >> 32);
+    limb[2] = (uint32_t)v->hi;
+    limb[3] = (uint32_t)(v->hi >> 32);
+    for (i = 0; i < 4; i++) {
+        uint64_t cur = (uint64_t)limb[i] * 10 + carry;
+        limb[i] = (uint32_t)cur;
+        carry = cur >> 32;
+    }
+    if (carry)
+        return PDOT_E_INVALID;
+    v->lo = ((uint64_t)limb[1] << 32) | limb[0];
+    v->hi = ((uint64_t)limb[3] << 32) | limb[2];
+    return 0;
+}
+
+int pdot_u128_parse(const char *text, uint8_t decimals, pdot_u128 *out)
+{
+    const char *p = text;
+    unsigned frac = 0;
+    int digits = 0, dot = 0;
+
+    if (!text || !out)
+        return PDOT_E_INVALID;
+    out->lo = out->hi = 0;
+    for (; *p; p++) {
+        if (*p == '.' && !dot) {
+            dot = 1;
+            continue;
+        }
+        if (*p < '0' || *p > '9')
+            return PDOT_E_INVALID;
+        if (dot && frac == decimals)
+            return PDOT_E_INVALID;  /* more precision than the token has */
+        if (mul10_add(out, (unsigned)(*p - '0')))
+            return PDOT_E_INVALID;
+        frac += dot;
+        digits++;
+    }
+    if (!digits)
+        return PDOT_E_INVALID;
+    for (; frac < decimals; frac++)
+        if (mul10_add(out, 0))
+            return PDOT_E_INVALID;
+    return 0;
+}

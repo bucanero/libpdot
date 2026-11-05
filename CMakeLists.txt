@@ -125,6 +125,8 @@ add_library(pdot
   src/thread.c
   src/ws.c
   src/async.c
+  src/encode.c
+  src/transact.c
   $<TARGET_OBJECTS:pdot_blake2>
   $<TARGET_OBJECTS:pdot_blake3>)
 target_link_libraries(pdot PUBLIC MbedTLS::mbedcrypto PRIVATE CURL::libcurl ${PDOT_CJSON})
@@ -191,7 +193,7 @@ if(PDOT_WITH_SR25519 AND PDOT_BUILD_TESTS)
 endif()
 
 if(PDOT_FUZZ)
-  set(PDOT_FUZZ_TARGETS metadata decode assets)
+  set(PDOT_FUZZ_TARGETS metadata decode assets call)
   if(PDOT_WITH_VERIFY)
     list(APPEND PDOT_FUZZ_TARGETS proof)
   endif()
@@ -212,7 +214,7 @@ if(PDOT_BUILD_TESTS)
     list(APPEND PDOT_TESTS signer tx)
   endif()
   if(PDOT_WITH_VERIFY)
-    list(APPEND PDOT_TESTS verify assets async)
+    list(APPEND PDOT_TESTS verify assets async transact)
   endif()
   foreach(t ${PDOT_TESTS})
     add_executable(test_${t} tests/test_${t}.c)

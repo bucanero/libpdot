@@ -40,6 +40,8 @@ union result {
     pdot_nft_list       nfts;
     pdot_final_block    head;
     pdot_storage_value  storage;
+    pdot_fee            fee;
+    pdot_proxies        proxies;
 };
 
 struct item;
@@ -69,6 +71,9 @@ struct item {
     pdot_cid          cid;
     uint8_t           account[32];
     pdot_query        q;
+    pdot_tx_options   opts;       /* proxy_for points at proxy_for below */
+    uint8_t           proxy_for[32];
+    pdot_transfer     transfer;
 
     /* Progress report. */
     size_t            index, total;
@@ -845,6 +850,40 @@ static int w_nft_owned(pdot_client *c, struct item *it)
     return rc;
 }
 
+static int w_submit(pdot_client *c, struct item *it)
+{
+    int rc = pdot_tx_submit(c, &it->signer, it->data, it->len, &it->opts, &it->res.tx);
+
+    it->has_result = rc == PDOT_E_DISPATCH;
+    return rc;
+}
+
+static int w_fee(pdot_client *c, struct item *it)
+{
+    return pdot_tx_fee(c, &it->signer, it->data, it->len, &it->opts, &it->res.fee);
+}
+
+static int w_transfer(pdot_client *c, struct item *it)
+{
+    int rc = pdot_transfer_submit(c, &it->signer, &it->transfer, &it->opts, &it->res.tx);
+
+    it->has_result = rc == PDOT_E_DISPATCH;
+    return rc;
+}
+
+/* Copies transaction options into the job, pointing proxy_for at its own copy. */
+static struct item *with_options(struct item *it, const pdot_tx_options *o)
+{
+    if (it && o) {
+        it->opts = *o;
+        if (o->proxy_for) {
+            memcpy(it->proxy_for, o->proxy_for, 32);
+            it->opts.proxy_for = it->proxy_for;
+        }
+    }
+    return it;
+}
+
 static struct item *job(pdot_async *a, work_fn work, pdot_result_fn done, void *ud)
 {
     struct item *it;
@@ -1082,4 +1121,46 @@ uint64_t pdot_async_watch_nft_item(pdot_async *a, uint32_t collection, uint32_t 
     w->q.id = collection;
     w->q.item = item;
     return add_watch(a, w);
+}
+
+/* ---- Transactions -------------------------------------------------------- */
+
+uint64_t pdot_async_submit(pdot_async *a, const pdot_signer *s, const uint8_t *call,
+                           size_t len, const pdot_tx_options *o, pdot_result_fn done, void *ud)
+{
+    if (!s || !call || !len)
+        return 0;
+    return submit(a, with_options(with_input(job(a, w_submit, done, ud), s, call, len), o));
+}
+
+uint64_t pdot_async_fee(pdot_async *a, const pdot_signer *s, const uint8_t *call, size_t len,
+                        const pdot_tx_options *o, pdot_result_fn done, void *ud)
+{
+    if (!s || !call || !len)
+        return 0;
+    return submit(a, with_options(with_input(job(a, w_fee, done, ud), s, call, len), o));
+}
+
+uint64_t pdot_async_transfer(pdot_async *a, const pdot_signer *s, const pdot_transfer *t,
+                             const pdot_tx_options *o, pdot_result_fn done, void *ud)
+{
+    struct item *it;
+
+    if (!s || !t || !(it = with_options(with_input(job(a, w_transfer, done, ud), s, NULL, 0), o)))
+        return 0;
+    it->transfer = *t;
+    return submit(a, it);
+}
+
+uint64_t pdot_async_proxies(pdot_async *a, const uint8_t account_id[32],
+                            pdot_result_fn done, void *ud)
+{
+    pdot_query q;
+
+    if (!account_id)
+        return 0;
+    memset(&q, 0, sizeof q);
+    q.kind = PDOT_Q_PROXIES;
+    memcpy(q.account, account_id, 32);
+    return query_job(a, &q, done, ud);
 }

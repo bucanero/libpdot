@@ -189,6 +189,11 @@ int pdot_ss58_encode(const uint8_t account_id[32], uint16_t prefix,
 int pdot_ss58_decode(const char *address, uint8_t account_id[32],
                      uint16_t *prefix);
 
+/* An unsigned 128-bit integer, as balances are on chain (see Amounts). */
+typedef struct {
+    uint64_t lo, hi;
+} pdot_u128;
+
 /* ---- Bulletin Chain ------------------------------------------------- */
 
 /* Dispatch outcome, read from the block's System.Events. */
@@ -205,6 +210,8 @@ typedef struct {
     int      dispatch;   /* PDOT_DISPATCH_* */
     char     error[96];  /* "Pallet.Error" when dispatch failed */
     int      verified;   /* 1: the effect was proven (needs a verifier) */
+    int      has_fee;
+    pdot_u128 fee;       /* fee actually paid, tip included, from the *FeePaid event */
 } pdot_tx_result;
 
 typedef struct {
@@ -324,11 +331,6 @@ int pdot_bulletin_fetch(pdot_client *c, const pdot_cid *cid,
 
 /* ---- Amounts -------------------------------------------------------- */
 
-/* An unsigned 128-bit integer, as balances are on chain. */
-typedef struct {
-    uint64_t lo, hi;
-} pdot_u128;
-
 /*
  * Decimal text of v scaled down by `decimals` places, trailing zeros trimmed:
  * 12345 with 3 decimals is "12.345". PDOT_E_BUFFER if out is too small; 64
@@ -337,6 +339,12 @@ typedef struct {
 int pdot_u128_format(pdot_u128 v, uint8_t decimals, char *out, size_t out_len);
 /* v / 10^decimals as a double, for display; may round. */
 double pdot_u128_to_double(pdot_u128 v, uint8_t decimals);
+/*
+ * Parses decimal text ("1.25") into the smallest unit, scaled up by
+ * `decimals` places: 1.25 with 12 decimals is 1250000000000. PDOT_E_INVALID
+ * on anything else, more fractional digits than decimals, or overflow.
+ */
+int pdot_u128_parse(const char *text, uint8_t decimals, pdot_u128 *out);
 
 /* ---- Chain state at a final block ----------------------------------- */
 
@@ -450,6 +458,117 @@ int pdot_nft_attribute_get(pdot_client *c, uint32_t collection, int has_item, ui
 int pdot_nft_owned(pdot_client *c, const uint8_t account_id[32], uint32_t collection,
                    size_t max, uint32_t **items, size_t *n, pdot_final_block *at);
 
+/* ---- Transactions: any call, fees, transfers and proxies -------------
+
+   For Asset Hub and any other chain the client points at. Calls are built
+   from the runtime's metadata, so they follow its argument types. Where a
+   transaction landed and how it went (dispatch outcome, fee) come from the
+   RPC node's blocks and events and are not proven, even with a verifier;
+   read balances afterwards to prove an effect. */
+
+/* Options for a transaction; pass NULL for none. */
+typedef struct {
+    pdot_u128      tip;        /* paid to the block author on top of the fee */
+    /*
+     * Sign as a proxy of this account: the call is wrapped in Proxy.proxy
+     * and runs as that account, while the signer pays the fee. NULL: the
+     * call runs as the signer.
+     */
+    const uint8_t *proxy_for;
+} pdot_tx_options;
+
+/* What a transaction would pay now (TransactionPaymentApi_query_info). */
+typedef struct {
+    pdot_u128 partial_fee;     /* base + length + weight fee; add the tip for the total */
+    uint64_t  ref_time;        /* its weight */
+    uint64_t  proof_size;
+    uint8_t   dispatch_class;  /* 0 normal, 1 operational, 2 mandatory */
+} pdot_fee;
+
+/*
+ * Encodes pallet.call from JSON arguments, an array in order or an object by
+ * name: integers as numbers or decimal strings, accounts as SS58 or 0x hex,
+ * bytes as 0x hex or text, enums as "Variant" or {"Variant": value}, null
+ * for None. Messages name the argument that did not fit. *call is freed
+ * with pdot_free.
+ */
+int pdot_call_from_json(pdot_client *c, const char *pallet, const char *call,
+                        const char *json_args, uint8_t **call_out, size_t *len);
+
+/*
+ * Signs and submits an encoded call, then blocks until it is in a finalized
+ * block (PDOT_E_TIMEOUT after the mortality window). PDOT_E_DISPATCH, with
+ * out->error, when the call failed; through a proxy, also when the proxied
+ * call failed although the transaction itself went through.
+ */
+int pdot_tx_submit(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
+                   const pdot_tx_options *o, pdot_tx_result *out);
+
+/* The fee submitting would cost now. Signs, but submits nothing. */
+int pdot_tx_fee(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
+                const pdot_tx_options *o, pdot_fee *out);
+
+/* Transfers. "keep alive" ones fail rather than take the sender below the existential deposit. */
+#define PDOT_TRANSFER_NATIVE 0  /* Balances.transfer_keep_alive: amount of the native token */
+#define PDOT_TRANSFER_ASSET  1  /* Assets.transfer_keep_alive: amount of asset id */
+#define PDOT_TRANSFER_NFT    2  /* Nfts.transfer: item of collection id */
+#define PDOT_TRANSFER_ALL    3  /* Balances.transfer_all: all of the native token, closing the account */
+
+typedef struct {
+    int       kind;       /* PDOT_TRANSFER_* */
+    uint8_t   dest[32];
+    pdot_u128 amount;     /* smallest units; NATIVE and ASSET */
+    uint32_t  id;         /* asset id, or NFT collection */
+    uint32_t  item;       /* NFT item */
+} pdot_transfer;
+
+/* The encoded call for t, to submit, estimate or batch yourself. Freed with pdot_free. */
+int pdot_transfer_call(pdot_client *c, const pdot_transfer *t, uint8_t **call, size_t *len);
+/* pdot_transfer_call + pdot_tx_submit. */
+int pdot_transfer_submit(pdot_client *c, const pdot_signer *s, const pdot_transfer *t,
+                         const pdot_tx_options *o, pdot_tx_result *out);
+
+/* ---- Proxy session keys ----------------------------------------------
+
+   A game asks the player to sign once, letting a fresh session key act for
+   their account (a proxy), and then signs moves with the session key alone.
+   The session key pays its own fees, so fund it when adding it. Proxy
+   types limit what it can do: "Any", "NonTransfer" (no transfers of the
+   native token), "Assets" (pallet-assets and NFT calls), ... as the
+   runtime's ProxyType lists them. Adding one reserves a deposit from the
+   real account, returned on removal. */
+
+/* A new random sr25519 key; seed_out (may be NULL) gets its seed, to save. */
+int pdot_signer_sr25519_random(pdot_signer *s, uint8_t seed_out[32]);
+
+/*
+ * Proxy.add_proxy(delegate, proxy_type, delay 0), signed by the real account
+ * s. With fund nonzero, the same transaction (Utility.batch_all) also sends
+ * the delegate fund of the native token, all or nothing.
+ */
+int pdot_proxy_add(pdot_client *c, const pdot_signer *s, const uint8_t delegate[32],
+                   const char *proxy_type, pdot_u128 fund, pdot_tx_result *out);
+int pdot_proxy_remove(pdot_client *c, const pdot_signer *s, const uint8_t delegate[32],
+                      const char *proxy_type, pdot_tx_result *out);
+
+#define PDOT_PROXIES_MAX 32
+
+typedef struct {
+    uint8_t  delegate[32];
+    char     type[32];  /* ProxyType variant name */
+    uint32_t delay;     /* blocks an announcement must wait; 0 acts at once */
+} pdot_proxy_def;
+
+/* Proxy.Proxies: the accounts that may act for account_id. */
+typedef struct {
+    size_t           n;
+    pdot_proxy_def   list[PDOT_PROXIES_MAX];
+    pdot_u128        deposit;
+    pdot_final_block at;
+} pdot_proxies;
+
+int pdot_proxies_get(pdot_client *c, const uint8_t account_id[32], pdot_proxies *out);
+
 /* ---- Non-blocking use: pdot_async -----------------------------------
 
    For game loops and UI threads. pdot_async takes over a configured client
@@ -551,6 +670,18 @@ typedef struct {
 
 uint64_t pdot_async_nft_owned(pdot_async *a, const uint8_t account_id[32], uint32_t collection,
                               size_t max, pdot_result_fn done, void *ud);   /* pdot_nft_list */
+
+/* Transactions. The call, signer and options are copied. */
+uint64_t pdot_async_submit(pdot_async *a, const pdot_signer *s, const uint8_t *call,
+                           size_t len, const pdot_tx_options *o,
+                           pdot_result_fn done, void *ud);                  /* pdot_tx_result */
+uint64_t pdot_async_fee(pdot_async *a, const pdot_signer *s, const uint8_t *call, size_t len,
+                        const pdot_tx_options *o, pdot_result_fn done, void *ud); /* pdot_fee */
+uint64_t pdot_async_transfer(pdot_async *a, const pdot_signer *s, const pdot_transfer *t,
+                             const pdot_tx_options *o, pdot_result_fn done, void *ud);
+                                                                            /* pdot_tx_result */
+uint64_t pdot_async_proxies(pdot_async *a, const uint8_t account_id[32],
+                            pdot_result_fn done, void *ud);                 /* pdot_proxies */
 
 /*
  * Watches: the callback runs repeatedly until pdot_async_cancel or

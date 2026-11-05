@@ -1,6 +1,7 @@
 #!/bin/sh
-# End-to-end run against a dev node from the prebuilt polkadot-omni-node
-# release (x86_64 only), with a Kubo gateway.
+# End-to-end runs against dev nodes from the prebuilt polkadot-omni-node
+# release (x86_64 only): the Bulletin chain with a Kubo gateway, then Asset
+# Hub (transfers, fees and proxy session keys).
 set -eu
 POLKADOT_RELEASE=${POLKADOT_RELEASE:-polkadot-stable2609}
 KUBO_VERSION=${KUBO_VERSION:-v0.40.1}
@@ -21,3 +22,4 @@ export PATH="$BIN/kubo:$PATH"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPDOT_BUILD_TESTS=OFF >/dev/null
 cmake --build build -j "$(nproc)" --target pdot-bulletin >/dev/null
 OMNI_NODE="$BIN/polkadot-omni-node" KUBO=1 sh tools/e2e-devnode.sh build
+OMNI_NODE="$BIN/polkadot-omni-node" sh tools/e2e-assethub.sh build

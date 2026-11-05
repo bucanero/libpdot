@@ -27,6 +27,8 @@ void pdot_scale_u32(pdot_buf *b, uint32_t v);
 void pdot_scale_u64(pdot_buf *b, uint64_t v);
 void pdot_scale_bool(pdot_buf *b, int v);
 void pdot_scale_compact(pdot_buf *b, uint64_t v);
+/* Compact<u128> of hi:lo. */
+void pdot_scale_compact128(pdot_buf *b, uint64_t lo, uint64_t hi);
 /* Vec<u8>: compact length prefix followed by the bytes. */
 void pdot_scale_bytes(pdot_buf *b, const uint8_t *p, size_t n);
 
