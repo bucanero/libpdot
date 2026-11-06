@@ -156,8 +156,8 @@ static int read_authorization(pdot_client *c, const uint8_t account_id[32], uint
     };
     pdot_md_storage st;
     pdot_buf key;
-    uint8_t *value;
-    size_t len, i;
+    uint8_t *value = NULL;
+    size_t len = 0, i;
     int rc;
 
     const pdot_header *head = NULL;
@@ -262,8 +262,8 @@ static int prove_stored(pdot_client *c, const uint8_t digest[32], uint32_t min_b
     const pdot_header *head;
     pdot_md_storage st, rst;
     pdot_buf key;
-    uint8_t *v;
-    size_t vlen;
+    uint8_t *v = NULL;
+    size_t vlen = 0;
     uint64_t block = 0, index = 0, retention = 0;
     pdot_md_field f[2];
     size_t nf;

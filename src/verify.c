@@ -270,9 +270,9 @@ static int relay_final(pdot_client *c, uint8_t hash[32], uint32_t *number, int w
 
     for (walked = 0; walked < MAX_SET_WALK; walked++) {
         uint8_t *proof, target[32];
-        const uint8_t *just;
-        size_t plen, jlen;
-        uint32_t tnum;
+        const uint8_t *just = NULL;
+        size_t plen, jlen = 0;
+        uint32_t tnum = 0;
         pdot_grandpa_stats st;
         pdot_grandpa_set next;
         pdot_reader r;
@@ -400,6 +400,7 @@ static int prove_para_head(pdot_client *c, const uint8_t rhash[32], uint32_t rnu
     size_t hdlen;
     int rc;
 
+    memset(&ph, 0, sizeof ph);
     if ((rc = proven_header(c, v->relay, rhash, &enc, &rh)))
         return rc;
     pdot_buf_free(&enc);

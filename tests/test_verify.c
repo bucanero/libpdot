@@ -128,6 +128,7 @@ static void run(const char *path, int expect_stored, uint32_t expect_block, uint
     heads = proof_field(j, "paras_heads_proof");
     CHECK(pdot_trie_read(rh.state_root, heads.nodes, heads.n, key, 44, &v, &vl) == 0);
     pdot_reader_init(&r, v, vl);
+    memset(&ph, 0, sizeof ph);  /* stays zero if the check below fails */
     CHECK(pdot_read_bytes(&r, &hd, &hdl) == 0 && pdot_header_decode(hd, hdl, &ph) == 0);
     printf("  Bulletin #%u proven final\n", ph.number);
 

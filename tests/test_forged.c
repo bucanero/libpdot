@@ -583,7 +583,10 @@ int main(void)
     CHECK(pdot_header_decode(srv.relay_header.p, srv.relay_header.len, &srv.rh) == 0);
     CHECK(pdot_header_decode(srv.handover_header.p, srv.handover_header.len, &srv.hh) == 0);
     CHECK(pdot_cid_from_string(&cid, cJSON_GetObjectItem(j, "cid")->valuestring) == 0);
-    CHECK(pdot_mutex_init(&srv.lock) == 0 && server_start(&t) == 0);
+    if (pdot_mutex_init(&srv.lock) != 0 || server_start(&t) != 0) {
+        CHECK(!"the fake node did not start");
+        TEST_DONE();
+    }
     snprintf(relay_url, sizeof relay_url, "http://127.0.0.1:%d/relay", srv.port);
     snprintf(para_url, sizeof para_url, "http://127.0.0.1:%d/para", srv.port);
     checkpoint_469(ho, &ck469, &ck469_len);

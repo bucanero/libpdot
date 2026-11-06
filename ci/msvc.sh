@@ -3,8 +3,11 @@
 # Bash on a GitHub windows runner (CMake and Visual Studio preinstalled).
 # mbedTLS, curl (with Schannel, Windows' own TLS) and cJSON are built first
 # from the same pinned release tarballs as ci/mingw.sh, into a static prefix.
-#   WERROR=1  treat MSVC warnings in libpdot's own code as errors
+#   ci/msvc.sh [WERROR=1]   WERROR=1: MSVC warnings in libpdot's own code are errors
 set -eu
+for kv in "$@"; do
+    case $kv in WERROR=*) WERROR=${kv#WERROR=} ;; esac
+done
 WERROR=${WERROR:-0}
 WORK=$(pwd)
 DEPS=$WORK/build-deps
@@ -43,7 +46,7 @@ dep "$DEPS/curl-8.23.0" -DBUILD_STATIC_LIBS=ON -DBUILD_CURL_EXE=OFF -DBUILD_TEST
 
 echo "== libpdot (WERROR=$WERROR)"
 cmake -S . -B build -A x64 -DCMAKE_PREFIX_PATH="$PREFIX" -DPDOT_WERROR="$WERROR"
-# Warnings are listed once each, so the first run without /WX shows them all.
+# Each distinct warning is listed once (vendored code's included, never errors).
 cmake --build build --config Release -j 4 -- -nologo 2>&1 | tee build/msbuild.log
 grep -E "warning C[0-9]+" build/msbuild.log | sed 's/^ *//' | sort -u > build/warnings.txt || true
 echo "== $(wc -l < build/warnings.txt) distinct MSVC warnings"

@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - run: ci/msvc.sh
+      - run: ci/msvc.sh WERROR=1
 
   fuzz:
     runs-on: ubuntu-24.04
