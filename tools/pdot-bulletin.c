@@ -415,18 +415,63 @@ static int setup_verifier(pdot_client *c, const struct opts *o)
     return rc ? die("checkpoint", rc, c) : 0;
 }
 
+/*
+ * Writes ck to --checkpoint if it differs from what is there, through a
+ * temporary file so that a run killed mid-write keeps the old one.
+ */
+static void store_checkpoint(const struct opts *o, const uint8_t *ck, size_t len)
+{
+    uint8_t *old = NULL;
+    size_t old_len = 0;
+    char tmp[1024];
+
+    if (!o->relay || !o->checkpoint)
+        return;
+    if (read_file(o->checkpoint, &old, &old_len) == 0 && old_len == len &&
+        memcmp(old, ck, len) == 0) {
+        free(old);
+        return;
+    }
+    free(old);
+    snprintf(tmp, sizeof tmp, "%s.tmp", o->checkpoint);
+    if (write_file(tmp, ck, len) == 0) {
+#if defined(_WIN32)
+        remove(o->checkpoint);
+#endif
+        if (rename(tmp, o->checkpoint) != 0)
+            perror(o->checkpoint);
+    }
+}
+
 /* Saves the checkpoint back if verification advanced it. */
 static void save_checkpoint(pdot_client *c, const struct opts *o)
 {
-    uint8_t *ck, *old = NULL;
-    size_t len, old_len = 0;
+    uint8_t *ck;
+    size_t len;
 
     if (!o->relay || pdot_client_checkpoint(c, &ck, &len))
         return;
-    if (read_file(o->checkpoint, &old, &old_len) || old_len != len || memcmp(old, ck, len) != 0)
-        write_file(o->checkpoint, ck, len);
-    free(old);
+    store_checkpoint(o, ck, len);
     pdot_free(ck);
+}
+
+/* The same for a client handed to pdot_async: its jobs and watches combined. */
+static void save_async_checkpoint(pdot_async *a, const struct opts *o)
+{
+    uint8_t *ck;
+    size_t len;
+
+    if (!o->relay || pdot_async_checkpoint(a, &ck, &len))
+        return;
+    store_checkpoint(o, ck, len);
+    pdot_free(ck);
+}
+
+/* pdot_async_set_checkpoint_fn: saved as soon as a watch moves it forward. */
+static void on_checkpoint(void *ud, const uint8_t *ck, size_t len)
+{
+    store_checkpoint(ud, ck, len);
+    fprintf(stderr, "checkpoint advanced: saved\n");
 }
 
 /* --metadata-hash on | off | SYMBOL:DECIMALS */
@@ -732,6 +777,8 @@ static int cmd_watch(pdot_client *c, int argc, char **argv, int i, const struct 
         pdot_client_free(c);
         return rc ? rc : die("async", PDOT_E_NOMEM, NULL);
     }
+    if (o->relay)
+        pdot_async_set_checkpoint_fn(a, on_checkpoint, (void *)o);
     switch (w.kind) {
     case 0: id = pdot_async_watch_head(a, on_watch, &w); break;
     case 1: id = pdot_async_watch_balance(a, who, on_watch, &w); break;
@@ -743,6 +790,7 @@ static int cmd_watch(pdot_client *c, int argc, char **argv, int i, const struct 
         pdot_async_poll(a);
         sleep_ms(16);
     }
+    save_async_checkpoint(a, o);
     pdot_async_free(a);
     return id ? 0 : die("watch", PDOT_E_NOMEM, NULL);
 }
@@ -768,7 +816,8 @@ static void on_tx(void *ud, int rc, const char *error, const void *result)
 
 /* Through pdot_async: submit, then poll once per "frame" until the callback ran. */
 static int submit_async(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
-                        const pdot_tx_options *to, pdot_tx_result *tx, char *err, size_t cap)
+                        const pdot_tx_options *to, const struct opts *o, pdot_tx_result *tx,
+                        char *err, size_t cap)
 {
     struct tx_wait w;
     pdot_async *a = pdot_async_new(c);
@@ -787,6 +836,7 @@ static int submit_async(pdot_client *c, const pdot_signer *s, const uint8_t *cal
             frames++;
         }
     }
+    save_async_checkpoint(a, o);
     pdot_async_free(a);
     fprintf(stderr, "async: done after %u frames\n", frames);
     *tx = w.tx;
@@ -838,7 +888,7 @@ static int run_tx(pdot_client *c, const pdot_signer *s, const uint8_t *call, siz
     }
     if (o->async) {
         *client_gone = 1;
-        rc = submit_async(c, s, call, len, &to, &tx, err, sizeof err);
+        rc = submit_async(c, s, call, len, &to, o, &tx, err, sizeof err);
     } else {
         rc = pdot_tx_submit(c, s, call, len, &to, &tx);
         snprintf(err, sizeof err, "%s", rc ? pdot_last_error(c) : "");

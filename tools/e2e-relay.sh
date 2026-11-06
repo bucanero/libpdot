@@ -9,6 +9,10 @@
 #   POLKADOT=/path/to/polkadot OMNI_NODE=/path/to/polkadot-omni-node \
 #     tools/e2e-relay.sh [build-dir]
 #
+# The Bulletin runtime is the one live on RUNTIME_RPC; RUNTIME_AT=<block> takes
+# the one deployed at that block instead, for a node too old for the newest.
+# The collator runs with COLLATOR_ARGS (default: --authoring slot-based).
+#
 # The polkadot-prepare-worker and polkadot-execute-worker binaries must sit
 # next to polkadot. Validators need Linux's secure-validator sandbox; where it
 # is unavailable (macOS, most containers) pass the opt-out yourself through
@@ -20,6 +24,7 @@ CLI=$BUILD/pdot-bulletin
 POLKADOT=${POLKADOT:-polkadot}
 OMNI_NODE=${OMNI_NODE:-polkadot-omni-node}
 RUNTIME_RPC=${RUNTIME_RPC:-https://westend-bulletin-rpc.polkadot.io}
+RUNTIME_AT=${RUNTIME_AT:-}  # a block number: the runtime deployed then, not the newest
 PARA_ID=2487
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pdot-relay.XXXXXX")
 RELAY=http://127.0.0.1:9944
@@ -31,21 +36,49 @@ EVE_SR=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
 
 PIDS=
 WATCH_PID=
+KEEP_LOGS=
 cleanup() {
     for p in $PIDS $WATCH_PID; do kill "$p" 2>/dev/null || true; done
-    rm -rf "$WORK"
+    if [ -n "$KEEP_LOGS" ]; then echo "logs kept in $WORK"; else rm -rf "$WORK"; fi
 }
 trap cleanup EXIT INT TERM
+
+# Each log's first errors (the cause is usually there) and last lines; keeps them.
+show_logs() {
+    for f in "$WORK"/*.log; do
+        echo "--- $f: first errors"
+        grep -m 8 -iE 'error|cannot|secure|panic' "$f" || echo "(none)"
+        echo "--- $f: last lines"
+        tail -8 "$f"
+    done
+    KEEP_LOGS=1
+}
+
+# Writes a relay chain spec to $1: polkadot 1.25 and later have
+# export-chain-spec, older releases build-spec. Shows the error if both fail.
+relay_spec() {  # out-file args...
+    out=$1
+    shift
+    "$POLKADOT" export-chain-spec "$@" > "$out" 2> "$WORK/spec.err" && return 0
+    "$POLKADOT" build-spec --disable-default-bootnode "$@" > "$out" 2>> "$WORK/spec.err" && return 0
+    echo "cannot create the relay chain spec with $POLKADOT:"
+    cat "$WORK/spec.err"
+    exit 1
+}
 
 wait_for() {  # file pattern seconds
     i=0
     until grep -q "$2" "$1" 2>/dev/null; do
         i=$((i + 1))
-        if [ $i -gt "$3" ]; then echo "timed out waiting for '$2' in $1"; tail -20 "$1"; exit 1; fi
+        if [ $i -gt "$3" ]; then
+            echo "timed out waiting for '$2' in $1"
+            show_logs
+            exit 1
+        fi
         for p in $PIDS; do  # a node that exited will never log it
             if ! kill -0 "$p" 2>/dev/null; then
                 echo "a node exited while waiting for '$2'"
-                for f in "$WORK"/*.log; do echo "--- $f"; tail -20 "$f"; done
+                show_logs
                 exit 1
             fi
         done
@@ -53,9 +86,15 @@ wait_for() {  # file pattern seconds
     done
 }
 
-echo "== Bulletin runtime from $RUNTIME_RPC"
+echo "== Bulletin runtime from $RUNTIME_RPC${RUNTIME_AT:+ at #$RUNTIME_AT}"
+AT=
+if [ -n "$RUNTIME_AT" ]; then
+    AT=$(curl -fsS -m 30 -H 'Content-Type: application/json' \
+        -d "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"chain_getBlockHash\",\"params\":[$RUNTIME_AT]}" \
+        "$RUNTIME_RPC" | sed 's/.*"result":"\(0x[0-9a-f]*\)".*/,"\1"/')
+fi
 curl -fsS -m 120 -H 'Content-Type: application/json' \
-    -d '{"id":1,"jsonrpc":"2.0","method":"state_getStorage","params":["0x3a636f6465"]}' \
+    -d "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"state_getStorage\",\"params\":[\"0x3a636f6465\"$AT]}" \
     "$RUNTIME_RPC" | sed 's/.*"result":"0x\([0-9a-f]*\)".*/\1/' | xxd -r -p > "$WORK/runtime.wasm"
 "$OMNI_NODE" chain-spec-builder -c "$WORK/para.json" create -p $PARA_ID -c westend_local_testnet \
     -i bulletin-westend -n Bulletin -t local -r "$WORK/runtime.wasm" named-preset local_testnet >/dev/null
@@ -74,7 +113,7 @@ EOF
 "$OMNI_NODE" export-genesis-wasm --chain "$WORK/para.json" > "$WORK/code.hex" 2>/dev/null
 
 echo "== westend-local relay with parachain $PARA_ID at genesis"
-"$POLKADOT" build-spec --chain westend-local --disable-default-bootnode > "$WORK/relay-plain.json" 2>/dev/null
+relay_spec "$WORK/relay-plain.json" --chain westend-local
 python3 - "$WORK" $PARA_ID <<'EOF'
 import json, sys
 work, para = sys.argv[1], int(sys.argv[2])
@@ -86,7 +125,7 @@ spec["genesis"]["runtimeGenesis"]["patch"]["paras"] = {
 }
 json.dump(spec, open(f"{work}/relay-plain.json", "w"))
 EOF
-"$POLKADOT" build-spec --chain "$WORK/relay-plain.json" --raw --disable-default-bootnode > "$WORK/relay.json" 2>/dev/null
+relay_spec "$WORK/relay.json" --chain "$WORK/relay-plain.json" --raw
 # A node serves grandpa_proveFinality only after its first authority set
 # change, and westend-local makes none for hours. Schedule one at block 1, to
 # the same authorities: set 0 hands over to set 1 at once.
@@ -116,7 +155,11 @@ ALICE_P2P=/ip4/127.0.0.1/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2
     --bootnodes $ALICE_P2P > "$WORK/bob.log" 2>&1 &
 PIDS="$PIDS $!"
 
+# Bulletin runtimes from spec 1000028 build on a relay parent one block back
+# (a relay parent offset), which only the slot-based collator supports.
+# shellcheck disable=SC2086
 "$OMNI_NODE" --chain "$WORK/para.json" --collator --alice --tmp --port 40333 --rpc-port 9988 \
+    ${COLLATOR_ARGS:---authoring slot-based} \
     --node-key 0000000000000000000000000000000000000000000000000000000000000003 \
     --no-telemetry --no-mdns -- --chain "$WORK/relay.json" --port 30335 --bootnodes $ALICE_P2P \
     > "$WORK/collator.log" 2>&1 &

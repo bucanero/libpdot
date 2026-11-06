@@ -162,6 +162,36 @@ int pdot_client_checkpoint(pdot_client *c, uint8_t **blob, size_t *len)
                      c->verifier->anchor_hash, blob, len);
 }
 
+int pdot_verifier_newer(uint64_t set_a, uint32_t anchor_a, uint64_t set_b, uint32_t anchor_b)
+{
+    return set_a > set_b || (set_a == set_b && anchor_a > anchor_b);
+}
+
+int pdot_verifier_adopt(pdot_client *c, const uint8_t *blob, size_t len)
+{
+    pdot_verifier *v = c->verifier, tmp;
+    int rc;
+
+    if (!v)
+        return PDOT_E_INVALID;
+    memset(&tmp, 0, sizeof tmp);
+    if ((rc = ck_decode(blob, len, &tmp)))
+        return rc;
+    if (memcmp(tmp.genesis, v->genesis, 32) != 0) {
+        pdot_grandpa_set_free(&tmp.set);
+        return PDOT_E_INVALID;
+    }
+    if (!pdot_verifier_newer(tmp.set.set_id, tmp.anchor_number, v->set.set_id, v->anchor_number)) {
+        pdot_grandpa_set_free(&tmp.set);
+        return 0;
+    }
+    pdot_grandpa_set_free(&v->set);
+    v->set = tmp.set;
+    v->anchor_number = tmp.anchor_number;
+    memcpy(v->anchor_hash, tmp.anchor_hash, 32);
+    return 0;
+}
+
 /* ---- Relay finality ------------------------------------------------------ */
 
 /* Fetches a header by hash and checks it hashes to that hash. */
@@ -271,25 +301,33 @@ static int relay_final(pdot_client *c, uint8_t hash[32], uint32_t *number, int w
         pdot_reader_init(&r, proof, plen);
         rc = pdot_read_skip(&r, 32) || pdot_read_bytes(&r, &just, &jlen);
         rc = rc ? PDOT_E_DECODE : pdot_grandpa_verify(&v->set, just, jlen, target, &tnum, &st);
-        free(proof);
-        if (rc) {
+        if (rc && rc != PDOT_E_DECODE) {
             /*
              * Signed by another set: the set may have changed at the anchor
              * through a change signalled with a delay. Only then is the
-             * slower search back through ancestors worth it.
+             * slower search back through ancestors worth it, and the set
+             * found replaces the trusted one only if it signed this proof:
+             * otherwise a node serving any bad or old justification could
+             * have a change applied again, moving the set id past the real one.
              */
             int rc2 = change_enacted_at(c, v->anchor_hash, MAX_DELAY_WALK, &next);
             if (rc2 == 0) {
                 next.set_id = v->set.set_id + 1;
-                pdot_grandpa_set_free(&v->set);
-                v->set = next;
-                continue;
+                if (pdot_grandpa_verify(&next, just, jlen, target, &tnum, &st) == 0) {
+                    free(proof);
+                    pdot_grandpa_set_free(&v->set);
+                    v->set = next;
+                    continue;
+                }
+                pdot_grandpa_set_free(&next);
             }
+        }
+        free(proof);
+        if (rc)
             return pdot_fail(c, PDOT_E_UNVERIFIED,
                              "relay finality proof after #%u does not verify under set %llu (%s)",
                              v->anchor_number, (unsigned long long)v->set.set_id,
                              pdot_strerror(rc));
-        }
         if (tnum <= v->anchor_number)
             return pdot_fail(c, PDOT_E_UNVERIFIED, "relay finality proof goes backwards");
 

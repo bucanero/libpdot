@@ -105,7 +105,10 @@ int pdot_checkpoint_fetch_at(const char *relay_url, uint32_t block, uint8_t **bl
 int pdot_client_set_verifier(pdot_client *c, const char *relay_url, uint32_t para_id,
                              const uint8_t *checkpoint, size_t len);
 
-/* The current checkpoint, advanced past any set changes seen; save it. */
+/*
+ * The current checkpoint, advanced past any set changes seen; save it. Once
+ * the client is handed to pdot_async_new, use pdot_async_checkpoint.
+ */
 int pdot_client_checkpoint(pdot_client *c, uint8_t **blob, size_t *len);
 
 /* ---- Signers -------------------------------------------------------- */
@@ -606,6 +609,23 @@ void pdot_async_free(pdot_async *a);
 int pdot_async_poll(pdot_async *a);
 
 /*
+ * With a verifier: the checkpoint furthest along, from jobs and watches
+ * alike (they verify on separate connections and share their progress).
+ * Save it so the next run starts from there. *blob is freed with pdot_free;
+ * PDOT_E_INVALID without a verifier.
+ */
+int pdot_async_checkpoint(pdot_async *a, uint8_t **blob, size_t *len);
+
+/*
+ * Optional: fn(ud, blob, len) runs inside pdot_async_poll each time the
+ * checkpoint advances (at GRANDPA authority-set changes, every few hours on
+ * live relay chains), so a long-running app can save it as it goes. blob is
+ * valid during the call only.
+ */
+void pdot_async_set_checkpoint_fn(pdot_async *a,
+                                  void (*fn)(void *ud, const uint8_t *blob, size_t len), void *ud);
+
+/*
  * Optional: wake(ud) is called from a background thread whenever callbacks
  * are waiting, for loops that sleep instead of polling every frame.
  */
@@ -622,8 +642,7 @@ int pdot_async_cancel(pdot_async *a, uint64_t id);
  * Runs work(c, ud) on the worker thread with the async's client; the callback
  * gets its return code and no result. Long-running work should return
  * PDOT_E_CANCELLED once pdot_client_cancelled(c) is 1; library calls made
- * inside it already do. pdot_client_checkpoint inside work saves the
- * verifier's progress.
+ * inside it already do.
  */
 uint64_t pdot_async_run(pdot_async *a, int (*work)(pdot_client *c, void *ud),
                         pdot_result_fn done, void *ud);

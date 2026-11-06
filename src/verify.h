@@ -30,6 +30,15 @@ typedef struct pdot_verifier {
 
 void pdot_verifier_free(pdot_verifier *v);
 
+/* 1 if checkpoint progress (set a, anchor a) is past (set b, anchor b). */
+int pdot_verifier_newer(uint64_t set_a, uint32_t anchor_a, uint64_t set_b, uint32_t anchor_b);
+
+/*
+ * Moves c's verifier to a checkpoint another client of the same relay chain
+ * reached, if that one is further along; otherwise leaves it as it is.
+ */
+int pdot_verifier_adopt(pdot_client *c, const uint8_t *blob, size_t len);
+
 /*
  * A Bulletin header proven final with number >= min_number, polling relay
  * finality until the client's verify timeout. Reuses the last proof when new

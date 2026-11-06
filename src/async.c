@@ -6,6 +6,12 @@
  * Locking: everything in struct pdot_async below `lock` is guarded by it.
  * The worker owns `c`, the watch thread owns `sc` and the per-watch reading
  * state; neither client is touched by any other thread.
+ *
+ * Checkpoints: each client verifies on its own connection, so each advances
+ * its own verifier. Around every job and every watch round the thread
+ * publishes its progress to `ck` if it got further, and first catches up
+ * from `ck` if the other thread did, so authority-set changes are walked
+ * once and the app can save one checkpoint.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,6 +124,15 @@ struct pdot_async {
     uint64_t      next_id;
     void        (*wake)(void *ud);
     void         *wake_ud;
+
+    /* The furthest verifier checkpoint either thread reached; NULL: no verifier. */
+    uint8_t      *ck;
+    size_t        ck_len;
+    uint64_t      ck_set;
+    uint32_t      ck_anchor;
+    int           ck_new;  /* advanced since ck_fn last ran */
+    void        (*ck_fn)(void *ud, const uint8_t *blob, size_t len);
+    void         *ck_ud;
 };
 
 /* ---- Items ---------------------------------------------------------------- */
@@ -185,6 +200,67 @@ static void deliver(struct item *it)
 
 /* ---- Worker --------------------------------------------------------------- */
 
+/* ---- Checkpoints ---------------------------------------------------------- */
+
+/* Moves c's verifier up to the shared checkpoint if the other thread got further. */
+static void ck_catch_up(pdot_async *a, pdot_client *c)
+{
+    uint8_t *ck = NULL;
+    size_t len = 0;
+
+    if (!c->verifier)
+        return;
+    pdot_mutex_lock(&a->lock);
+    if (a->ck && pdot_verifier_newer(a->ck_set, a->ck_anchor, c->verifier->set.set_id,
+                                     c->verifier->anchor_number) &&
+        (ck = malloc(a->ck_len)) != NULL) {
+        memcpy(ck, a->ck, a->ck_len);
+        len = a->ck_len;
+    }
+    pdot_mutex_unlock(&a->lock);
+    if (ck) {
+        pdot_verifier_adopt(c, ck, len);
+        free(ck);
+    }
+}
+
+/* Publishes c's verifier progress as the shared checkpoint if it is further along. */
+static void ck_publish(pdot_async *a, pdot_client *c)
+{
+    const pdot_verifier *v = c->verifier;
+    void (*wake)(void *) = NULL;
+    void *wake_ud = NULL;
+    uint8_t *ck;
+    size_t len;
+    int newer;
+
+    if (!v)
+        return;
+    pdot_mutex_lock(&a->lock);
+    newer = !a->ck || pdot_verifier_newer(v->set.set_id, v->anchor_number, a->ck_set, a->ck_anchor);
+    pdot_mutex_unlock(&a->lock);
+    if (!newer || pdot_client_checkpoint(c, &ck, &len))
+        return;
+    pdot_mutex_lock(&a->lock);
+    if (!a->ck || pdot_verifier_newer(v->set.set_id, v->anchor_number, a->ck_set, a->ck_anchor)) {
+        a->ck_new = a->ck != NULL;  /* an advance, not the starting point */
+        free(a->ck);
+        a->ck = ck;
+        a->ck_len = len;
+        a->ck_set = v->set.set_id;
+        a->ck_anchor = v->anchor_number;
+        wake = a->ck_new && a->ck_fn ? a->wake : NULL;
+        wake_ud = a->wake_ud;
+        ck = NULL;
+    }
+    pdot_mutex_unlock(&a->lock);
+    free(ck);
+    if (wake)
+        wake(wake_ud);
+}
+
+/* ---- Worker thread --------------------------------------------------------- */
+
 static int worker_stop(void *ud)
 {
     pdot_async *a = ud;
@@ -219,7 +295,9 @@ static void worker_main(void *arg)
         pdot_mutex_unlock(&a->lock);
 
         a->c->err[0] = '\0';
+        ck_catch_up(a, a->c);
         rc = it->work(a->c, it);
+        ck_publish(a, a->c);
         if (rc)
             set_error(it, rc, a->c);
         /* Jobs that may report a failed dispatch set has_result themselves. */
@@ -574,7 +652,9 @@ static void watcher_main(void *arg)
         if (!ws && time(NULL) >= ws_retry && pdot_ws_available() &&
             pdot_ws_subscribe(c, url, "chain_subscribeFinalizedHeads", &ws))
             ws_retry = time(NULL) + WS_RETRY_S;
+        ck_catch_up(a, c);
         tick(a, &last, &have_last, force);
+        ck_publish(a, c);
         wait_trigger(a, &ws, &ws_retry);
     }
     pdot_ws_close(ws);
@@ -641,6 +721,7 @@ pdot_async *pdot_async_new(pdot_client *c)
         return NULL;
     }
     a->c = c;
+    ck_publish(a, c);  /* the starting point, before any thread runs */
     pdot_client_set_stop(a->c, worker_stop, a);
     pdot_client_set_stop(a->sc, watcher_stop, a);
     return a;
@@ -679,6 +760,7 @@ void pdot_async_free(pdot_async *a)
 
     pdot_client_free(a->c);
     pdot_client_free(a->sc);
+    free(a->ck);
     pdot_cond_destroy(&a->cond);
     pdot_mutex_destroy(&a->lock);
     free(a);
@@ -687,6 +769,10 @@ void pdot_async_free(pdot_async *a)
 int pdot_async_poll(pdot_async *a)
 {
     struct item *list, *it;
+    void (*ck_fn)(void *, const uint8_t *, size_t) = NULL;
+    void *ck_ud = NULL;
+    uint8_t *ck = NULL;
+    size_t ck_len = 0;
     int n = 0;
 
     if (!a)
@@ -694,6 +780,13 @@ int pdot_async_poll(pdot_async *a)
     pdot_mutex_lock(&a->lock);
     list = a->done;
     a->done = a->done_tail = NULL;
+    if (a->ck_new && a->ck_fn && (ck = malloc(a->ck_len)) != NULL) {
+        memcpy(ck, a->ck, a->ck_len);
+        ck_len = a->ck_len;
+        ck_fn = a->ck_fn;
+        ck_ud = a->ck_ud;
+        a->ck_new = 0;
+    }
     pdot_mutex_unlock(&a->lock);
     while ((it = list)) {
         list = it->next;
@@ -701,7 +794,42 @@ int pdot_async_poll(pdot_async *a)
         free_item(it);
         n++;
     }
+    if (ck_fn)
+        ck_fn(ck_ud, ck, ck_len);
+    free(ck);
     return n;
+}
+
+int pdot_async_checkpoint(pdot_async *a, uint8_t **blob, size_t *len)
+{
+    int rc = PDOT_E_INVALID;
+
+    if (!a || !blob || !len)
+        return PDOT_E_INVALID;
+    *blob = NULL;
+    *len = 0;
+    pdot_mutex_lock(&a->lock);
+    if (a->ck) {
+        rc = PDOT_E_NOMEM;
+        if ((*blob = malloc(a->ck_len)) != NULL) {
+            memcpy(*blob, a->ck, a->ck_len);
+            *len = a->ck_len;
+            rc = 0;
+        }
+    }
+    pdot_mutex_unlock(&a->lock);
+    return rc;
+}
+
+void pdot_async_set_checkpoint_fn(pdot_async *a,
+                                  void (*fn)(void *ud, const uint8_t *blob, size_t len), void *ud)
+{
+    if (!a)
+        return;
+    pdot_mutex_lock(&a->lock);
+    a->ck_fn = fn;
+    a->ck_ud = ud;
+    pdot_mutex_unlock(&a->lock);
 }
 
 void pdot_async_set_wake(pdot_async *a, void (*wake)(void *ud), void *ud)

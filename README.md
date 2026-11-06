@@ -325,6 +325,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 - **Cancel** with `pdot_async_cancel(a, id)`. A queued job never runs; a running one stops at its next network call or wait. A store may still land on chain.
 - **Watches** live on a second thread with their own connection. Each new final block triggers one batched read of every watched key (one proof with a verifier), and a callback runs only when a value changed. A failed read is reported once and retried. New blocks are announced over a WebSocket subscription (`chain_subscribeFinalizedHeads`, on the relay chain when verifying) if libcurl supports WebSockets, and found by polling every 2 s otherwise.
 - **Wake-ups**: `pdot_async_set_wake` lets a loop that sleeps be woken when results are waiting.
+- **Checkpoints**: jobs and watches verify on separate connections but share their progress, so a validator-set change is walked once. `pdot_async_checkpoint` returns the newest checkpoint; save it before `pdot_async_free`. A long-running app can also pass a function to `pdot_async_set_checkpoint_fn`, which runs inside `pdot_async_poll` whenever the checkpoint advances. `pdot-bulletin watch` saves `--checkpoint` that way.
 - `pdot_async_run(a, work, done, ud)` runs any blocking libpdot code of your own on the worker.
 
 [`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line.
@@ -345,7 +346,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit` |
 | Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |
 | Amounts | `pdot_u128_format`, `pdot_u128_parse`, `pdot_u128_to_double` |
-| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
+| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_checkpoint`, `pdot_async_set_checkpoint_fn`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
 | Watches | `pdot_async_watch_head`, `pdot_async_watch_storage`, `pdot_async_watch_balance`, `pdot_async_watch_asset_balance`, `pdot_async_watch_nft_item` |
 
 ### Things to know
@@ -393,6 +394,7 @@ Every layer is checked against Parity's own implementations before it touches a 
 - **Event decoding:** against subxt, on events from Paseo blocks.
 - **Metadata hash:** against hashes the Rust [merkleized-metadata](https://github.com/bkchr/merkleized-metadata) crate computed: the ones the Westend and Paseo Bulletin runtimes embed, and one of the crate's own test vectors. BLAKE3 against its official test vectors.
 - **Verification:** GRANDPA justifications, validator-set handovers and storage proofs recorded from Paseo and Polkadot mainnet, plus tampered copies that must fail. [`tools/record-proofs.c`](tools/record-proofs.c) re-records them.
+- **A lying node** ([`tests/test_forged.c`](tests/test_forged.c)): a local JSON-RPC server serves those recorded Paseo proofs to a verifying client over HTTP. Answered honestly, the CID is proven stored and the checkpoint follows the handover to the next validator set, including through a `pdot_async` watch. Then the server forges one answer at a time: a signature in a justification, an authority announced in the handover header, a header's state root, a node of each storage proof, a withheld proof, and an old justification replayed as the newest. Every forgery must fail with `PDOT_E_UNVERIFIED` and leave the checkpoint where it was.
 - **Asset Hub reads:** keys compared byte for byte with keys a Polkadot Asset Hub node listed, then balances, USDt, an NFT and its attributes decoded from one recorded read proof, checked against the block's state root. A proof with any byte changed must fail. [`tools/record-assets.c`](tools/record-assets.c) re-records it.
 - **Transactions:** calls encoded from JSON against Polkadot Asset Hub metadata, compared with bytes worked out by hand from the SCALE rules, plus error messages for bad arguments. Also the `ChargeAssetTxPayment` extension layout, the fee and the inner result of a proxied call read from events, and `Proxy.Proxies` decoding. The live checks below are what show a real runtime accepts them.
 - **`pdot_async`:** ordering, callbacks only inside `pdot_async_poll`, cancelling queued and running jobs, callbacks owed at `pdot_async_free`, and one report per failure streak for watches. Also run under ThreadSanitizer.
