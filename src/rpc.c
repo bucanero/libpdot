@@ -4,7 +4,7 @@
 #include "pdot.h"
 #include "hex.h"
 #include "http.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 
 int pdot_rpc(pdot_client *c, const char *method, cJSON *params, cJSON **result)
 {
@@ -155,16 +155,49 @@ int pdot_rpc_block_number(pdot_client *c, const uint8_t hash[32], uint32_t *numb
     return rc;
 }
 
-int pdot_rpc_runtime_version(pdot_client *c, uint32_t *spec, uint32_t *tx)
+int pdot_rpc_runtime_version(pdot_client *c, uint32_t *spec, uint32_t *tx,
+                             char *spec_name, size_t cap)
 {
-    cJSON *res;
+    cJSON *res, *name;
     int rc;
 
     if ((rc = pdot_rpc(c, "state_getRuntimeVersion", NULL, &res)))
         return rc;
+    name = cJSON_GetObjectItemCaseSensitive(res, "specName");
     if (json_u32(cJSON_GetObjectItemCaseSensitive(res, "specVersion"), spec) ||
         json_u32(cJSON_GetObjectItemCaseSensitive(res, "transactionVersion"), tx))
         rc = pdot_fail(c, PDOT_E_RPC, "state_getRuntimeVersion: missing versions");
+    else if (spec_name && (!cJSON_IsString(name) || strlen(name->valuestring) >= cap))
+        rc = pdot_fail(c, PDOT_E_RPC, "state_getRuntimeVersion: bad specName");
+    else if (spec_name)
+        strcpy(spec_name, name->valuestring);
+    cJSON_Delete(res);
+    return rc;
+}
+
+/* A property that is a value, or an array of them for multi-token chains. */
+static const cJSON *first_of(const cJSON *v)
+{
+    return cJSON_IsArray(v) ? cJSON_GetArrayItem(v, 0) : v;
+}
+
+int pdot_rpc_token(pdot_client *c, char *symbol, size_t cap, uint8_t *decimals)
+{
+    const cJSON *sym, *dec;
+    cJSON *res;
+    int rc;
+
+    if ((rc = pdot_rpc(c, "system_properties", NULL, &res)))
+        return rc;
+    sym = first_of(cJSON_GetObjectItemCaseSensitive(res, "tokenSymbol"));
+    dec = first_of(cJSON_GetObjectItemCaseSensitive(res, "tokenDecimals"));
+    if (!cJSON_IsString(sym) || strlen(sym->valuestring) >= cap ||
+        !cJSON_IsNumber(dec) || dec->valuedouble < 0 || dec->valuedouble > 255)
+        rc = pdot_fail(c, PDOT_E_RPC, "system_properties: no tokenSymbol/tokenDecimals");
+    else {
+        strcpy(symbol, sym->valuestring);
+        *decimals = (uint8_t)dec->valuedouble;
+    }
     cJSON_Delete(res);
     return rc;
 }
@@ -249,4 +282,202 @@ int pdot_rpc_block_extrinsics(pdot_client *c, const uint8_t hash[32], cJSON **ex
 int pdot_rpc_submit(pdot_client *c, const uint8_t *xt, size_t len, uint8_t tx_hash[32])
 {
     return pdot_rpc_hash(c, "author_submitExtrinsic", pdot_rpc_hex_param(xt, len), tx_hash);
+}
+
+int pdot_rpc_state_call_at(pdot_client *c, const char *fn, const uint8_t *args, size_t args_len,
+                           const uint8_t at[32], uint8_t **out, size_t *out_len)
+{
+    cJSON *p = pdot_rpc_hex_param(args, args_len);
+    cJSON *h = pdot_rpc_hex_param(at, 32);
+
+    cJSON_InsertItemInArray(p, 0, cJSON_CreateString(fn));
+    cJSON_AddItemToArray(p, cJSON_DetachItemFromArray(h, 0));
+    cJSON_Delete(h);
+    return pdot_rpc_bytes(c, "state_call", p, out, out_len);
+}
+
+static int put_hex(pdot_buf *b, const cJSON *v, size_t want)
+{
+    uint8_t *d;
+    size_t n;
+
+    if (!cJSON_IsString(v) || pdot_hex_decode_alloc(v->valuestring, &d, &n))
+        return PDOT_E_RPC;
+    if (want && n != want) {
+        free(d);
+        return PDOT_E_RPC;
+    }
+    pdot_scale_raw(b, d, n);
+    free(d);
+    return 0;
+}
+
+int pdot_rpc_header(pdot_client *c, const uint8_t hash[32], pdot_buf *enc)
+{
+    cJSON *res, *logs, *item;
+    uint32_t number;
+    int rc;
+
+    if ((rc = pdot_rpc(c, "chain_getHeader", pdot_rpc_hex_param(hash, 32), &res)))
+        return rc;
+    logs = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(res, "digest"), "logs");
+    if (put_hex(enc, cJSON_GetObjectItemCaseSensitive(res, "parentHash"), 32) ||
+        json_u32(cJSON_GetObjectItemCaseSensitive(res, "number"), &number) ||
+        !cJSON_IsArray(logs)) {
+        cJSON_Delete(res);
+        return pdot_fail(c, PDOT_E_RPC, "chain_getHeader: malformed header");
+    }
+    pdot_scale_compact(enc, number);
+    rc = put_hex(enc, cJSON_GetObjectItemCaseSensitive(res, "stateRoot"), 32);
+    rc = rc ? rc : put_hex(enc, cJSON_GetObjectItemCaseSensitive(res, "extrinsicsRoot"), 32);
+    pdot_scale_compact(enc, (uint64_t)cJSON_GetArraySize(logs));
+    cJSON_ArrayForEach(item, logs)
+        if (!rc)
+            rc = put_hex(enc, item, 0);
+    cJSON_Delete(res);
+    if (rc)
+        return pdot_fail(c, rc, "chain_getHeader: malformed header");
+    return enc->err;
+}
+
+int pdot_rpc_read_proof(pdot_client *c, const uint8_t *key, size_t key_len,
+                        const uint8_t at[32], pdot_trie_proof *proof)
+{
+    return pdot_rpc_read_proof_keys(c, &key, &key_len, 1, at, proof);
+}
+
+int pdot_rpc_read_proof_keys(pdot_client *c, const uint8_t *const *keys, const size_t *lens,
+                             size_t nkeys, const uint8_t at[32], pdot_trie_proof *proof)
+{
+    cJSON *p = cJSON_CreateArray(), *list = cJSON_CreateArray();
+    cJSON *h = pdot_rpc_hex_param(at, 32), *res, *item;
+    size_t i;
+    int rc = 0, n;
+
+    memset(proof, 0, sizeof *proof);
+    for (i = 0; i < nkeys; i++) {
+        cJSON *k = pdot_rpc_hex_param(keys[i], lens[i]);
+        cJSON_AddItemToArray(list, cJSON_DetachItemFromArray(k, 0));
+        cJSON_Delete(k);
+    }
+    cJSON_AddItemToArray(p, list);
+    cJSON_AddItemToArray(p, cJSON_DetachItemFromArray(h, 0));
+    cJSON_Delete(h);
+    if ((rc = pdot_rpc(c, "state_getReadProof", p, &res)))
+        return rc;
+    list = cJSON_GetObjectItemCaseSensitive(res, "proof");
+    n = cJSON_GetArraySize(list);
+    if (!cJSON_IsArray(list) || n > 16384 ||
+        !(proof->nodes = calloc((size_t)n + 1, sizeof *proof->nodes))) {
+        cJSON_Delete(res);
+        return pdot_fail(c, PDOT_E_RPC, "state_getReadProof: malformed proof");
+    }
+    cJSON_ArrayForEach(item, list) {
+        uint8_t *d;
+        size_t len;
+        if (!cJSON_IsString(item) || pdot_hex_decode_alloc(item->valuestring, &d, &len)) {
+            rc = pdot_fail(c, PDOT_E_RPC, "state_getReadProof: malformed proof");
+            break;
+        }
+        proof->nodes[proof->n].data = d;
+        proof->nodes[proof->n].len = len;
+        proof->n++;
+    }
+    cJSON_Delete(res);
+    if (rc)
+        pdot_trie_proof_free(proof);
+    else
+        pdot_trie_hash_nodes(proof->nodes, proof->n);
+    return rc;
+}
+
+int pdot_rpc_query_storage_at(pdot_client *c, const uint8_t *const *keys, const size_t *lens,
+                              size_t nkeys, const uint8_t at[32], pdot_value *values)
+{
+    cJSON *p = cJSON_CreateArray(), *list = cJSON_CreateArray();
+    cJSON *h = pdot_rpc_hex_param(at, 32), *res, *changes, *item;
+    size_t i;
+    int rc;
+
+    memset(values, 0, nkeys * sizeof *values);
+    for (i = 0; i < nkeys; i++) {
+        cJSON *k = pdot_rpc_hex_param(keys[i], lens[i]);
+        cJSON_AddItemToArray(list, cJSON_DetachItemFromArray(k, 0));
+        cJSON_Delete(k);
+    }
+    cJSON_AddItemToArray(p, list);
+    cJSON_AddItemToArray(p, cJSON_DetachItemFromArray(h, 0));
+    cJSON_Delete(h);
+    if ((rc = pdot_rpc(c, "state_queryStorageAt", p, &res)))
+        return rc;
+    /* [{ block, changes: [[key, value | null], ...] }]; keys come back as given. */
+    changes = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(res, 0), "changes");
+    if (!cJSON_IsArray(changes))
+        rc = pdot_fail(c, PDOT_E_RPC, "state_queryStorageAt: malformed result");
+    cJSON_ArrayForEach(item, changes) {
+        cJSON *k = cJSON_GetArrayItem(item, 0), *v = cJSON_GetArrayItem(item, 1);
+        uint8_t *kb;
+        size_t kl;
+
+        if (rc || !cJSON_IsString(k) || pdot_hex_decode_alloc(k->valuestring, &kb, &kl)) {
+            rc = rc ? rc : pdot_fail(c, PDOT_E_RPC, "state_queryStorageAt: malformed result");
+            break;
+        }
+        for (i = 0; i < nkeys; i++) {
+            if (lens[i] != kl || memcmp(keys[i], kb, kl) != 0 || values[i].present)
+                continue;
+            if (cJSON_IsString(v)) {
+                if (pdot_hex_decode_alloc(v->valuestring, &values[i].data, &values[i].len))
+                    rc = pdot_fail(c, PDOT_E_RPC, "state_queryStorageAt: malformed value");
+                else
+                    values[i].present = 1;
+            }
+            break;
+        }
+        free(kb);
+    }
+    cJSON_Delete(res);
+    if (rc)
+        pdot_values_free(values, nkeys);
+    return rc;
+}
+
+int pdot_rpc_keys_paged(pdot_client *c, const uint8_t *prefix, size_t prefix_len,
+                        uint32_t count, const uint8_t *start, size_t start_len,
+                        const uint8_t at[32], cJSON **keys)
+{
+    cJSON *p = pdot_rpc_hex_param(prefix, prefix_len), *t;
+
+    cJSON_AddItemToArray(p, cJSON_CreateNumber(count));
+    if (start) {
+        t = pdot_rpc_hex_param(start, start_len);
+        cJSON_AddItemToArray(p, cJSON_DetachItemFromArray(t, 0));
+        cJSON_Delete(t);
+    } else {
+        cJSON_AddItemToArray(p, cJSON_CreateNull());
+    }
+    t = pdot_rpc_hex_param(at, 32);
+    cJSON_AddItemToArray(p, cJSON_DetachItemFromArray(t, 0));
+    cJSON_Delete(t);
+    return pdot_rpc(c, "state_getKeysPaged", p, keys);
+}
+
+void pdot_values_free(pdot_value *values, size_t n)
+{
+    size_t i;
+
+    for (i = 0; values && i < n; i++) {
+        free(values[i].data);
+        values[i].data = NULL;
+        values[i].len = 0;
+        values[i].present = 0;
+    }
+}
+
+int pdot_rpc_prove_finality(pdot_client *c, uint32_t number, uint8_t **proof, size_t *len)
+{
+    cJSON *p = cJSON_CreateArray();
+
+    cJSON_AddItemToArray(p, cJSON_CreateNumber(number));
+    return pdot_rpc_bytes(c, "grandpa_proveFinality", p, proof, len);
 }

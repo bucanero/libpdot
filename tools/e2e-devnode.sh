@@ -5,7 +5,10 @@
 # Bulletin (no Rust build needed), starts polkadot-omni-node, then runs the
 # store / fetch / verify / renew round trip with sr25519 //Alice and with
 # ECDSA //Alice after //Eve (a registered authorizer in the dev genesis)
-# grants it storage, and a chunked file with a DAG-PB manifest. With KUBO=1
+# grants it storage, and a chunked file with a DAG-PB manifest. Transactions
+# are signed with CheckMetadataHash, and one over a wrong hash must be
+# rejected. A pdot_async balance watch must see a store change the nonce.
+# With KUBO=1
 # it also fetches through a local Kubo gateway.
 #
 #   OMNI_NODE=/path/to/polkadot-omni-node tools/e2e-devnode.sh [build-dir]
@@ -26,7 +29,9 @@ EVE_SR=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
 
 NODE_PID=
 KUBO_PID=
+WATCH_PID=
 cleanup() {
+    if [ -n "$WATCH_PID" ]; then kill "$WATCH_PID" 2>/dev/null || true; fi
     if [ -n "$NODE_PID" ]; then kill "$NODE_PID" 2>/dev/null || true; fi
     if [ -n "$KUBO_PID" ]; then kill "$KUBO_PID" 2>/dev/null || true; fi
     rm -rf "$WORK"
@@ -37,8 +42,13 @@ echo "== runtime from $RUNTIME_RPC"
 curl -fsS -m 120 -H 'Content-Type: application/json' \
     -d '{"id":1,"jsonrpc":"2.0","method":"state_getStorage","params":["0x3a636f6465"]}' \
     "$RUNTIME_RPC" | sed 's/.*"result":"0x\([0-9a-f]*\)".*/\1/' | xxd -r -p > "$WORK/runtime.wasm"
-(cd "$WORK" && "$OMNI_NODE" chain-spec-builder -c spec.json create -p 2487 -c westend \
-    -i bulletin-westend -n Bulletin -t local -r runtime.wasm named-preset local_testnet >/dev/null)
+"$OMNI_NODE" chain-spec-builder -c "$WORK/spec.json" create -p 2487 -c westend \
+    -i bulletin-westend -n Bulletin -t local -r "$WORK/runtime.wasm" named-preset local_testnet >/dev/null
+# CheckMetadataHash covers the token the runtime was built with (WND, 12 on
+# Westend); the CLI reads it from the node's properties, so match them.
+sed 's/"tokenSymbol": *"UNIT"/"tokenSymbol": "WND"/' "$WORK/spec.json" > "$WORK/spec.tmp"
+mv "$WORK/spec.tmp" "$WORK/spec.json"
+grep -q '"tokenSymbol": "WND"' "$WORK/spec.json"
 
 echo "== starting dev node"
 "$OMNI_NODE" --chain "$WORK/spec.json" --dev --ipfs-server --base-path "$WORK/node" \
@@ -64,6 +74,37 @@ head -c 3670016 /dev/urandom > "$WORK/chunked.bin"
 "$CLI" --rpc $RPC --seed $ALICE_SR roundtrip "$WORK/chunked.bin" 2>&1 | tee "$WORK/chunked.out"
 grep -q 'as 4 chunks + manifest' "$WORK/chunked.out"
 grep -q 'roundtrip ok' "$WORK/chunked.out"
+
+echo "== pdot_async: a balance watch reports //Alice's nonce changing"
+# shellcheck disable=SC2086
+"$CLI" --rpc $RPC --count 2 watch balance 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY \
+    > "$WORK/watch.out" 2>&1 &
+WATCH_PID=$!
+i=0
+until grep -q '^balance:' "$WORK/watch.out"; do  # its first report: the current value
+    i=$((i + 1)); [ $i -gt 120 ] && { cat "$WORK/watch.out"; exit 1; }
+    sleep 1
+done
+head -c 1000 /dev/urandom > "$WORK/small.bin"
+# shellcheck disable=SC2086
+"$CLI" --rpc $RPC --seed $ALICE_SR store "$WORK/small.bin" > /dev/null
+i=0
+while kill -0 $WATCH_PID 2>/dev/null; do  # exits after the second report
+    i=$((i + 1)); [ $i -gt 120 ] && { cat "$WORK/watch.out"; echo "the watch saw no change"; exit 1; }
+    sleep 1
+done
+cat "$WORK/watch.out"
+[ "$(grep -c '^balance:' "$WORK/watch.out")" = 2 ]
+[ "$(grep 'nonce:' "$WORK/watch.out" | sort -u | wc -l)" -eq 2 ]
+
+echo "== CheckMetadataHash: a hash over the wrong inputs is rejected by the chain"
+"$CLI" --rpc $RPC metadata-hash
+if "$CLI" --rpc $RPC --seed $ALICE_SR --metadata-hash UNIT:12 store "$WORK/700k.bin" \
+        > "$WORK/mdh.out" 2>&1; then
+    echo "expected a transaction signed over another metadata hash to be rejected"; exit 1
+fi
+cat "$WORK/mdh.out"
+grep -q 'signed with CheckMetadataHash' "$WORK/mdh.out"
 
 echo "== a failing call is reported by name"
 if "$CLI" --rpc $RPC --seed $EVE_SR authorize $ALICE_ECDSA_ADDR 1 0 > "$WORK/fail.out" 2>&1; then

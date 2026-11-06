@@ -3,6 +3,8 @@
 #include "pdot.h"
 #include "hash.h"
 
+#include "blake3.h"
+
 #define XXH_INLINE_ALL
 #define XXH_NO_XXH3
 #define XXH_NO_STREAM
@@ -67,4 +69,13 @@ void pdot_twox64_concat(uint8_t *out, const void *key, size_t len)
 {
     pdot_twox(out, 8, key, len);
     memcpy(out + 8, key, len);
+}
+
+void pdot_blake3(uint8_t out[32], const void *in, size_t len)
+{
+    blake3_hasher h;
+
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, in, len);
+    blake3_hasher_finalize(&h, out, 32);
 }

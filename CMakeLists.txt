@@ -12,6 +12,7 @@ option(PDOT_FUZZ         "Build libFuzzer targets (clang)" OFF)
 option(PDOT_WERROR       "Treat warnings in libpdot's own code as errors" OFF)
 option(PDOT_WITH_SR25519 "Build the sr25519 signer (sr25519-donna)" ON)
 option(PDOT_WITH_ECDSA   "Build the ECDSA secp256k1 signer (mbedTLS)" ON)
+option(PDOT_WITH_VERIFY  "Relay-chain light client: verify results without trusting RPC nodes" ON)
 option(PDOT_SR25519_FORCE_32BIT "Use sr25519-donna's 32-bit field arithmetic" OFF)
 
 # mbedTLS 3.6 LTS. On macOS: -DCMAKE_PREFIX_PATH=$(brew --prefix mbedtls@3)
@@ -44,6 +45,11 @@ if(PDOT_WERROR)
   list(APPEND PDOT_WARNINGS $<IF:$<C_COMPILER_ID:MSVC>,/WX,-Werror>)
 endif()
 
+if(MINGW)
+  # C99 printf (%zu, %llu) instead of the old Microsoft C runtime's.
+  add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+endif()
+
 if(PDOT_SANITIZE AND NOT MSVC)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
                       -fno-sanitize-recover=all)
@@ -55,14 +61,30 @@ add_library(pdot_blake2 OBJECT third_party/blake2/blake2b-ref.c)
 target_include_directories(pdot_blake2 PUBLIC third_party/blake2)
 set_target_properties(pdot_blake2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# BLAKE3 for the RFC-0078 metadata hash: the portable code path only.
+add_library(pdot_blake3 OBJECT
+  third_party/blake3/blake3.c
+  third_party/blake3/blake3_dispatch.c
+  third_party/blake3/blake3_portable.c)
+target_include_directories(pdot_blake3 PUBLIC third_party/blake3)
+target_compile_definitions(pdot_blake3 PRIVATE
+  BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+  BLAKE3_USE_NEON=0 BLAKE3_ATOMICS=0)
+set_target_properties(pdot_blake3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 if(PDOT_WITH_SR25519)
   include(cmake/PatchSr25519.cmake)  # sets SR25519_DIR
-  add_library(pdot_sr25519 OBJECT
+  set(PDOT_SR25519_SOURCES
     ${SR25519_DIR}/sr25519.c
     ${SR25519_DIR}/merlin.c
     ${SR25519_DIR}/ristretto255.c
     ${SR25519_DIR}/memzero.c
     ${SR25519_DIR}/vrf.c)
+  if(PDOT_WITH_VERIFY)
+    # ed25519 verification for GRANDPA, from the same donna code and hooks.
+    list(APPEND PDOT_SR25519_SOURCES ${SR25519_DIR}/ed25519-donna/ed25519.c)
+  endif()
+  add_library(pdot_sr25519 OBJECT ${PDOT_SR25519_SOURCES})
   target_include_directories(pdot_sr25519 PUBLIC ${SR25519_DIR})
   # Hash and RNG hooks come from our header, force-included, so the
   # submodule's placeholder hook headers stay untouched.
@@ -101,7 +123,17 @@ add_library(pdot
   src/dag.c
   src/tx.c
   src/bulletin.c
-  $<TARGET_OBJECTS:pdot_blake2>)
+  src/mdhash.c
+  src/amount.c
+  src/storage.c
+  src/assets.c
+  src/thread.c
+  src/ws.c
+  src/async.c
+  src/encode.c
+  src/transact.c
+  $<TARGET_OBJECTS:pdot_blake2>
+  $<TARGET_OBJECTS:pdot_blake3>)
 target_link_libraries(pdot PUBLIC MbedTLS::mbedcrypto PRIVATE CURL::libcurl ${PDOT_CJSON})
 if(NOT WIN32)
   find_package(Threads REQUIRED)
@@ -112,6 +144,14 @@ if(PDOT_WITH_SR25519)
   target_include_directories(pdot SYSTEM PRIVATE ${SR25519_DIR})
   target_compile_definitions(pdot PUBLIC PDOT_WITH_SR25519)
 endif()
+if(PDOT_WITH_VERIFY)
+  if(NOT PDOT_WITH_SR25519)
+    message(FATAL_ERROR "PDOT_WITH_VERIFY needs PDOT_WITH_SR25519 (for ed25519-donna)")
+  endif()
+  target_sources(pdot PRIVATE src/trie.c src/grandpa.c src/verify.c)
+  target_include_directories(pdot SYSTEM PRIVATE ${SR25519_DIR}/ed25519-donna)
+  target_compile_definitions(pdot PUBLIC PDOT_WITH_VERIFY)
+endif()
 if(PDOT_WITH_ECDSA)
   target_sources(pdot PRIVATE src/signer_ecdsa.c)
   target_compile_definitions(pdot PUBLIC PDOT_WITH_ECDSA)
@@ -119,7 +159,7 @@ endif()
 target_include_directories(pdot
   PUBLIC  include
   PRIVATE src)
-target_include_directories(pdot SYSTEM PRIVATE third_party/blake2 third_party/xxhash)
+target_include_directories(pdot SYSTEM PRIVATE third_party/blake2 third_party/blake3 third_party/xxhash)
 target_compile_options(pdot PRIVATE ${PDOT_WARNINGS})
 
 if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
@@ -129,18 +169,44 @@ if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
 endif()
 
 if(PDOT_BUILD_EXAMPLES AND PDOT_WITH_SR25519)
-  foreach(e store_and_fetch chunked_upload custom_signer)
+  foreach(e store_and_fetch chunked_upload custom_signer game_loop)
     add_executable(example_${e} examples/${e}.c)
     target_link_libraries(example_${e} PRIVATE pdot)
     target_compile_options(example_${e} PRIVATE ${PDOT_WARNINGS})
   endforeach()
 endif()
 
+if(PDOT_WITH_VERIFY AND PDOT_BUILD_TESTS)
+  # Maintenance tool: records live proofs into tests/fixtures/verify-*.json.
+  add_executable(record_proofs tools/record-proofs.c)
+  target_include_directories(record_proofs PRIVATE src third_party/blake2)
+  target_link_libraries(record_proofs PRIVATE pdot ${PDOT_CJSON})
+  target_compile_options(record_proofs PRIVATE ${PDOT_WARNINGS})
+  # Records Asset Hub state into tests/fixtures/assets-polkadot.json.
+  add_executable(record_assets tools/record-assets.c)
+  target_include_directories(record_assets PRIVATE src)
+  target_link_libraries(record_assets PRIVATE pdot ${PDOT_CJSON})
+  target_compile_options(record_assets PRIVATE ${PDOT_WARNINGS})
+endif()
+
+if(PDOT_WITH_SR25519 AND PDOT_BUILD_TESTS)
+  # Read-only check that live runtimes accept the metadata hash (ci/verify-live.sh).
+  add_executable(check_mdhash tools/check-mdhash.c)
+  target_include_directories(check_mdhash PRIVATE src)
+  target_link_libraries(check_mdhash PRIVATE pdot ${PDOT_CJSON})
+  target_compile_options(check_mdhash PRIVATE ${PDOT_WARNINGS})
+endif()
+
 if(PDOT_FUZZ)
-  foreach(f metadata decode)
+  set(PDOT_FUZZ_TARGETS metadata decode assets call)
+  if(PDOT_WITH_VERIFY)
+    list(APPEND PDOT_FUZZ_TARGETS proof)
+  endif()
+  foreach(f ${PDOT_FUZZ_TARGETS})
     add_executable(fuzz_${f} fuzz/fuzz_${f}.c)
     target_link_libraries(fuzz_${f} PRIVATE pdot)
     target_include_directories(fuzz_${f} PRIVATE src third_party/blake2)
+    target_link_libraries(fuzz_${f} PRIVATE ${PDOT_CJSON})
     target_compile_options(fuzz_${f} PRIVATE -fsanitize=fuzzer,address,undefined)
     target_link_options(fuzz_${f} PRIVATE -fsanitize=fuzzer,address,undefined)
   endforeach()
@@ -148,9 +214,12 @@ endif()
 
 if(PDOT_BUILD_TESTS)
   enable_testing()
-  set(PDOT_TESTS scale hash cid ss58 metadata events dag)
+  set(PDOT_TESTS scale hash cid ss58 metadata mdhash events dag)
   if(PDOT_WITH_SR25519 AND PDOT_WITH_ECDSA)
     list(APPEND PDOT_TESTS signer tx)
+  endif()
+  if(PDOT_WITH_VERIFY)
+    list(APPEND PDOT_TESTS verify assets async transact forged)
   endif()
   foreach(t ${PDOT_TESTS})
     add_executable(test_${t} tests/test_${t}.c)
@@ -161,4 +230,7 @@ if(PDOT_BUILD_TESTS)
     add_test(NAME ${t} COMMAND test_${t}
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
   endforeach()
+  if(WIN32 AND TARGET test_forged)
+    target_link_libraries(test_forged PRIVATE ws2_32)  # its fake RPC node
+  endif()
 endif()

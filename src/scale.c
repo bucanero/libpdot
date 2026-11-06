@@ -95,6 +95,21 @@ void pdot_scale_compact(pdot_buf *b, uint64_t v)
     }
 }
 
+void pdot_scale_compact128(pdot_buf *b, uint64_t lo, uint64_t hi)
+{
+    size_t n;
+
+    if (!hi) {
+        pdot_scale_compact(b, lo);
+        return;
+    }
+    for (n = 9; n < 16 && (hi >> (8 * (n - 8))) != 0; n++)
+        ;
+    put_le(b, ((uint64_t)(n - 4) << 2) | 3, 1);
+    put_le(b, lo, 8);
+    put_le(b, hi, n - 8);
+}
+
 void pdot_scale_bytes(pdot_buf *b, const uint8_t *p, size_t n)
 {
     pdot_scale_compact(b, n);

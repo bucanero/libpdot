@@ -123,6 +123,39 @@ static int read_phase(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
     return rc < 0 ? rc : 0;
 }
 
+static int name_ends(const char *name, size_t len, const char *suffix)
+{
+    size_t n = strlen(suffix);
+
+    return len >= n && memcmp(name + len - n, suffix, n) == 0;
+}
+
+/* Result<(), DispatchError> of a call made through a proxy. */
+static int proxy_result(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
+                        pdot_ext_outcome *out)
+{
+    pdot_md_iter it;
+    pdot_md_field f;
+    const char *name;
+    size_t len;
+    int rc;
+
+    if ((rc = pdot_decode_variant(md, ty, r, &it, &name, &len)))
+        return rc;
+    if (pdot_md_name_eq(name, len, "Err") && it.left == 1 && pdot_md_iter_next(&it, &f) == 1) {
+        char inner[72];  /* + " (in the proxied call)" fits error[96] */
+        out->proxy_failed = 1;
+        if ((rc = pdot_dispatch_error(md, f.ty, r, inner, sizeof inner)))
+            return rc;
+        snprintf(out->error, sizeof out->error, "%s (in the proxied call)", inner);
+        return 0;
+    }
+    while ((rc = pdot_md_iter_next(&it, &f)) == 1)
+        if ((rc = pdot_decode_skip(md, f.ty, r)))
+            return rc;
+    return rc < 0 ? rc : 0;
+}
+
 /*
  * RuntimeEvent is an enum of pallets whose single field is the pallet's own
  * Event enum. Records the events libpdot cares about, skips the rest.
@@ -162,6 +195,14 @@ static int read_event(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
                 out->has_stored = 1;
                 out->stored_index = (uint32_t)v;
             }
+        } else if (name_ends(name, len, "FeePaid") &&
+                   pdot_md_name_eq(f.name, f.name_len, "actual_fee")) {
+            if (!(rc = pdot_decode_u128(md, f.ty, r, &out->fee)))
+                out->has_fee = 1;
+        } else if (pdot_md_name_eq(pallet, plen, "Proxy") &&
+                   pdot_md_name_eq(name, len, "ProxyExecuted") &&
+                   pdot_md_name_eq(f.name, f.name_len, "result")) {
+            rc = proxy_result(md, f.ty, r, out);
         } else {
             rc = pdot_decode_skip(md, f.ty, r);
         }

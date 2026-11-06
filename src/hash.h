@@ -21,6 +21,9 @@ void pdot_blake2b_256(uint8_t out[32], const void *in, size_t len);
 void pdot_blake2b_128(uint8_t out[16], const void *in, size_t len);
 
 /* twox64/128/256: XXH64 with seeds 0..n-1, each output little-endian. */
+/* BLAKE3-256, for the RFC-0078 metadata hash. */
+void pdot_blake3(uint8_t out[32], const void *in, size_t len);
+
 void pdot_twox(uint8_t *out, size_t outlen, const void *in, size_t len);
 void pdot_twox128(uint8_t out[16], const void *in, size_t len);
 

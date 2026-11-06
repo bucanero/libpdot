@@ -251,6 +251,7 @@ static int parse_pallets(pdot_metadata *md, pdot_reader *r)
         if (pl->has_calls)
             TRY(read_compact_u32(r, &pl->calls_ty));
         TRY(skip_opt_compact(r));  /* event */
+        pl->constants_off = r->pos;
         TRY(pdot_read_compact(r, &nconst));
         for (j = 0; j < nconst; j++) {
             TRY(skip_str(r));
@@ -333,6 +334,7 @@ int pdot_metadata_parse(const uint8_t *blob, size_t len, pdot_metadata **out)
         free(md);
         return PDOT_E_NOMEM;
     }
+    md->refs = 1;
     memcpy(md->blob, blob, len);
     md->len = len;
 
@@ -357,7 +359,7 @@ int pdot_metadata_parse(const uint8_t *blob, size_t len, pdot_metadata **out)
 
 void pdot_metadata_free(pdot_metadata *md)
 {
-    if (!md)
+    if (!md || --md->refs > 0)
         return;
     free(md->blob);
     free(md->type_off);
@@ -711,4 +713,31 @@ static int zero_sized(const pdot_metadata *md, uint32_t ty, int depth)
 int pdot_md_is_zero_sized(const pdot_metadata *md, uint32_t ty)
 {
     return zero_sized(md, ty, 0);
+}
+
+int pdot_md_constant(const pdot_metadata *md, const char *pallet, const char *name,
+                     const uint8_t **value, size_t *len)
+{
+    const pdot_md_pallet *pl = pdot_md_find_pallet(md, pallet);
+    pdot_reader r;
+    uint64_t n, i;
+
+    if (!pl || !pl->constants_off)
+        return PDOT_E_NOTFOUND;
+    pdot_reader_init(&r, md->blob, md->len);
+    r.pos = pl->constants_off;
+    TRY(pdot_read_compact(&r, &n));
+    for (i = 0; i < n; i++) {
+        const char *cname;
+        size_t cname_len;
+        uint32_t ty;
+
+        TRY(read_str(&r, &cname, &cname_len));
+        TRY(read_compact_u32(&r, &ty));
+        TRY(pdot_read_bytes(&r, value, len));
+        TRY(skip_strs(&r));
+        if (pdot_md_name_eq(cname, cname_len, name))
+            return 0;
+    }
+    return PDOT_E_NOTFOUND;
 }

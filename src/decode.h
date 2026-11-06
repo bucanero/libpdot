@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pdot.h"
 #include "metadata.h"
 #include "scale.h"
 
@@ -35,5 +36,24 @@ int pdot_decode_seek(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
 /* pdot_decode_seek + pdot_decode_uint on a fresh reader over p. */
 int pdot_decode_path_uint(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
                           size_t len, const char *path, uint64_t *v);
+
+/* Reads an unsigned integer up to u128, Compact<u128>, or a one-field wrapper. */
+int pdot_decode_u128(const pdot_metadata *md, uint32_t ty, pdot_reader *r, pdot_u128 *v);
+
+/*
+ * Reads a byte string in place: Vec<u8>, [u8; N], str, or a one-field
+ * wrapper of those (BoundedVec, AccountId32).
+ */
+int pdot_decode_bytes(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
+                      const uint8_t **p, size_t *n);
+
+/* pdot_decode_seek followed by the reads above, on a fresh reader over p. */
+int pdot_decode_path_u128(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
+                          size_t len, const char *path, pdot_u128 *v);
+int pdot_decode_path_bytes(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
+                           size_t len, const char *path, const uint8_t **out, size_t *n);
+/* The name of the enum variant at path. */
+int pdot_decode_path_variant(const pdot_metadata *md, uint32_t ty, const uint8_t *p,
+                             size_t len, const char *path, const char **name, size_t *name_len);
 
 #endif

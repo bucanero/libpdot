@@ -6,9 +6,9 @@ SECS=${FUZZ_SECONDS:-60}
 sh ci/deps.sh clang libclang-rt-dev
 CC=clang cmake -S . -B build -DPDOT_FUZZ=ON -DPDOT_BUILD_TESTS=OFF \
     -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -g -O1" >/dev/null
-cmake --build build -j "$(nproc)" --target fuzz_metadata fuzz_decode >/dev/null 2>&1
+cmake --build build -j "$(nproc)" --target fuzz_metadata fuzz_decode fuzz_proof fuzz_assets fuzz_call >/dev/null 2>&1
 status=0
-for t in metadata decode; do
+for t in metadata decode proof assets call; do
     mkdir -p "corpus-$t" "crashes-$t"
     cp fuzz/corpus/$t/* "corpus-$t/"
     echo "== fuzz_$t for ${SECS}s"
