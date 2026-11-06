@@ -674,6 +674,7 @@ int pdot_nft_owned(pdot_client *c, const uint8_t account_id[32], uint32_t collec
     uint8_t id[4];
     int rc;
 
+    memset(&blk, 0, sizeof blk);
     if (!c || !account_id || !items || !n || max > OWNED_MAX)
         return PDOT_E_INVALID;
     *items = NULL;

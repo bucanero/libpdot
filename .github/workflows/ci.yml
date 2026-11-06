@@ -68,6 +68,20 @@ jobs:
           submodules: recursive
       - run: ci/in-docker.sh linux/amd64 ci/mingw.sh
 
+  msvc:
+    name: windows x64 (msvc)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Started by hand, it also checks Schannel against live Polkadot (read-only).
+      - run: ci/msvc.sh WERROR=1 ${{ github.event_name == 'workflow_dispatch' && 'LIVE=1' || '' }}
+
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

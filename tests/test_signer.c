@@ -82,7 +82,7 @@ static void test_sr25519(void)
 
 static void test_ecdsa(void)
 {
-    static const uint8_t zero[32];
+    static const uint8_t zero[32] = { 0 };
     /* The secp256k1 group order n: not a valid secret. */
     static const uint8_t order[32] = {
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,

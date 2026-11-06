@@ -47,11 +47,21 @@ grep -q '"tokenSymbol": "WND"' "$WORK/spec.json"
 echo "== starting dev node"
 "$OMNI_NODE" --chain "$WORK/spec.json" --dev --base-path "$WORK/node" > "$WORK/node.log" 2>&1 &
 NODE_PID=$!
+# The Asset Hub runtime is large: on a 4-core CI runner preparing it takes the
+# node over 3 minutes, so give the first finalized block NODE_WAIT seconds.
+NODE_WAIT=${NODE_WAIT:-900}
 i=0
 until grep -q 'finalized #[1-9]' "$WORK/node.log"; do
-    i=$((i + 1)); [ $i -gt 300 ] && { tail -20 "$WORK/node.log"; exit 1; }
+    i=$((i + 1))
+    if ! kill -0 "$NODE_PID" 2>/dev/null; then
+        tail -40 "$WORK/node.log"; fail "the node exited before finalizing a block"
+    fi
+    if [ $i -gt "$NODE_WAIT" ]; then
+        tail -40 "$WORK/node.log"; fail "no finalized block after ${NODE_WAIT}s"
+    fi
     sleep 1
 done
+echo "first block finalized after ${i}s"
 
 echo "== fee estimate, then a transfer of 1.5 WND to //Bob"
 cli balance $BOB_ADDR | grep -q 'free:       1000000 WND' || fail "Bob does not start at 1000000"

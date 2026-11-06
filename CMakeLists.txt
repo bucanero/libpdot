@@ -37,7 +37,9 @@ else()
 endif()
 
 if(MSVC)
-  set(PDOT_WARNINGS /W4)
+  # Off: C4706 flags `if ((rc = f()))`, C4204/C4221 C99 aggregate initializers.
+  set(PDOT_WARNINGS /W4 /wd4706 /wd4204 /wd4221)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)  # fopen, strcpy, ... are used safely
 else()
   set(PDOT_WARNINGS -Wall -Wextra -pedantic -Wshadow -Wstrict-prototypes)
 endif()
@@ -93,7 +95,8 @@ if(PDOT_WITH_SR25519)
     ED25519_CUSTOMHASH ED25519_CUSTOMRANDOM ED25519_NO_INLINE_ASM
     $<$<BOOL:${PDOT_SR25519_FORCE_32BIT}>:ED25519_FORCE_32BIT>)
   if(MSVC)
-    target_compile_options(pdot_sr25519 PRIVATE
+    # C4090: upstream passes const pointers to non-const parameters (GCC warns too).
+    target_compile_options(pdot_sr25519 PRIVATE /wd4090
       /FI${CMAKE_CURRENT_SOURCE_DIR}/src/sr25519_hooks.h)
   else()
     target_compile_options(pdot_sr25519 PRIVATE

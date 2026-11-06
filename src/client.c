@@ -311,7 +311,7 @@ static int refresh_mdhash(pdot_client *c)
     pdot_mdhash_info info;
     char spec_name[64], symbol[32];
     uint32_t spec, tx;
-    uint8_t decimals;
+    uint8_t decimals = 0;
     size_t i;
     int rc;
 
