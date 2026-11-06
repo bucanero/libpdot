@@ -7,6 +7,7 @@
 #include "hex.h"
 #include "jsonrpc.h"
 #include "tx.h"
+#include "verify.h"
 
 uint16_t pdot_era_mortal(uint32_t period, uint32_t current)
 {
@@ -268,21 +269,12 @@ static int find_in_block(pdot_client *c, uint32_t number, const uint8_t tx_hash[
     return 0;
 }
 
-/* Fills out->dispatch and out->error from the block's System.Events. */
-static int read_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result *out,
-                        pdot_ext_outcome *oc)
+/* Fills out->dispatch, out->error and the fee from a block's encoded System.Events. */
+static int apply_events(pdot_client *c, const pdot_tx_params *p, const uint8_t *events,
+                        size_t len, pdot_tx_result *out, pdot_ext_outcome *oc)
 {
-    uint8_t key[32], *events;
-    size_t len;
-    int rc;
+    int rc = pdot_events_outcome(p->md, events, len, out->index, oc);
 
-    out->dispatch = PDOT_DISPATCH_UNKNOWN;
-    pdot_events_key(key);
-    rc = pdot_rpc_storage_at(c, key, sizeof key, out->block_hash, &events, &len);
-    if (rc)
-        return rc == PDOT_E_RPC || rc == PDOT_E_NOTFOUND ? 0 : rc;  /* pruned */
-    rc = pdot_events_outcome(p->md, events, len, out->index, oc);
-    free(events);
     if (rc)
         return pdot_fail(c, rc, "cannot decode events of block #%u: %s", out->block,
                          pdot_strerror(rc));
@@ -298,6 +290,47 @@ static int read_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result 
     if (oc->success)
         out->dispatch = PDOT_DISPATCH_OK;
     return 0;
+}
+
+/* The outcome as the RPC node reports it. */
+static int read_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result *out,
+                        pdot_ext_outcome *oc)
+{
+    uint8_t key[32], *events;
+    size_t len;
+    int rc;
+
+    out->dispatch = PDOT_DISPATCH_UNKNOWN;
+    pdot_events_key(key);
+    rc = pdot_rpc_storage_at(c, key, sizeof key, out->block_hash, &events, &len);
+    if (rc)
+        return rc == PDOT_E_RPC || rc == PDOT_E_NOTFOUND ? 0 : rc;  /* pruned */
+    rc = apply_events(c, p, events, len, out, oc);
+    free(events);
+    return rc;
+}
+
+/*
+ * The outcome proven from relay-chain finality: the block, the extrinsic's
+ * place in its body and its events. Only the block number comes from the
+ * RPC node's search, and a wrong one fails the proof.
+ */
+static int prove_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result *out,
+                         pdot_ext_outcome *oc)
+{
+    uint8_t *events;
+    size_t len;
+    int rc;
+
+    out->dispatch = PDOT_DISPATCH_UNKNOWN;
+    if ((rc = pdot_verify_extrinsic(c, out->block, out->tx_hash, out->block_hash, &out->index,
+                                    &events, &len)))
+        return rc;
+    rc = apply_events(c, p, events, len, out, oc);
+    free(events);
+    if (!rc || rc == PDOT_E_DISPATCH)
+        out->verified = 1;  /* a proven failure is proven too */
+    return rc;
 }
 
 int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
@@ -333,7 +366,8 @@ int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
             if ((rc = find_in_block(c, next, out->tx_hash, len, out, &found)))
                 return rc;
             if (found)
-                return read_outcome(c, p, out, oc ? oc : &local);
+                return c->verifier ? prove_outcome(c, p, out, oc ? oc : &local)
+                                   : read_outcome(c, p, out, oc ? oc : &local);
             if (next >= last)
                 return pdot_fail(c, PDOT_E_TIMEOUT,
                                  "not included by block %u (mortality window)", last);

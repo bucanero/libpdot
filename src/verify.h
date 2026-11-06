@@ -63,4 +63,16 @@ int pdot_verify_read(pdot_client *c, const pdot_header *head, const uint8_t *key
 int pdot_verify_read_many(pdot_client *c, const pdot_header *head, const uint8_t *const *keys,
                           const size_t *lens, size_t nkeys, pdot_value *values);
 
+/*
+ * Proves that the extrinsic hashing to tx_hash is in final parachain block
+ * `number` and reads that block's System.Events through a read proof: the
+ * block's header is reached from a relay-final head through parent hashes,
+ * its body is checked against the header's extrinsics_root, and the
+ * extrinsic is looked up in that body. Fills block_hash, the extrinsic's
+ * *index and *events (a fresh allocation).
+ */
+int pdot_verify_extrinsic(pdot_client *c, uint32_t number, const uint8_t tx_hash[32],
+                          uint8_t block_hash[32], uint32_t *index, uint8_t **events,
+                          size_t *events_len);
+
 #endif

@@ -212,7 +212,7 @@ typedef struct {
     uint32_t index;      /* extrinsic index in the block */
     int      dispatch;   /* PDOT_DISPATCH_* */
     char     error[96];  /* "Pallet.Error" when dispatch failed */
-    int      verified;   /* 1: the effect was proven (needs a verifier) */
+    int      verified;   /* 1: proven from relay-chain finality (needs a verifier) */
     int      has_fee;
     pdot_u128 fee;       /* fee actually paid, tip included, from the *FeePaid event */
 } pdot_tx_result;
@@ -503,6 +503,13 @@ int pdot_call_from_json(pdot_client *c, const char *pallet, const char *call,
  * block (PDOT_E_TIMEOUT after the mortality window). PDOT_E_DISPATCH, with
  * out->error, when the call failed; through a proxy, also when the proxied
  * call failed although the transaction itself went through.
+ *
+ * With a verifier, the result is proven and out->verified set, a failed call
+ * included: the block from relay-chain finality, the extrinsic's place in the
+ * block body against the header's extrinsics root, and the outcome and fee
+ * from a read proof of the block's System.Events. PDOT_E_UNVERIFIED when the
+ * node's answers do not prove it. Every transaction call (transfers, proxies,
+ * Bulletin store, renew and authorize) goes through here.
  */
 int pdot_tx_submit(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
                    const pdot_tx_options *o, pdot_tx_result *out);

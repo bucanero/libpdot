@@ -2,7 +2,8 @@
 # End-to-end test of verification on a local relay chain: a westend-local
 # relay (validators //Alice and //Bob) with the Bulletin chain as parachain
 # 2487, then store, renew and authorize with results proven from GRANDPA
-# finality instead of taken from the RPC node. Transactions are signed with
+# finality instead of taken from the RPC node: each transaction's block, its
+# place in the block body and its events, and a failed call proven failed. Transactions are signed with
 # CheckMetadataHash, and one over a wrong hash must be rejected. A proven
 # pdot_async balance watch must see a store change the nonce.
 #
@@ -233,6 +234,15 @@ echo "== proven grant to ECDSA //Alice by //Eve"
 # shellcheck disable=SC2086
 "$CLI" $V --seed $EVE_SR authorize $ALICE_ECDSA_ADDR 4 1000000 | tee "$WORK/grant.out"
 grep -q 'verified:   yes' "$WORK/grant.out"
+
+echo "== a failed call is proven failed: block, place in the body and events"
+# shellcheck disable=SC2086
+if "$CLI" $V --seed $EVE_SR authorize $ALICE_ECDSA_ADDR 1 0 > "$WORK/fail.out" 2>&1; then
+    echo "expected authorize with 0 bytes to fail"; exit 1
+fi
+cat "$WORK/fail.out"
+grep -q 'dispatch:   FAILED: TransactionStorage.BadDataSize' "$WORK/fail.out"
+grep -q 'verified:   yes' "$WORK/fail.out"
 
 echo "== a CID that was never stored is proven absent"
 # shellcheck disable=SC2086

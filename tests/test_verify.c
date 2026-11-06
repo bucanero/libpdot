@@ -233,11 +233,63 @@ static void run(const char *path, int expect_stored, uint32_t expect_block, uint
     cJSON_Delete(j);
 }
 
+/*
+ * Extrinsics roots: the recorded Bulletin block body hashes to its header's
+ * root as a version-0 trie, a changed or dropped extrinsic does not, and the
+ * empty trie has sp-trie's empty root.
+ */
+static void extrinsics_root(const char *path)
+{
+    static const char empty_root[] =
+        "0x03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314";
+    cJSON *j = load_json(path), *tx, *item, *hdrs;
+    uint8_t *v[16], root[32], want[32];
+    size_t l[16], n = 0, i, wl;
+    blob hb;
+    pdot_header h;
+
+    CHECK(pdot_trie_ordered_root(NULL, NULL, 0, 0, root) == 0);
+    CHECK(pdot_hex_decode(empty_root, want, 32, &wl) == 0 && memcmp(root, want, 32) == 0);
+    tx = cJSON_GetObjectItem(j, "tx");
+    CHECK(tx != NULL);
+    if (!tx) {
+        cJSON_Delete(j);
+        return;
+    }
+    hdrs = cJSON_GetObjectItem(tx, "headers");
+    {
+        const cJSON *last = cJSON_GetArrayItem(hdrs, cJSON_GetArraySize(hdrs) - 1);
+        CHECK(pdot_hex_decode_alloc(last->valuestring, &hb.p, &hb.len) == 0);
+        CHECK(pdot_header_decode(hb.p, hb.len, &h) == 0);
+    }
+    cJSON_ArrayForEach(item, cJSON_GetObjectItem(tx, "body")) {
+        if (n < 16 && pdot_hex_decode_alloc(item->valuestring, &v[n], &l[n]) == 0)
+            n++;
+    }
+    CHECK(n >= 3);
+    CHECK(pdot_trie_ordered_root((const uint8_t *const *)v, l, n, 0, root) == 0 &&
+          memcmp(root, h.extrinsics_root, 32) == 0);
+    CHECK(pdot_trie_ordered_root((const uint8_t *const *)v, l, n, 1, root) == 0 &&
+          memcmp(root, h.extrinsics_root, 32) != 0);
+    v[n - 1][l[n - 1] / 2] ^= 1;
+    CHECK(pdot_trie_ordered_root((const uint8_t *const *)v, l, n, 0, root) == 0 &&
+          memcmp(root, h.extrinsics_root, 32) != 0);
+    v[n - 1][l[n - 1] / 2] ^= 1;
+    CHECK(pdot_trie_ordered_root((const uint8_t *const *)v, l, n - 1, 0, root) == 0 &&
+          memcmp(root, h.extrinsics_root, 32) != 0);
+    printf("  Bulletin #%u body (%zu extrinsics) matches its extrinsics root\n", h.number, n);
+    for (i = 0; i < n; i++)
+        free(v[i]);
+    free(hb.p);
+    cJSON_Delete(j);
+}
+
 int main(void)
 {
     /* Paseo: the CID stored on Oct 28 and renewed at #2511088 (entry 2). */
     run("verify-paseo.json", 1, 2511088, 2);
     /* Polkadot Bulletin stores nothing yet: the same CID is proven absent. */
     run("verify-polkadot.json", 0, 0, 0);
+    extrinsics_root("verify-paseo.json");
     TEST_DONE();
 }
