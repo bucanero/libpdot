@@ -37,7 +37,9 @@ else()
 endif()
 
 if(MSVC)
-  set(PDOT_WARNINGS /W4)
+  # Off: C4706 flags `if ((rc = f()))`, C4204/C4221 C99 aggregate initializers.
+  set(PDOT_WARNINGS /W4 /wd4706 /wd4204 /wd4221)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)  # fopen, strcpy, ... are used safely
 else()
   set(PDOT_WARNINGS -Wall -Wextra -pedantic -Wshadow -Wstrict-prototypes)
 endif()
