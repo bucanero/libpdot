@@ -56,3 +56,6 @@ dkms.conf
 build*/
 .DS_Store
 tools/fixtures-gen/target/
+
+# pdot-asteroids session key, written where the game runs
+asteroids-session.key

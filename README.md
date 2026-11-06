@@ -330,7 +330,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 - **Checkpoints**: jobs and watches verify on separate connections but share their progress, so a validator-set change is walked once. `pdot_async_checkpoint` returns the newest checkpoint; save it before `pdot_async_free`. A long-running app can also pass a function to `pdot_async_set_checkpoint_fn`, which runs inside `pdot_async_poll` whenever the checkpoint advances. `pdot-bulletin watch` saves `--checkpoint` that way.
 - `pdot_async_run(a, work, done, ud)` runs any blocking libpdot code of your own on the worker.
 
-[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line.
+[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line. [`examples/asteroids`](examples/asteroids) is a small SDL2 game built on it: it signs with a session key, records scores on chain, keeps a top-10 leaderboard on the Bulletin chain and mints NFT trophies.
 
 ### API overview
 
@@ -382,6 +382,7 @@ target_link_libraries(my_game PRIVATE pdot)
 | `PDOT_WITH_ECDSA` | `ON` | ECDSA secp256k1 signer (mbedTLS) |
 | `PDOT_BUILD_TESTS` | `ON` | Unit tests |
 | `PDOT_BUILD_EXAMPLES` | `ON` | Programs in `examples/` |
+| `PDOT_BUILD_ASTEROIDS` | `OFF` | The SDL2 sample game in `examples/asteroids` (needs SDL2) |
 | `PDOT_SANITIZE` | `OFF` | Build with ASan and UBSan |
 | `PDOT_WERROR` | `OFF` | Warnings in libpdot's own code are errors (CI uses this) |
 | `PDOT_WITH_VERIFY` | `ON` | Relay-chain light client for verified results (needs `PDOT_WITH_SR25519`) |

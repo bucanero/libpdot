@@ -466,8 +466,8 @@ int pdot_nft_owned(pdot_client *c, const uint8_t account_id[32], uint32_t collec
    For Asset Hub and any other chain the client points at. Calls are built
    from the runtime's metadata, so they follow its argument types. Where a
    transaction landed and how it went (dispatch outcome, fee) come from the
-   RPC node's blocks and events and are not proven, even with a verifier;
-   read balances afterwards to prove an effect. */
+   RPC node's blocks and events; with a verifier they are proven (see
+   pdot_tx_submit). */
 
 /* Options for a transaction; pass NULL for none. */
 typedef struct {
