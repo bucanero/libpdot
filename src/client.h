@@ -3,6 +3,7 @@
 #define PDOT_CLIENT_H
 
 #include <stdint.h>
+#include <stdio.h>  /* MinGW: __MINGW_PRINTF_FORMAT */
 
 #include "pdot.h"
 #include "metadata.h"
@@ -39,10 +40,17 @@ struct pdot_client {
     void    *stop_ud;
 };
 
+/* MinGW checks printf formats against the Microsoft runtime unless told it is C99's. */
+#if defined(__MINGW_PRINTF_FORMAT)
+#define PDOT_PRINTF_FORMAT __MINGW_PRINTF_FORMAT
+#else
+#define PDOT_PRINTF_FORMAT printf
+#endif
+
 /* Records a message for pdot_last_error and returns code. */
 int pdot_fail(pdot_client *c, int code, const char *fmt, ...)
 #if defined(__GNUC__)
-    __attribute__((format(printf, 3, 4)))
+    __attribute__((format(PDOT_PRINTF_FORMAT, 3, 4)))
 #endif
     ;
 

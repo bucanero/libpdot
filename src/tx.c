@@ -5,7 +5,7 @@
 #include "pdot.h"
 #include "hash.h"
 #include "hex.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "tx.h"
 
 uint16_t pdot_era_mortal(uint32_t period, uint32_t current)

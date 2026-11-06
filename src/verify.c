@@ -4,7 +4,7 @@
 
 #include "pdot.h"
 #include "hash.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "scale.h"
 #include "trie.h"
 #include "verify.h"

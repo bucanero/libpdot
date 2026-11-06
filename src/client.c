@@ -17,7 +17,7 @@
 #include "client.h"
 #include "http.h"
 #include "mdhash.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "scale.h"
 #include "thread.h"
 #include "verify.h"

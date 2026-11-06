@@ -12,7 +12,7 @@
 #include "encode.h"
 #include "hex.h"
 #include "rng.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "tx.h"
 
 static int take(pdot_buf *b, uint8_t **out, size_t *len)

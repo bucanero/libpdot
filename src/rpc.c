@@ -4,7 +4,7 @@
 #include "pdot.h"
 #include "hex.h"
 #include "http.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 
 int pdot_rpc(pdot_client *c, const char *method, cJSON *params, cJSON **result)
 {

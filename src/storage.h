@@ -12,7 +12,7 @@
 #include "client.h"
 #include "grandpa.h"
 #include "metadata.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "scale.h"
 
 /* One SCALE-encoded key of a storage map. */

@@ -21,6 +21,8 @@
 #    are the high bytes on big-endian hosts. Now an explicit LE u32.
 # Without 5 and 6, sr25519 signatures made or checked on big-endian hosts
 # are incompatible with schnorrkel.
+# 7. memzero.c includes <Windows.h>; MinGW's headers on case-sensitive
+#    filesystems are lowercase. <windows.h> works everywhere.
 
 set(_sr_src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sr25519-donna/src)
 set(SR25519_DIR ${CMAKE_CURRENT_BINARY_DIR}/sr25519-donna)
@@ -98,3 +100,5 @@ _sr_patch(6 merlin.c REGEX
 _sr_patch(6 merlin.c REGEX
   "\\(uint8_t\\*\\)&([a-z_]+_len_bytes)"
   "\\1")
+
+_sr_patch(7 memzero.c PLAIN "#include <Windows.h>" "#include <windows.h>")

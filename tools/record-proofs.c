@@ -16,7 +16,7 @@
 #include "grandpa.h"
 #include "hash.h"
 #include "hex.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "scale.h"
 #include "trie.h"
 

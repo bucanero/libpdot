@@ -9,10 +9,21 @@
  * checkpoint moves to set 470, through pdot_client_checkpoint and through
  * pdot_async (where a watch, not a job, moves it). Then the server forges
  * one answer at a time, and every forgery must end in PDOT_E_UNVERIFIED with
- * the checkpoint unchanged, never in a wrong value or a "not stored".
+ * the checkpoint unchanged, never in a wrong value or a "not stored". The
+ * server uses POSIX sockets or Winsock.
  */
-#include <stdlib.h>
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+#include <stdlib.h>
 
 #include <cjson/cJSON.h>
 
@@ -25,18 +36,17 @@
 #include "test.h"
 
 #if defined(_WIN32)
-int main(void)
-{
-    printf("skipped: the fake node uses POSIX sockets\n");
-    return 0;
-}
+typedef SOCKET sock_t;
+typedef int sock_len;
+#define poll WSAPoll
+#define close_socket closesocket
+#define strncasecmp _strnicmp
 #else
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+typedef int sock_t;
+typedef ssize_t sock_len;
+#define INVALID_SOCKET (-1)
+#define close_socket close
+#endif
 
 enum {
     F_NONE,
@@ -63,7 +73,7 @@ typedef struct {
 } blob;
 
 static struct {
-    int     fd;
+    sock_t  fd;
     int     port;
     pdot_mutex lock;         /* guards the four below, shared with the test */
     int     stop;
@@ -309,10 +319,10 @@ static cJSON *answer(int relay, const char *method, const cJSON *params, const c
 
 /* ---- HTTP ------------------------------------------------------------------- */
 
-static void send_all(int fd, const char *p, size_t n)
+static void send_all(sock_t fd, const char *p, size_t n)
 {
     while (n) {
-        ssize_t w = send(fd, p, n, 0);
+        sock_len w = send(fd, p, (int)n, 0);
         if (w <= 0)
             return;
         p += w;
@@ -320,7 +330,7 @@ static void send_all(int fd, const char *p, size_t n)
     }
 }
 
-static void serve(int fd)
+static void serve(sock_t fd)
 {
     size_t cap = 65536, len = 0, body_at = 0, want = 0;
     char *buf = malloc(cap + 1), *out, head[160];
@@ -328,10 +338,10 @@ static void serve(int fd)
     const char *error;
 
     for (;;) {  /* headers, then Content-Length bytes of body */
-        ssize_t r;
+        sock_len r;
         if (len == cap)
             break;
-        r = recv(fd, buf + len, cap - len, 0);
+        r = recv(fd, buf + len, (int)(cap - len), 0);
         if (r <= 0)
             break;
         len += (size_t)r;
@@ -390,16 +400,16 @@ static void server_main(void *arg)
     (void)arg;
     while (!get(&srv.stop)) {
         struct pollfd p;
-        int fd;
+        sock_t fd;
 
         p.fd = srv.fd;
         p.events = POLLIN;
         if (poll(&p, 1, 50) <= 0)
             continue;
-        if ((fd = accept(srv.fd, NULL, NULL)) < 0)
+        if ((fd = accept(srv.fd, NULL, NULL)) == INVALID_SOCKET)
             continue;
         serve(fd);
-        close(fd);
+        close_socket(fd);
     }
 }
 
@@ -409,8 +419,13 @@ static int server_start(pdot_thread *t)
     socklen_t alen = sizeof a;
     int one = 1;
 
+#if defined(_WIN32)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa))
+        return -1;
+#endif
     srv.fd = socket(AF_INET, SOCK_STREAM, 0);
-    setsockopt(srv.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(srv.fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -657,7 +672,10 @@ int main(void)
     set(&srv.stop, 1);
     pdot_thread_join(t);
     pdot_mutex_destroy(&srv.lock);
-    close(srv.fd);
+    close_socket(srv.fd);
+#if defined(_WIN32)
+    WSACleanup();
+#endif
     free(srv.just.p);
     free(srv.handover_just.p);
     free(srv.relay_header.p);
@@ -668,5 +686,3 @@ int main(void)
     cJSON_Delete(j);
     TEST_DONE();
 }
-
-#endif

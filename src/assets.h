@@ -11,7 +11,7 @@
 
 #include "pdot.h"
 #include "client.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "scale.h"
 
 enum pdot_query_kind {

@@ -3,12 +3,7 @@
  * pdot_async_poll, cancellation of queued and running jobs, callbacks owed
  * at pdot_async_free, and a watch that reports one failure per streak.
  */
-#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 200809L
-#endif
-
 #include <stdlib.h>
-#include <time.h>
 
 #include "pdot.h"
 #include "client.h"
@@ -101,11 +96,7 @@ static int work_mark(pdot_client *c, void *ud)
 
 static void sleep_ms(unsigned ms)
 {
-    struct timespec ts;
-
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
+    pdot_sleep_ms(ms);
 }
 
 /* Polls until cond holds or ms pass. */

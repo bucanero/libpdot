@@ -14,7 +14,7 @@
 
 #include "client.h"
 #include "grandpa.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 
 typedef struct pdot_verifier {
     pdot_client     *relay;

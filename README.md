@@ -41,7 +41,7 @@ libpdot needs a C99 compiler, CMake 3.16+, [mbedTLS 3.6 LTS](https://github.com/
 | macOS (Homebrew) | `brew install cmake mbedtls@3 cjson` (curl ships with macOS) |
 | Debian 13 (trixie) and later | `apt install cmake gcc libmbedtls-dev libcurl4-openssl-dev libcjson-dev` |
 | Ubuntu 24.04 and older | Ships mbedTLS 2.28: build [mbedTLS 3.6](https://github.com/Mbed-TLS/mbedtls/releases) from source, or build inside a `debian:trixie` container |
-| Windows | Not tested yet |
+| Windows (MinGW-w64, cross-compiled) | [`ci/mingw.sh`](ci/mingw.sh) builds the dependencies from source and libpdot with them; see below. MSVC is not tested yet |
 
 ### 2. Build and test
 
@@ -406,6 +406,7 @@ Every layer is checked against Parity's own implementations before it touches a 
 - gcc and clang, each with and without AddressSanitizer and UBSan;
 - arm64, 32-bit ARM and big-endian s390x under QEMU;
 - ThreadSanitizer on the unit tests, for `pdot_async`;
+- a 64-bit Windows build with MinGW-w64, its unit tests run under Wine ([`ci/mingw.sh`](ci/mingw.sh)). curl uses Schannel, Windows' own TLS. `LIVE=1` adds read-only checks against live Polkadot from the Windows CLI: a proven proxy list and a proven head watch. Wine's Schannel cannot complete TLS handshakes, so for those curl uses mbedTLS;
 - libFuzzer on the metadata parser and metadata hash, on the event, manifest and proof parsers, on balance, asset and NFT decoding, and on calls encoded from JSON;
 - an end-to-end run against a dev node and an IPFS gateway, signing with the metadata hash, where a transaction signed over a wrong hash must be rejected, and a `pdot_async` balance watch must see a store change the account's nonce;
 - an end-to-end run against an Asset Hub dev node built from the live Westend Asset Hub runtime ([`tools/e2e-assethub.sh`](tools/e2e-assethub.sh)). It checks fee estimates against fees paid, with and without a tip. It moves WND, an asset and an NFT, including through a session key acting for `//Alice` via `pdot_async`. A `NonTransfer` key trying to move WND must be reported as failed, and closing the session must reap the key's account;
@@ -431,7 +432,7 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 - Verification needs a relay chain that has changed its GRANDPA validator set at least once: until then, nodes cannot serve `grandpa_proveFinality`. Every public network has; a fresh local relay chain has not. [`tools/e2e-relay.sh`](tools/e2e-relay.sh) schedules a change at block 1 for that reason.
 - Chunks upload one at a time, so a 64 MiB file takes about 65 transactions.
 - Polkadot mainnet is not supported; its Bulletin authorization model is not final.
-- Not tested on Windows or macOS CI. The library builds and runs on macOS. `pdot_async` has Win32 threads, but they have never been compiled.
+- Not tested on macOS CI, or on real Windows. The library builds and runs on macOS. On Windows it is built with MinGW-w64 and tested under Wine only: MSVC has not compiled it, and Schannel TLS has not been tested against real nodes.
 - sr25519 uses [sr25519-donna](https://github.com/TerenceGe/sr25519-donna) with fixes applied at build time ([`cmake/PatchSr25519.cmake`](cmake/PatchSr25519.cmake)). These include big-endian fixes, without which sr25519 signatures fail on those platforms.
 
 ## References

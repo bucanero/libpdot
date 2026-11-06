@@ -18,7 +18,7 @@
 #include "bulletin.h"
 #include "client.h"
 #include "hex.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "tx.h"
 
 static const char alice[] = "e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";

@@ -16,7 +16,7 @@
 #include "assets.h"
 #include "client.h"
 #include "hex.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "trie.h"
 #include "../tests/assets_cases.h"
 

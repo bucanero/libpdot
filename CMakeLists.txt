@@ -45,6 +45,11 @@ if(PDOT_WERROR)
   list(APPEND PDOT_WARNINGS $<IF:$<C_COMPILER_ID:MSVC>,/WX,-Werror>)
 endif()
 
+if(MINGW)
+  # C99 printf (%zu, %llu) instead of the old Microsoft C runtime's.
+  add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+endif()
+
 if(PDOT_SANITIZE AND NOT MSVC)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
                       -fno-sanitize-recover=all)
@@ -225,4 +230,7 @@ if(PDOT_BUILD_TESTS)
     add_test(NAME ${t} COMMAND test_${t}
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
   endforeach()
+  if(WIN32 AND TARGET test_forged)
+    target_link_libraries(test_forged PRIVATE ws2_32)  # its fake RPC node
+  endif()
 endif()

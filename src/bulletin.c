@@ -11,7 +11,7 @@
 #include "hash.h"
 #include "hex.h"
 #include "http.h"
-#include "rpc.h"
+#include "jsonrpc.h"
 #include "storage.h"
 #include "tx.h"
 #include "verify.h"
