@@ -3,12 +3,18 @@
 # Bash on a GitHub windows runner (CMake and Visual Studio preinstalled).
 # mbedTLS, curl (with Schannel, Windows' own TLS) and cJSON are built first
 # from the same pinned release tarballs as ci/mingw.sh, into a static prefix.
-#   ci/msvc.sh [WERROR=1]   WERROR=1: MSVC warnings in libpdot's own code are errors
+#   ci/msvc.sh [WERROR=1] [LIVE=1]
+#   WERROR=1  MSVC warnings in libpdot's own code are errors
+#   LIVE=1    then read-only checks against live Polkadot over Schannel
 set -eu
 for kv in "$@"; do
-    case $kv in WERROR=*) WERROR=${kv#WERROR=} ;; esac
+    case $kv in
+        WERROR=*) WERROR=${kv#WERROR=} ;;
+        LIVE=*) LIVE=${kv#LIVE=} ;;
+    esac
 done
 WERROR=${WERROR:-0}
+LIVE=${LIVE:-0}
 WORK=$(pwd)
 DEPS=$WORK/build-deps
 PREFIX=$DEPS/prefix
@@ -58,3 +64,20 @@ fi
 
 echo "== unit tests"
 ctest --test-dir build -C Release --output-on-failure
+
+# Read-only and network-dependent: HTTPS and a WebSocket watch through
+# Schannel, Windows' own TLS, against live Polkadot, proven from relay-chain
+# finality. Wine cannot run these over Schannel; a real Windows host can.
+if [ "$LIVE" = 1 ]; then
+    echo "== live, read-only: pdot-bulletin.exe against Polkadot (Schannel)"
+    CLI=build/Release/pdot-bulletin.exe
+    AH=https://polkadot-asset-hub-rpc.polkadot.io
+    WHO=1zugcag7cJVBtVRnFxv5Qftn7xKAnR6YJ9x4x3XLgGgmNnS
+    "$CLI" --rpc $AH balance $WHO
+    "$CLI" --relay https://rpc.polkadot.io --checkpoint build/dot.ck checkpoint
+    V="--rpc $AH --relay https://rpc.polkadot.io --para-id 1000 --checkpoint build/dot.ck"
+    # shellcheck disable=SC2086
+    "$CLI" $V proxies $WHO
+    # shellcheck disable=SC2086
+    "$CLI" $V --count 2 watch head
+fi
