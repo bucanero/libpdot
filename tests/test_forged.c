@@ -9,8 +9,13 @@
  * checkpoint moves to set 470, through pdot_client_checkpoint and through
  * pdot_async (where a watch, not a job, moves it). Then the server forges
  * one answer at a time, and every forgery must end in PDOT_E_UNVERIFIED with
- * the checkpoint unchanged, never in a wrong value or a "not stored". The
- * server uses POSIX sockets or Winsock.
+ * the checkpoint unchanged, never in a wrong value or a "not stored".
+ *
+ * Transactions: pdot_tx_submit_watch with a verifier proves a recorded
+ * Bulletin extrinsic's block, its place in the block body and its events.
+ * A node that forges the body, the block, a header or the events proof must
+ * end in PDOT_E_UNVERIFIED, never in a result marked verified. The server
+ * uses POSIX sockets or Winsock.
  */
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -30,9 +35,11 @@
 #include "pdot.h"
 #include "client.h"
 #include "grandpa.h"
+#include "hash.h"
 #include "hex.h"
 #include "scale.h"
 #include "thread.h"
+#include "tx.h"
 #include "test.h"
 
 #if defined(_WIN32)
@@ -57,14 +64,21 @@ enum {
     F_PARAS_PROOF,       /* a node of the Paras::Heads proof */
     F_STORED_PROOF,      /* a node of the Bulletin storage proof */
     F_STORED_WITHHELD,   /* the storage proof left out: "not stored"? */
-    F_REPLAY             /* set 469's justification served again as newest */
+    F_REPLAY,            /* set 469's justification served again as newest */
+    F_TX_BODY,           /* another extrinsic in the transaction's block body */
+    F_TX_ELSEWHERE,      /* the transaction reported in the next block */
+    F_TX_HEADER,         /* the state root of the transaction's block header */
+    F_TX_EVENTS,         /* a node of the System.Events proof */
+    F_TX_EVENTS_WITHHELD /* another proof served for System.Events */
 };
 
 static const char *const forgery_name[] = {
     "honest", "relay justification signature", "handover justification signature",
     "authority announced in the handover header", "relay header state root",
     "Paras::Heads proof node", "Bulletin storage proof node", "storage proof withheld",
-    "old justification replayed as the newest"
+    "old justification replayed as the newest", "transaction block body",
+    "transaction reported in the next block", "transaction block header",
+    "System.Events proof node", "System.Events proof withheld"
 };
 
 typedef struct {
@@ -84,6 +98,14 @@ static struct {
     blob    just, handover_just, relay_header, handover_header, metadata;
     cJSON  *paras_proof, *stored_proof, *retention_proof;
     pdot_header rh, hh;
+
+    /* The "tx" section: Bulletin headers from the proven head down to the block. */
+    blob   *tx_headers;
+    pdot_header *tx_h;
+    int     ntx;
+    cJSON  *tx_body, *events_proof;
+    uint32_t tx_number;
+    int     tx_index;
 } srv;
 
 /* The shared fields, read or changed under the lock. */
@@ -269,6 +291,55 @@ static int is_hash(const cJSON *params, const uint8_t hash[32])
            memcmp(h, hash, 32) == 0;
 }
 
+/* Whether a state_getReadProof asks for System.Events. */
+static int is_events_key(const cJSON *params)
+{
+    const cJSON *k = cJSON_GetArrayItem(cJSON_GetArrayItem(params, 0), 0);
+
+    return cJSON_IsString(k) &&
+           strcmp(k->valuestring,
+                  "0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7") == 0;
+}
+
+/*
+ * chain_getBlock: the transaction's block body, other recorded blocks empty.
+ * F_TX_BODY changes a byte of the first extrinsic; F_TX_ELSEWHERE serves the
+ * body, transaction included, as the next block's and leaves it out of its own.
+ */
+static cJSON *block_json(const cJSON *params, int f)
+{
+    cJSON *o = cJSON_CreateObject(), *block = cJSON_AddObjectToObject(o, "block");
+    cJSON *xts = cJSON_AddArrayToObject(block, "extrinsics"), *item;
+    uint32_t number = 0;
+    int k, i = 0, n = cJSON_GetArraySize(srv.tx_body), full;
+
+    for (k = 0; k < srv.ntx; k++)
+        if (is_hash(params, srv.tx_h[k].hash))
+            number = srv.tx_h[k].number;
+    if (f == F_TX_ELSEWHERE)
+        full = number == srv.tx_number + 1;
+    else
+        full = number == srv.tx_number;
+    if (number == srv.tx_number || full) {
+        cJSON_ArrayForEach(item, srv.tx_body) {
+            if (!full && i == n - 1)
+                break;
+            if (f == F_TX_BODY && i == 0) {
+                uint8_t *d;
+                size_t len;
+                pdot_hex_decode_alloc(item->valuestring, &d, &len);
+                d[len / 2] ^= 1;
+                cJSON_AddItemToArray(xts, hex_json(d, len));
+                free(d);
+            } else {
+                cJSON_AddItemToArray(xts, cJSON_CreateString(item->valuestring));
+            }
+            i++;
+        }
+    }
+    return o;
+}
+
 /* The answer to one call; NULL for a JSON null result, *error for an error. */
 static cJSON *answer(int relay, const char *method, const cJSON *params, const char **error)
 {
@@ -287,21 +358,51 @@ static cJSON *answer(int relay, const char *method, const cJSON *params, const c
         return NULL;
     }
     if (strcmp(method, "chain_getHeader") == 0) {
+        int k;
         if (relay && is_hash(params, srv.rh.hash))
             return header_json(&srv.relay_header, f == F_RELAY_HEADER, 0);
         if (relay && is_hash(params, srv.hh.hash))
             return header_json(&srv.handover_header, 0, f == F_HANDOVER_SET);
+        for (k = 0; !relay && k < srv.ntx; k++)
+            if (is_hash(params, srv.tx_h[k].hash))
+                return header_json(&srv.tx_headers[k], f == F_TX_HEADER && k == srv.ntx - 1, 0);
         return NULL;
     }
+    if (!relay && strcmp(method, "author_submitExtrinsic") == 0) {
+        const cJSON *x = cJSON_GetArrayItem(params, 0);
+        uint8_t *raw, h[32];
+        size_t n;
+        if (!cJSON_IsString(x) || pdot_hex_decode_alloc(x->valuestring, &raw, &n)) {
+            *error = "bad extrinsic";
+            return NULL;
+        }
+        pdot_blake2b_256(h, raw, n);
+        free(raw);
+        return hex_json(h, 32);
+    }
+    if (!relay && strcmp(method, "chain_getFinalizedHead") == 0)
+        return hex_json(srv.tx_h[0].hash, 32);
+    if (!relay && strcmp(method, "chain_getBlock") == 0)
+        return block_json(params, f);
     if (strcmp(method, "state_getReadProof") == 0) {
         if (relay)
             return proof_json(srv.paras_proof, NULL, f == F_PARAS_PROOF);
+        if (is_events_key(params)) {
+            if (f == F_TX_EVENTS_WITHHELD)
+                return proof_json(srv.retention_proof, NULL, 0);
+            return proof_json(srv.events_proof, NULL, f == F_TX_EVENTS);
+        }
         if (f == F_STORED_WITHHELD)
             return proof_json(srv.retention_proof, NULL, 0);
         return proof_json(srv.stored_proof, srv.retention_proof, f == F_STORED_PROOF);
     }
     if (strcmp(method, "chain_getBlockHash") == 0) {
         static const uint8_t genesis[32] = { 0x11 };
+        const cJSON *n = cJSON_GetArrayItem(params, 0);
+        int k;
+        for (k = 0; !relay && cJSON_IsNumber(n) && k < srv.ntx; k++)
+            if (srv.tx_h[k].number == (uint32_t)n->valuedouble)
+                return hex_json(srv.tx_h[k].hash, 32);
         return hex_json(genesis, 32);
     }
     if (strcmp(method, "state_getRuntimeVersion") == 0) {
@@ -507,6 +608,33 @@ static void forged(int f, const uint8_t *ck, size_t ck_len, const pdot_cid *cid)
     pdot_client_free(c);
 }
 
+/* Submits the recorded transaction to the fake node and waits for its result. */
+static int submit_tx(int f, const uint8_t *ck, size_t ck_len, pdot_tx_result *out)
+{
+    pdot_client *c = client(ck, ck_len);
+    const cJSON *x = cJSON_GetArrayItem(srv.tx_body, srv.tx_index);
+    pdot_tx_params p;
+    uint8_t *xt = NULL;
+    size_t len = 0;
+    int rc, req = get(&srv.requests);
+
+    set(&srv.forge, f);
+    memset(&p, 0, sizeof p);
+    memset(out, 0, sizeof *out);
+    if (!(rc = pdot_chain_sync(c)) &&
+        !(rc = pdot_hex_decode_alloc(x->valuestring, &xt, &len))) {
+        p.md = c->md;
+        p.era_block = srv.tx_number - 1;
+        p.era_period = 64;
+        rc = pdot_tx_submit_watch(c, &p, xt, len, out, NULL);
+    }
+    printf("  tx: %-40s -> %s%s%s (%d requests)\n", forgery_name[f], pdot_strerror(rc),
+           rc ? ": " : "", rc ? pdot_last_error(c) : "", get(&srv.requests) - req);
+    free(xt);
+    pdot_client_free(c);
+    return rc;
+}
+
 struct watched {
     int heads, checkpoints;
     uint8_t *ck;
@@ -578,6 +706,24 @@ int main(void)
     srv.paras_proof = cJSON_GetObjectItem(j, "paras_heads_proof");
     srv.stored_proof = cJSON_GetObjectItem(j, "stored_proof");
     srv.retention_proof = cJSON_GetObjectItem(j, "retention_proof");
+    {
+        cJSON *tx = cJSON_GetObjectItem(j, "tx"), *hd;
+        int k = 0;
+        srv.tx_number = (uint32_t)cJSON_GetObjectItem(tx, "number")->valuedouble;
+        srv.tx_index = cJSON_GetObjectItem(tx, "index")->valueint;
+        srv.tx_body = cJSON_GetObjectItem(tx, "body");
+        srv.events_proof = cJSON_GetObjectItem(tx, "events_proof");
+        srv.ntx = cJSON_GetArraySize(cJSON_GetObjectItem(tx, "headers"));
+        srv.tx_headers = calloc((size_t)srv.ntx, sizeof *srv.tx_headers);
+        srv.tx_h = calloc((size_t)srv.ntx, sizeof *srv.tx_h);
+        cJSON_ArrayForEach(hd, cJSON_GetObjectItem(tx, "headers")) {
+            pdot_hex_decode_alloc(hd->valuestring, &srv.tx_headers[k].p, &srv.tx_headers[k].len);
+            CHECK(pdot_header_decode(srv.tx_headers[k].p, srv.tx_headers[k].len,
+                                     &srv.tx_h[k]) == 0);
+            k++;
+        }
+        CHECK(srv.ntx > 1 && srv.tx_h[srv.ntx - 1].number == srv.tx_number);
+    }
     srv.metadata = load_file("metadata-v15-paseo.scale");
     CHECK(srv.metadata.len > 0);
     CHECK(pdot_header_decode(srv.relay_header.p, srv.relay_header.len, &srv.rh) == 0);
@@ -617,6 +763,30 @@ int main(void)
             forged(f, ck470, ck470_len, &cid);
     }
     set(&srv.forge, F_NONE);
+
+    /*
+     * A transaction's result: proven honest from set 469 (through the
+     * handover) and from set 470, and every forgery of it caught.
+     */
+    {
+        pdot_tx_result r;
+        const pdot_header *blk = &srv.tx_h[srv.ntx - 1];
+        int i, rc;
+
+        for (i = 0; i < 2; i++) {
+            rc = submit_tx(F_NONE, i ? ck470 : ck469, i ? ck470_len : ck469_len, &r);
+            CHECK(rc == 0 && r.verified && r.block == srv.tx_number &&
+                  r.index == (uint32_t)srv.tx_index && r.dispatch == PDOT_DISPATCH_OK &&
+                  memcmp(r.block_hash, blk->hash, 32) == 0);
+        }
+        printf("  tx: proven in Bulletin #%u at index %u, dispatch ok%s\n", r.block, r.index,
+               r.has_fee ? ", fee from its event" : "");
+        for (f = F_TX_BODY; f <= F_TX_EVENTS_WITHHELD; f++) {
+            rc = submit_tx(f, ck470, ck470_len, &r);
+            CHECK(rc == PDOT_E_UNVERIFIED && !r.verified);
+        }
+        set(&srv.forge, F_NONE);
+    }
 
     /*
      * pdot_async: a watch alone (no job runs) walks the handover, and the
@@ -684,6 +854,10 @@ int main(void)
     free(srv.relay_header.p);
     free(srv.handover_header.p);
     free(srv.metadata.p);
+    for (f = 0; f < srv.ntx; f++)
+        free(srv.tx_headers[f].p);
+    free(srv.tx_headers);
+    free(srv.tx_h);
     pdot_free(ck469);
     pdot_free(ck470);
     cJSON_Delete(j);

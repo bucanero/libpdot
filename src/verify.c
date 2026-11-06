@@ -2,8 +2,11 @@
 #include <string.h>
 #include <time.h>
 
+#include <cjson/cJSON.h>
+
 #include "pdot.h"
 #include "hash.h"
+#include "hex.h"
 #include "jsonrpc.h"
 #include "scale.h"
 #include "trie.h"
@@ -510,4 +513,122 @@ int pdot_verify_read_many(pdot_client *c, const pdot_header *head, const uint8_t
     if (rc)
         pdot_values_free(values, nkeys);
     return rc;
+}
+
+/* ---- Extrinsics ---------------------------------------------------------- */
+
+/* Parachain blocks walked back from a proven head to reach a transaction's. */
+#define MAX_TX_WALK 4096
+
+/* The header of block `number`, reached from head through proven parent hashes. */
+static int para_header_at(pdot_client *c, const pdot_header *head, uint32_t number,
+                          pdot_header *out)
+{
+    pdot_header h = *head;
+
+    if (head->number < number || head->number - number > MAX_TX_WALK)
+        return pdot_fail(c, PDOT_E_UNVERIFIED, "block #%u is not within %d blocks before the "
+                         "proven head #%u", number, MAX_TX_WALK, head->number);
+    while (h.number > number) {
+        pdot_header parent;
+        pdot_buf enc;
+        int rc;
+
+        if ((rc = proven_header(c, c, h.parent, &enc, &parent)))
+            return rc;
+        pdot_buf_free(&enc);
+        if (parent.number + 1 != h.number)
+            return pdot_fail(c, PDOT_E_UNVERIFIED, "parent of #%u is numbered #%u", h.number,
+                             parent.number);
+        h = parent;
+    }
+    *out = h;
+    return 0;
+}
+
+/*
+ * Checks the block body against the header's extrinsics_root and finds the
+ * extrinsic hashing to tx_hash in it. frame-system builds that root with trie
+ * version 0, or version 1 from runtime system_version 2: either proves the
+ * body. Every live runtime checked (system_version 1) uses version 0.
+ */
+static int find_proven(pdot_client *c, const pdot_header *h, const uint8_t tx_hash[32],
+                       uint32_t *index)
+{
+    cJSON *xts, *item;
+    uint8_t **v = NULL, root[32], x[32];
+    size_t *l = NULL, n, i = 0;
+    int rc;
+
+    if ((rc = pdot_rpc_block_extrinsics(c, h->hash, &xts)))
+        return rc;
+    n = (size_t)cJSON_GetArraySize(xts);
+    if (n && (!(v = calloc(n, sizeof *v)) || !(l = calloc(n, sizeof *l)))) {
+        rc = PDOT_E_NOMEM;
+        goto out;
+    }
+    cJSON_ArrayForEach(item, xts) {
+        if (!cJSON_IsString(item) || pdot_hex_decode_alloc(item->valuestring, &v[i], &l[i])) {
+            rc = pdot_fail(c, PDOT_E_UNVERIFIED, "block #%u: undecodable extrinsic", h->number);
+            goto out;
+        }
+        i++;
+    }
+    if ((rc = pdot_trie_ordered_root((const uint8_t *const *)v, l, n, 0, root)))
+        goto out;
+    if (memcmp(root, h->extrinsics_root, 32) != 0 &&
+        ((rc = pdot_trie_ordered_root((const uint8_t *const *)v, l, n, 1, root)) ||
+         memcmp(root, h->extrinsics_root, 32) != 0)) {
+        if (!rc)
+            rc = pdot_fail(c, PDOT_E_UNVERIFIED,
+                           "block #%u: body does not match the header's extrinsics root",
+                           h->number);
+        goto out;
+    }
+    for (i = 0; i < n; i++) {
+        pdot_blake2b_256(x, v[i], l[i]);
+        if (memcmp(x, tx_hash, 32) == 0)
+            break;
+    }
+    if (i < n)
+        *index = (uint32_t)i;
+    else
+        rc = pdot_fail(c, PDOT_E_UNVERIFIED, "block #%u does not contain the transaction",
+                       h->number);
+out:
+    for (i = 0; v && i < n; i++)
+        free(v[i]);
+    free(v);
+    free(l);
+    cJSON_Delete(xts);
+    return rc;
+}
+
+int pdot_verify_extrinsic(pdot_client *c, uint32_t number, const uint8_t tx_hash[32],
+                          uint8_t block_hash[32], uint32_t *index, uint8_t **events,
+                          size_t *events_len)
+{
+    const pdot_header *head;
+    pdot_header h;
+    uint8_t key[32];
+    int rc;
+
+    *events = NULL;
+    *events_len = 0;
+    if (!c->verifier)
+        return PDOT_E_INVALID;
+    if ((rc = pdot_verify_para_head(c, number, &head)) ||
+        (rc = para_header_at(c, head, number, &h)) ||
+        (rc = find_proven(c, &h, tx_hash, index)))
+        return rc;
+    /* System.Events at a block holds that block's events. */
+    pdot_twox128(key, "System", 6);
+    pdot_twox128(key + 16, "Events", 6);
+    rc = pdot_verify_read(c, &h, key, sizeof key, events, events_len);
+    if (rc == PDOT_E_NOTFOUND)
+        return pdot_fail(c, PDOT_E_UNVERIFIED, "block #%u: proven to have no events", number);
+    if (rc)
+        return rc;
+    memcpy(block_hash, h.hash, 32);
+    return 0;
 }

@@ -170,6 +170,7 @@ By default libpdot believes what the RPC node says about chain state. Give the c
 1. Relay-chain finality, from GRANDPA signatures by 2/3 of the validator set, following validator-set changes from a checkpoint.
 2. The Bulletin block, from the relay chain's record of parachain heads (`Paras::Heads`).
 3. Bulletin storage, from Merkle read proofs against that block.
+4. Transaction results: the block a transaction landed in, its place in that block's body (checked against the header's extrinsics root), and its outcome and fee (a read proof of the block's `System.Events`).
 
 ```c
 uint8_t *ck; size_t ck_len;           /* a checkpoint: load it from your app's files */
@@ -179,7 +180,7 @@ pdot_storage_proof p;
 if (pdot_bulletin_verify_cid(c, &cid, &p) == 0)
     printf("stored at block #%u, retained until #%u\n", p.block, p.expires);
 
-/* store/renew/authorize now set res.tx.verified, or fail with PDOT_E_UNVERIFIED */
+/* every transaction now sets res.tx.verified, or fails with PDOT_E_UNVERIFIED */
 pdot_client_checkpoint(c, &ck, &ck_len);   /* save it: later runs start from here */
 ```
 
@@ -291,7 +292,7 @@ pdot-bulletin --seed $SESSION transfer-all $PLAYER            # end of session
 pdot-bulletin --seed $PLAYER proxy-remove $SESSION Any
 ```
 
-Inclusion, the dispatch outcome and the fee come from the RPC node's blocks and events, even with a verifier. To prove a transfer's effect, read the balance afterwards with a verifier set.
+With a verifier set, inclusion, the dispatch outcome and the fee are proven like reads, and `tx.verified` is set, a failed call included. The CLI prints `verified:   yes, proven from relay-chain finality` under the result.
 
 ### Without blocking: `pdot_async`
 
@@ -395,7 +396,7 @@ Every layer is checked against Parity's own implementations before it touches a 
 - **Event decoding:** against subxt, on events from Paseo blocks.
 - **Metadata hash:** against hashes the Rust [merkleized-metadata](https://github.com/bkchr/merkleized-metadata) crate computed: the ones the Westend and Paseo Bulletin runtimes embed, and one of the crate's own test vectors. BLAKE3 against its official test vectors.
 - **Verification:** GRANDPA justifications, validator-set handovers and storage proofs recorded from Paseo and Polkadot mainnet, plus tampered copies that must fail. [`tools/record-proofs.c`](tools/record-proofs.c) re-records them.
-- **A lying node** ([`tests/test_forged.c`](tests/test_forged.c)): a local JSON-RPC server serves those recorded Paseo proofs to a verifying client over HTTP. Answered honestly, the CID is proven stored and the checkpoint follows the handover to the next validator set, including through a `pdot_async` watch. Then the server forges one answer at a time: a signature in a justification, an authority announced in the handover header, a header's state root, a node of each storage proof, a withheld proof, and an old justification replayed as the newest. Every forgery must fail with `PDOT_E_UNVERIFIED` and leave the checkpoint where it was.
+- **A lying node** ([`tests/test_forged.c`](tests/test_forged.c)): a local JSON-RPC server serves those recorded Paseo proofs to a verifying client over HTTP. Answered honestly, the CID is proven stored and the checkpoint follows the handover to the next validator set, including through a `pdot_async` watch. Then the server forges one answer at a time: a signature in a justification, an authority announced in the handover header, a header's state root, a node of each storage proof, a withheld proof, and an old justification replayed as the newest. Every forgery must fail with `PDOT_E_UNVERIFIED` and leave the checkpoint where it was. A recorded Bulletin transaction is then submitted to it: its result is proven, then the server forges the block body, the block it reports, a header on the way back from the proven head, and the events proof, and each must fail.
 - **Asset Hub reads:** keys compared byte for byte with keys a Polkadot Asset Hub node listed, then balances, USDt, an NFT and its attributes decoded from one recorded read proof, checked against the block's state root. A proof with any byte changed must fail. [`tools/record-assets.c`](tools/record-assets.c) re-records it.
 - **Transactions:** calls encoded from JSON against Polkadot Asset Hub metadata, compared with bytes worked out by hand from the SCALE rules, plus error messages for bad arguments. Also the `ChargeAssetTxPayment` extension layout, the fee and the inner result of a proxied call read from events, and `Proxy.Proxies` decoding. The live checks below are what show a real runtime accepts them.
 - **`pdot_async`:** ordering, callbacks only inside `pdot_async_poll`, cancelling queued and running jobs, callbacks owed at `pdot_async_free`, and one report per failure streak for watches. Also run under ThreadSanitizer.
@@ -424,12 +425,12 @@ ci/in-docker.sh linux/amd64 ci/e2e.sh
 ## Limitations
 
 - Fees are paid in the native token. Paying them in an asset such as USDt (`ChargeAssetTxPayment` with an asset id) is not supported yet. Foreign (XCM-location) assets can be moved through `pdot_call_from_json`, but have no typed helpers.
-- Transaction results (inclusion, outcome, fee) are taken from the RPC node even with a verifier; balances read afterwards are proven.
+- A node can hide that a transaction landed: libpdot then reports `PDOT_E_TIMEOUT` after the mortality window (64 blocks) although the transaction may be on chain. Read the account's nonce, which is proven with a verifier, before sending it again.
 - The JSON encoder does not handle bit sequences, `char`, or 256-bit integers. No common call uses them.
 - `pdot_nft_owned` cannot prove that a node listed every item, only that each listed item is owned.
 - The first call on a chain downloads its metadata, about 0.7 MB on Asset Hub, so the first result takes a few seconds. `pdot_async`'s two connections share that download, and a runtime upgrade triggers one new download.
 - Watches are woken by WebSocket only where libcurl supports it (Debian 13 does; the macOS system libcurl does not); otherwise they poll every 2 s.
-- Verification proves storage, renewals and authorizations, but not the outcome of arbitrary transactions.
+- Proven values and events are decoded with the metadata the node served. The metadata hash checks the parts transactions are built from, not event or storage types.
 - The metadata hash needs runtimes built with it (all Bulletin runtimes are) and v15 metadata. The token symbol and decimals in it are not in the metadata; libpdot takes them from the node unless you pass them.
 - Verification needs a relay chain that has changed its GRANDPA validator set at least once: until then, nodes cannot serve `grandpa_proveFinality`. Every public network has; a fresh local relay chain has not. [`tools/e2e-relay.sh`](tools/e2e-relay.sh) schedules a change at block 1 for that reason.
 - Chunks upload one at a time, so a 64 MiB file takes about 65 transactions.

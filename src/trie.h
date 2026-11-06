@@ -35,4 +35,12 @@ int pdot_trie_read(const uint8_t root[32], const pdot_trie_node *nodes, size_t n
 /* Hashes each node; call once before pdot_trie_read. */
 void pdot_trie_hash_nodes(pdot_trie_node *nodes, size_t nnodes);
 
+/*
+ * Root of the trie mapping Compact<u32>(i) to values[i], as a block header's
+ * extrinsics_root is built (sp-trie ordered_trie_root). state_version 1
+ * stores values of 33 bytes or more hashed; 0 stores every value inline.
+ */
+int pdot_trie_ordered_root(const uint8_t *const *values, const size_t *lens, size_t n,
+                           int state_version, uint8_t root[32]);
+
 #endif
