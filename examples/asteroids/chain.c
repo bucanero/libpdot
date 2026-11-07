@@ -21,7 +21,10 @@
  *   board   reads the leaderboard: the collection's "board" attribute holds
  *           the CID of a JSON document on the Bulletin chain (board.h),
  *           fetched and checked against the CID
- *   close   leftover funds back to the player, then the player removes the proxy
+ *   close   one transaction from the session key, Utility.batch_all of
+ *           Proxy.proxy(player, remove_proxy(session key)) and
+ *           Balances.transfer_all(player): the proxy goes and the leftover
+ *           funds go back together or not at all, and the player signs nothing
  *
  * Watches keep the newest final block and the session key's balance current.
  */
@@ -50,7 +53,6 @@ struct chain {
     char         operator_url[256];  /* "" for none */
     int          has_saved;      /* session holds the key saved by an earlier run */
     char         session_file[512];
-    int          funds_returned; /* closing: leftover funds went back */
     uint32_t     collection;
     char         fund[32];
     char         checkpoint[512];
@@ -67,8 +69,7 @@ struct chain {
     chain_view   v;
 };
 
-enum { J_OPEN, J_RECORD, J_QUOTE, J_SUBMIT, J_CLAIM, J_BOARD, J_CLOSE_FUNDS, J_CLOSE_PROXY,
-       J_WATCH };
+enum { J_OPEN, J_RECORD, J_QUOTE, J_SUBMIT, J_CLAIM, J_BOARD, J_CLOSE, J_WATCH };
 
 struct job {
     chain         *ch;
@@ -478,30 +479,55 @@ static int work_watch(pdot_client *c, void *ud)
     return 0;
 }
 
-static int work_close_funds(pdot_client *c, void *ud)
+static void hex32(const uint8_t b[32], char out[67])
 {
-    struct job *j = ud;
-    pdot_transfer t;
-    pdot_balance bal;
-    int rc;
-
-    /* An earlier run's transfer may have landed since: nothing to return. */
-    if ((rc = pdot_balance_get(c, j->ch->session.account_id, &bal)))
-        return rc;
-    if (!bal.exists) {
-        j->cleaned = 1;
-        return 0;
-    }
-    memset(&t, 0, sizeof t);
-    t.kind = PDOT_TRANSFER_ALL;
-    memcpy(t.dest, j->ch->player.account_id, 32);
-    return pdot_transfer_submit(c, &j->ch->session, &t, NULL, &j->tx);
+    int i;
+    out[0] = '0';
+    out[1] = 'x';
+    for (i = 0; i < 32; i++)
+        snprintf(out + 2 + 2 * i, 3, "%02x", b[i]);
 }
 
-static int work_close_proxy(pdot_client *c, void *ud)
+/*
+ * The session key closes its own session in one transaction: it removes
+ * itself as the player's proxy (acting for the player, which NonTransfer
+ * allows: a proxy may remove a proxy no stronger than itself) and sends
+ * everything left back. batch_all: both or neither.
+ */
+static int work_close(pdot_client *c, void *ud)
 {
     struct job *j = ud;
-    return pdot_proxy_remove(c, &j->ch->player, j->ch->session.account_id, PROXY_TYPE, &j->tx);
+    chain *ch = j->ch;
+    char player[67], session[67], json[512];
+    pdot_balance bal;
+    pdot_proxies px;
+    uint8_t *call;
+    size_t len;
+    int rc;
+
+    if ((rc = pdot_balance_get(c, ch->session.account_id, &bal)))
+        return rc;
+    if (!bal.exists) {
+        /* No funds to pay with (an earlier run returned them): the player removes it. */
+        j->cleaned = 1;
+        if ((rc = pdot_proxies_get(c, ch->player.account_id, &px)))
+            return rc;
+        if (!proxy_listed(&px, ch->session.account_id))
+            return 0;
+        return pdot_proxy_remove(c, &ch->player, ch->session.account_id, PROXY_TYPE, &j->tx);
+    }
+    hex32(ch->player.account_id, player);
+    hex32(ch->session.account_id, session);
+    snprintf(json, sizeof json,
+             "[[{\"Proxy\":{\"proxy\":[\"%s\",null,"
+             "{\"Proxy\":{\"remove_proxy\":[\"%s\",\"%s\",0]}}]}},"
+             "{\"Balances\":{\"transfer_all\":[\"%s\",false]}}]]",
+             player, session, PROXY_TYPE, player);
+    if ((rc = pdot_call_from_json(c, "Utility", "batch_all", json, &call, &len)))
+        return rc;
+    rc = pdot_tx_submit(c, &ch->session, call, len, NULL, &j->tx);
+    pdot_free(call);
+    return rc;
 }
 
 /* ---- done: runs inside chain_poll ------------------------------------ */
@@ -570,11 +596,8 @@ static void on_included(void *ud, uint64_t id, void *job_ud, const pdot_tx_resul
                wait);
         score_step(ch, j, CHAIN_STEP_INCLUDED, "IN BLOCK %u, WAITING FOR FINALITY", where->block);
         break;
-    case J_CLOSE_FUNDS:
-        status(ch, 0, "leftover funds in block %u; %s...", where->block, wait);
-        break;
-    case J_CLOSE_PROXY:
-        status(ch, 0, "proxy removal in block %u; %s...", where->block, wait);
+    case J_CLOSE:
+        status(ch, 0, "session closing in block %u; %s...", where->block, wait);
         break;
     default:
         break;
@@ -591,7 +614,7 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
     ch->v.busy--;
     if (rc == PDOT_E_CANCELLED) {
         /* Quit before the session closed: say what may be left on chain. */
-        if (j->kind == J_OPEN || j->kind == J_CLOSE_FUNDS || j->kind == J_CLOSE_PROXY)
+        if (j->kind == J_OPEN || j->kind == J_CLOSE)
             fprintf(stderr, "[chain] quit before the session closed: the next run resumes "
                     "or cleans it up from %s\n", ch->session_file);
         job_free(j);
@@ -735,23 +758,16 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         status(ch, 0, "replay %.24s... fetched from Bulletin (%zu bytes, checked against its CID)",
                j->replay_cid, ch->watch_len);
         break;
-    case J_CLOSE_FUNDS:
-        ch->funds_returned = rc == 0;
-        if (rc)
-            status(ch, 1, "funds not returned: %s", rc == PDOT_E_DISPATCH ? j->tx.error : error);
-        else if (j->cleaned)
-            status(ch, 0, "no funds left on the session key: already returned");
-        else
-            status(ch, 0, "leftover funds returned (%s)", tx);
-        queue(ch, J_CLOSE_PROXY, 0, NULL);
-        break;
-    case J_CLOSE_PROXY:
-        if (rc) {
-            status(ch, 1, "proxy not removed: %s", rc == PDOT_E_DISPATCH ? j->tx.error : error);
+    case J_CLOSE:
+        if (rc) {  /* the key stays saved: the next run cleans up */
+            status(ch, 1, "session not closed: %s", rc == PDOT_E_DISPATCH ? j->tx.error : error);
         } else {
-            status(ch, 0, "session closed (%s)", tx);
-            if (ch->funds_returned)  /* else keep the key: the next run returns the funds */
-                remove(ch->session_file);
+            if (j->cleaned)
+                status(ch, 0, "session closed: funds were already back%s%s",
+                       j->tx.block ? ", proxy removed " : "", j->tx.block ? tx : "");
+            else
+                status(ch, 0, "session closed: proxy removed and funds returned (%s)", tx);
+            remove(ch->session_file);
         }
         ch->v.state = CHAIN_CLOSED;
         break;
@@ -769,8 +785,8 @@ static struct job *queue_at(chain *ch, int kind, uint32_t score, const char *nam
                             uint32_t block, const char *cid, uint8_t *replay, size_t replay_len)
 {
     static int (*const work[])(pdot_client *, void *) = {
-        work_open, work_record, work_quote, work_submit, work_claim, work_board,
-        work_close_funds, work_close_proxy, work_watch,
+        work_open, work_record, work_quote, work_submit, work_claim, work_board, work_close,
+        work_watch,
     };
     struct job *j = calloc(1, sizeof *j);
 
@@ -804,6 +820,7 @@ static void on_head(void *ud, int rc, const char *error, const void *result)
     (void)error;
     if (rc == 0) {
         ch->v.head = b->number;
+        memcpy(ch->v.head_hash, b->hash, 32);
         ch->v.head_verified = b->verified;
     }
 }
@@ -1047,7 +1064,7 @@ void chain_close(chain *ch)
     }
     ch->v.state = CHAIN_CLOSING;
     status(ch, 0, "closing the session...");
-    queue(ch, J_CLOSE_FUNDS, 0, NULL);
+    queue(ch, J_CLOSE, 0, NULL);
 }
 
 void chain_free(chain *ch)

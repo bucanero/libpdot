@@ -399,6 +399,16 @@ typedef struct {
 int pdot_storage_get(pdot_client *c, const uint8_t *key, size_t key_len,
                      pdot_storage_value *out);
 
+/*
+ * The hash of block `number`, from System.BlockHash read at the newest final
+ * block `at` (proven with a verifier), or `at` itself. Covers the blocks the
+ * chain keeps hashes for (BlockHashCount, 4096 on Asset Hub): older ones,
+ * and blocks past `at`, are PDOT_E_NOTFOUND. A recent final block's hash is
+ * a seed nobody could know before that block: games use it so a run cannot
+ * be prepared in advance.
+ */
+int pdot_block_hash_get(pdot_client *c, uint32_t number, uint8_t hash[32], pdot_final_block *at);
+
 /* ---- Asset Hub: balances, assets and NFTs ----------------------------
 
    Reads of the chain the client points at; any chain with these pallets

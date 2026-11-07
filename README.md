@@ -234,7 +234,7 @@ pdot_balance_get(c, player, &b);
 pdot_u128_format(b.free, 10, text, sizeof text);      /* balances are 128-bit: "293.325" */
 ```
 
-With a verifier (relay chain plus `1000`, Asset Hub's parachain id on every network), each value is proven, absence included. All the keys of one read share a single proof. `pdot_nft_owned` lists the items of a collection an account owns: the node does the listing, so it could leave items out, but every item it returns is proven owned. Also available: `pdot_asset_balance_get`, `pdot_nft_attribute_get` for item and collection attributes (game stats, for example), and `pdot_storage_get` for any other storage key.
+With a verifier (relay chain plus `1000`, Asset Hub's parachain id on every network), each value is proven, absence included. All the keys of one read share a single proof. `pdot_nft_owned` lists the items of a collection an account owns: the node does the listing, so it could leave items out, but every item it returns is proven owned. Also available: `pdot_asset_balance_get`, `pdot_nft_attribute_get` for item and collection attributes (game stats, for example), and `pdot_storage_get` for any other storage key. `pdot_block_hash_get` gives a recent block's hash (proven): a seed nobody could know before that block, which the asteroids sample uses for its rocks.
 
 ```sh
 pdot-bulletin --rpc https://polkadot-asset-hub-rpc.polkadot.io --relay https://rpc.polkadot.io \
@@ -349,7 +349,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Metadata hash | `pdot_client_set_metadata_hash`, `pdot_client_metadata_hash` |
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_stored`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
-| Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
+| Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_block_hash_get`, `pdot_client_token` |
 | Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_client_set_included_fn`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit`, `pdot_remark_find` |
 | Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |
 | Amounts | `pdot_u128_format`, `pdot_u128_parse`, `pdot_u128_to_double` |

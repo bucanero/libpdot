@@ -14,6 +14,11 @@ its replay and checks the score on chain before it acts on it.
   operations, so the same seed and inputs give the same game on any build.
   Every tick's input is recorded; a game's replay ([`replay.h`](replay.h))
   is the seed plus run-length-coded inputs, about 1 KB a minute.
+- **Rocks nobody could know in advance.** Each game's seed is the hash of
+  the newest final Asset Hub block when it starts (proven, with a
+  verifier), and the replay names that block. A run cannot be found or
+  practised before the block exists, and the operator checks the seed
+  against the block.
 - **Scores on chain, without stalling a frame.** At game over the player
   enters 3 initials, arcade style, and the screen shows what recording the
   score would cost (`pdot_tx_fee`). Enter sends
@@ -38,7 +43,10 @@ its replay and checks the score on chain before it acts on it.
   re-runs the replay with the same `sim.c` and requires a finished game
   with exactly that score. Then it finds the remark in that block, from that
   account, naming that replay's CID (`pdot_remark_find`; through a proxy the
-  event names the player, not the session key). Anything else is refused.
+  event names the player, not the session key). The replay's seed must be
+  the hash of the block it names, one of the 1200 before the remark's
+  (`pdot_block_hash_get`, one proven read of `System.BlockHash`). Anything
+  else is refused.
   It then stores the replay on Bulletin, merges the score into the newest
   board (each entry names its replay) and stores that too
   (`pdot_bulletin_store`), and for a new record mints a trophy NFT whose
@@ -47,7 +55,8 @@ its replay and checks the score on chain before it acts on it.
   nothing. Each remark is honoured once.
 - **Anyone can check the board.** `asteroids-operator --audit` needs no key:
   it fetches every entry's replay from Bulletin (checked against its CID),
-  re-runs it to the score, and shows when each item expires
+  re-runs it to the score, checks its seed while the chain still keeps the
+  block's hash, and shows when each item expires
   (`pdot_bulletin_stored`).
 - **Watch any score being made.** On the title screen, a row's number (0
   for the tenth) fetches that entry's replay from Bulletin and plays it
@@ -64,8 +73,12 @@ its replay and checks the score on chain before it acts on it.
   player owns (`pdot_nft_attribute_get`, `pdot_async_nft_owned`).
 - **Live state.** Watches keep the newest final block and the session key's
   balance in the HUD (`pdot_async_watch_head`, `pdot_async_watch_balance`).
-- **Closing.** Escape sends the session key's leftover funds back to the
-  player (`Balances.transfer_all`), then the player removes the proxy.
+- **Closing in one transaction.** On escape the session key closes its own
+  session: one `Utility.batch_all` of `Proxy.proxy(player,
+  remove_proxy(session key))` and `Balances.transfer_all(player)`. The
+  proxy goes and the leftover funds go back together or not at all, and the
+  player signs nothing. (A `NonTransfer` proxy may remove a proxy no
+  stronger than itself, so this needs no more rights.)
 - **Sessions survive restarts.** The session key's seed is saved in
   `asteroids-session.key` (readable by your user only) before the key goes
   on chain. If the game quits without closing, the next run resumes the
@@ -183,10 +196,11 @@ copy of the checkpoint.
 
 ## Not covered yet
 
-- **Replays prove a game was played, not who played it.** A bot, or a
-  tool-assisted run built offline, makes a valid replay too. The game also
-  picks its own seed, so a player could look for an easy one; deriving the
-  seed from a recent block hash would stop that.
+- **Replays prove a game was played, not who played it.** A bot makes a
+  valid replay too, and so does a tool-assisted run searched for once the
+  seed's block exists (it has 1200 blocks to finish). The seed cannot be
+  chosen in advance, but a player can still start a few games and only
+  finish the one whose first rocks look easy.
 - **Determinism has rules.** `sim.c` must stay free of libm transcendental
   functions and fused multiply-add (`-ffp-contract=off`, set in CMake), and
   needs SSE-style floats (it refuses to build with x87's excess precision).

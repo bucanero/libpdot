@@ -50,7 +50,7 @@ static void play(uint32_t seed, replay *r, sim *s)
     uint8_t input = 0;
 
     sim_new(s, seed);
-    replay_begin(r, seed);
+    replay_begin(r, seed ^ 0x5a5a, seed);  /* any block number: only carried */
     while (!s->over && r->n < REPLAY_MAX_TICKS) {
         if (s->ticks % 9 == 0) {  /* a human changes input a few times a second */
             x = x * 1664525u + 1013904223u;
@@ -84,7 +84,7 @@ static void test_games(int print)
         sim s;
         uint8_t *enc, *bad;
         size_t len, i;
-        uint32_t score, ticks;
+        uint32_t score, ticks, block;
         char msg[160];
 
         memset(&r, 0, sizeof r);
@@ -100,37 +100,46 @@ static void test_games(int print)
             printf("seed %10u: score %6u after %6u ticks, %5zu bytes, state %016llx\n",
                    seeds[k], s.score, s.ticks, len, (unsigned long long)digest(&s));
 
-        /* the replay re-runs to the same game */
-        CHECK(replay_check(enc, len, &score, &ticks, msg, sizeof msg) == 0);
-        CHECK(score == s.score && ticks == s.ticks);
+        /* the replay re-runs to the same game, and carries its seed's block */
+        CHECK(replay_check(enc, len, &score, &ticks, &block, NULL, msg, sizeof msg) == 0);
+        CHECK(score == s.score && ticks == s.ticks && block == (seeds[k] ^ 0x5a5a));
+
+        /* a version 1 replay (no block) still re-runs, as block 0 */
+        bad = malloc(len);
+        memcpy(bad, enc, 4);
+        bad[4] = 1;
+        memcpy(bad + 5, enc + 9, len - 9);
+        CHECK(replay_check(bad, len - 4, &score, &ticks, &block, NULL, msg, sizeof msg) == 0);
+        CHECK(score == s.score && ticks == s.ticks && block == 0);
+        free(bad);
 
         /* any cut fails */
         for (i = 0; i < len; i++)
-            CHECK(replay_check(enc, i, &score, &ticks, msg, sizeof msg) != 0);
+            CHECK(replay_check(enc, i, &score, &ticks, NULL, NULL, msg, sizeof msg) != 0);
 
         bad = malloc(len + 2);
         /* one more tick after the end */
         memcpy(bad, enc, len);
         bad[len] = 0;
         bad[len + 1] = 1;
-        bad[9]++;  /* ticks + 1 */
-        CHECK(replay_check(bad, len + 2, &score, &ticks, msg, sizeof msg) != 0);
+        bad[13]++;  /* ticks + 1 */
+        CHECK(replay_check(bad, len + 2, &score, &ticks, NULL, NULL, msg, sizeof msg) != 0);
         /* a different seed is a different game */
         memcpy(bad, enc, len);
-        bad[5] ^= 1;
-        CHECK(replay_check(bad, len, &score, &ticks, msg, sizeof msg) != 0 || score != s.score ||
+        bad[9] ^= 1;  /* the seed */
+        CHECK(replay_check(bad, len, &score, &ticks, NULL, NULL, msg, sizeof msg) != 0 || score != s.score ||
               ticks != s.ticks);
         /* every changed input changes the game (or breaks the replay) */
-        for (i = 13; i < len; i += 7) {
+        for (i = 17; i < len; i += 7) {
             memcpy(bad, enc, len);
             bad[i] ^= 0x04;
-            if (replay_check(bad, len, &score, &ticks, msg, sizeof msg) == 0)
+            if (replay_check(bad, len, &score, &ticks, NULL, NULL, msg, sizeof msg) == 0)
                 CHECK(score != s.score || ticks != s.ticks || bad[i] == enc[i]);
         }
         /* bad header */
         memcpy(bad, enc, len);
-        bad[4] = 2;
-        CHECK(replay_check(bad, len, &score, &ticks, msg, sizeof msg) != 0);
+        bad[4] = 3;
+        CHECK(replay_check(bad, len, &score, &ticks, NULL, NULL, msg, sizeof msg) != 0);
         free(bad);
         free(enc);
         replay_free(&r);

@@ -19,7 +19,7 @@ typedef struct {
     const char *rpc;               /* Asset Hub */
     const char *bulletin_rpc;      /* Bulletin, for the leaderboard; NULL for none */
     const char *operator_url;      /* asteroids-operator: claims scores; NULL for none */
-    uint8_t     player_seed[32];   /* the player's account: signs to open and close the session */
+    uint8_t     player_seed[32];   /* the player's account: signs once, to open the session */
     uint32_t    collection;        /* the trophy collection, owned by the operator */
     const char *fund;              /* native token sent to the session key, e.g. "1" */
     const char *session_file;      /* where the session key is kept between runs */
@@ -52,6 +52,7 @@ typedef struct {
     char     player[PDOT_SS58_MAX_LEN];
     char     session[PDOT_SS58_MAX_LEN];
     uint32_t head;              /* newest final block */
+    uint8_t  head_hash[32];     /* its hash: new games' seed */
     int      head_verified;
     char     session_balance[40];
     int      trophies;          /* the player's, -1 until read */

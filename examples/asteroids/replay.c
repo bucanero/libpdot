@@ -7,12 +7,20 @@
 
 #include "sim.h"
 
-#define HEADER 13  /* magic, version, seed, ticks */
+#define HEADER_V1 13  /* magic, version, seed, ticks */
+#define HEADER    17  /* magic, version, block, seed, ticks */
 
-void replay_begin(replay *r, uint32_t seed)
+uint32_t replay_seed(const uint8_t block_hash[32])
+{
+    const uint8_t *p = block_hash;
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+void replay_begin(replay *r, uint32_t block, uint32_t seed)
 {
     free(r->inputs);
     memset(r, 0, sizeof *r);
+    r->block = block;
     r->seed = seed;
 }
 
@@ -60,8 +68,9 @@ uint8_t *replay_encode(const replay *r, size_t *len)
         return NULL;
     memcpy(out, "PDAR", 4);
     out[4] = REPLAY_VERSION;
-    put32(out + 5, r->seed);
-    put32(out + 9, (uint32_t)r->n);
+    put32(out + 5, r->block);
+    put32(out + 9, r->seed);
+    put32(out + 13, (uint32_t)r->n);
     while (i < r->n) {
         uint32_t run = 1;
         while (i + run < r->n && r->inputs[i + run] == r->inputs[i])
@@ -110,20 +119,27 @@ static int bad(char *msg, size_t len, const char *fmt, ...)
 int replay_decode(const uint8_t *data, size_t len, replay *r, char *msg, size_t msg_len)
 {
     uint32_t total;
-    size_t at = HEADER;
+    size_t at;
 
     memset(r, 0, sizeof *r);
-    if (len < HEADER || len > REPLAY_MAX_BYTES || memcmp(data, "PDAR", 4) != 0)
+    if (len < HEADER_V1 || len > REPLAY_MAX_BYTES || memcmp(data, "PDAR", 4) != 0)
         return bad(msg, msg_len, "not a replay");
-    if (data[4] != REPLAY_VERSION)
+    if (data[4] == 1) {  /* no block: an unanchored seed */
+        at = HEADER_V1;
+        r->seed = get32(data + 5);
+    } else if (data[4] == REPLAY_VERSION && len >= HEADER) {
+        at = HEADER;
+        r->block = get32(data + 5);
+        r->seed = get32(data + 9);
+    } else {
         return bad(msg, msg_len, "replay version %u, expected %u", data[4], REPLAY_VERSION);
-    total = get32(data + 9);
+    }
+    total = get32(data + at - 4);
     if (total == 0 || total > REPLAY_MAX_TICKS)
         return bad(msg, msg_len, "%u ticks: more than an hour, or none", total);
     if (!(r->inputs = malloc(total)))
         return bad(msg, msg_len, "out of memory");
     r->cap = total;
-    r->seed = get32(data + 5);
     while (at < len) {
         uint8_t input = data[at++];
         uint32_t run = 0;
@@ -163,14 +179,17 @@ fail:
 }
 
 int replay_check(const uint8_t *data, size_t len, uint32_t *score, uint32_t *ticks,
-                 char *msg, size_t msg_len)
+                 uint32_t *block, uint32_t *seed, char *msg, size_t msg_len)
 {
     replay r;
     sim s;
     size_t i;
+    uint32_t from, seeded;
 
     if (replay_decode(data, len, &r, msg, msg_len))
         return -1;
+    from = r.block;  /* replay_free clears r */
+    seeded = r.seed;
     sim_new(&s, r.seed);
     for (i = 0; i < r.n; i++) {
         if (s.over) {
@@ -184,5 +203,9 @@ int replay_check(const uint8_t *data, size_t len, uint32_t *score, uint32_t *tic
         return bad(msg, msg_len, "the game has not ended after %zu ticks", i);
     *score = s.score;
     *ticks = (uint32_t)i;
+    if (block)
+        *block = from;
+    if (seed)
+        *seed = seeded;
     return 0;
 }

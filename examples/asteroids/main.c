@@ -72,17 +72,24 @@ static float frand(float lo, float hi)
     return lo + (hi - lo) * (float)rand() / (float)RAND_MAX;
 }
 
-/* Any seed will do: the replay carries it. */
+/* For the title screen's rocks, and games played without a chain. */
 static uint32_t new_seed(void)
 {
     return (uint32_t)SDL_GetPerformanceCounter() ^ ((uint32_t)rand() << 16) ^ (uint32_t)rand();
 }
 
-static void new_game(game *g)
+/*
+ * Online, the rocks come from the newest final block's hash: nobody could
+ * know them before that block, so no run can be prepared in advance, and
+ * the operator checks the seed against the block. Offline (or before the
+ * first block is read) any seed will do, but such a game cannot be claimed.
+ */
+static void new_game(game *g, const chain_view *v)
 {
-    uint32_t seed = new_seed();
+    uint32_t block = v && v->head ? v->head : 0;
+    uint32_t seed = block ? replay_seed(v->head_hash) : new_seed();
     sim_new(&g->s, seed);
-    replay_begin(&g->rec, seed);
+    replay_begin(&g->rec, block, seed);
     g->submitted = 0;
     g->state = S_PLAY;
 }
@@ -493,7 +500,7 @@ static void draw(SDL_Renderer *r, const game *g, const chain_view *v, int offlin
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
         font_draw_centered(r, W / 2.0f, 260, 3.0f, "CLOSING THE SESSION");
         font_draw_centered(r, W / 2.0f, 320, 1.2f,
-                           "LEFTOVER FUNDS GO BACK TO THE PLAYER, THEN THE PROXY IS REMOVED");
+                           "ONE TRANSACTION: THE PROXY GOES, LEFTOVER FUNDS GO BACK");
         if (SDL_GetTicks() - g->quit_at > 2000)
             font_draw_centered(r, W / 2.0f, 350, 1.0f,
                                "ESC AGAIN TO QUIT NOW: THE NEXT RUN FINISHES THE CLEANUP");
@@ -656,7 +663,7 @@ int main(int argc, char **argv)
                 int can_submit = g.state == S_OVER && ch && !g.submitted &&
                                  v->state == CHAIN_READY;
                 if (k == SDLK_SPACE && (g.state == S_TITLE || g.state == S_OVER)) {
-                    new_game(&g);
+                    new_game(&g, ch ? v : NULL);
                 } else if (g.state == S_TITLE && ch && k >= SDLK_0 && k <= SDLK_9 &&
                            !g.watch_pending && v->board_state == 1) {
                     size_t row = k == SDLK_0 ? 9 : (size_t)(k - SDLK_1);

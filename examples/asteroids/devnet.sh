@@ -85,6 +85,12 @@ echo "== //Eve authorizes //Bob on Bulletin: 1000 stores, 16 MiB"
 "$CLI" --rpc $BULLETIN --seed $EVE authorize $BOB_ADDR 1000 16777216 > "$WORK/tx.out"
 grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "authorize"; }
 
+# A fresh chain reuses block numbers: claims recorded on an earlier one
+# (block << 32 | index) would refuse new scores as already claimed.
+if [ -f asteroids-claims.txt ]; then
+    rm -f asteroids-claims.txt
+    echo "== fresh chain: forgot the earlier chain's claims (asteroids-claims.txt)"
+fi
 echo "== ready: run $BUILD/examples/asteroids/asteroids-operator, then"
 echo "   $BUILD/examples/asteroids/asteroids, each in its own terminal (Ctrl-C here stops the nodes)"
 wait "$AH_PID"

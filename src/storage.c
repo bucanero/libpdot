@@ -95,3 +95,44 @@ int pdot_storage_get(pdot_client *c, const uint8_t *key, size_t key_len,
     out->len = v.len;
     return 0;
 }
+
+int pdot_block_hash_get(pdot_client *c, uint32_t number, uint8_t hash[32], pdot_final_block *at)
+{
+    const pdot_header *head;
+    const uint8_t *k;
+    uint8_t key[32 + 8 + 4], n[4];
+    size_t key_len = sizeof key;
+    pdot_value v;
+    int rc;
+
+    if (!c || !hash || !at)
+        return PDOT_E_INVALID;
+    if ((rc = pdot_final_block_get(c, at, &head)))
+        return rc;
+    if (number == at->number) {
+        memcpy(hash, at->hash, 32);
+        return 0;
+    }
+    if (number > at->number)
+        return pdot_fail(c, PDOT_E_NOTFOUND, "block %u is not final yet (final: %u)", number,
+                         at->number);
+    /* System.BlockHash: Twox64Concat(u32) -> H256 */
+    n[0] = (uint8_t)number;
+    n[1] = (uint8_t)(number >> 8);
+    n[2] = (uint8_t)(number >> 16);
+    n[3] = (uint8_t)(number >> 24);
+    pdot_twox128(key, "System", 6);
+    pdot_twox128(key + 16, "BlockHash", 9);
+    pdot_twox64_concat(key + 32, n, 4);
+    k = key;
+    if ((rc = pdot_storage_read_at(c, at, head, &k, &key_len, 1, &v)))
+        return rc;
+    if (!v.present || v.len != 32) {
+        free(v.data);
+        return pdot_fail(c, PDOT_E_NOTFOUND, "block %u is older than the hashes the chain keeps "
+                         "(final: %u)", number, at->number);
+    }
+    memcpy(hash, v.data, 32);
+    free(v.data);
+    return 0;
+}

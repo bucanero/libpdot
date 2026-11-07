@@ -14,7 +14,10 @@
  *   2. Asset Hub block `block` holds a System.Remarked event from `account`
  *      over "pdot-asteroids score=N name=ABC replay=CID", CID being the
  *      replay's (pdot_remark_find; proven from relay-chain finality with
- *      --relay and --checkpoint): that player recorded that very game.
+ *      --relay and --checkpoint): that player recorded that very game;
+ *   3. the replay's seed is the hash of the block it names, one of the
+ *      SEED_MAX_AGE blocks before the remark's (pdot_block_hash_get, proven
+ *      too): the rocks were unknown until then, so the run was not prepared.
  * Then, if the score makes the top 10 or beats the record, the operator
  * stores the replay on Bulletin; a top-10 score goes on the merged board,
  * stored there too, and a new record mints a trophy. The mint, its metadata
@@ -140,6 +143,7 @@ typedef struct {
     int      status;        /* HTTP status */
     char     error[256];
     int      remark_proven;
+    int      seed_proven;   /* the seed's block hash was proven */
     uint32_t ticks;         /* the replay's length */
     char     replay_cid[BOARD_CID_MAX];
     int      rank;          /* 0: not in the top 10 */
@@ -211,6 +215,35 @@ static int store(operator_t *o, const uint8_t *data, size_t len, char *cid, size
     return pdot_cid_to_string(&sr.cid, cid, cid_len);
 }
 
+/*
+ * A replay's seed must come from the hash of a block before its score's
+ * remark, and a recent one: the rocks were unknown before that block, so a
+ * run could not be found or practised in advance. An hour of play at
+ * Asset Hub's 6 s blocks is 600 blocks; this leaves room for slower ones.
+ */
+#define SEED_MAX_AGE 1200  /* blocks between the seed's block and the score's */
+
+/* 0 when seed is block's; PDOT_E_NOTFOUND when the chain no longer keeps its hash. */
+static int seed_check(operator_t *o, uint32_t block, uint32_t seed, int *proven, char *msg,
+                      size_t msg_len)
+{
+    uint8_t hash[32];
+    pdot_final_block at;
+    int rc = pdot_block_hash_get(o->ah, block, hash, &at);
+
+    if (rc) {
+        snprintf(msg, msg_len, "%s", pdot_last_error(o->ah));
+        return rc;
+    }
+    *proven = at.verified;
+    if (replay_seed(hash) != seed) {
+        snprintf(msg, msg_len, "seed %08x is not block %u's (%08x)", seed, block,
+                 replay_seed(hash));
+        return PDOT_E_INVALID;
+    }
+    return 0;
+}
+
 static void handle_claim(operator_t *o, const char *account, uint32_t score, const char *name,
                          uint32_t block, const uint8_t *replay, size_t replay_len,
                          claim_result *r)
@@ -218,7 +251,7 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
     uint8_t who[32];
     char remark[80 + BOARD_CID_MAX], msg[192] = "", text[PDOT_NFT_DATA_MAX];
     pdot_cid cid;
-    uint32_t replayed, replay_block;
+    uint32_t replayed, replay_block, seed_block, seed;
     int proven = 0;
     pdot_remark rm;
     board b;
@@ -235,10 +268,16 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
         REFUSE(400, "bad account or initials");
 
     /* 1. The game was played: its replay re-runs to the score. */
-    if (replay_check(replay, replay_len, &replayed, &r->ticks, msg, sizeof msg))
+    if (replay_check(replay, replay_len, &replayed, &r->ticks, &seed_block, &seed, msg,
+                     sizeof msg))
         REFUSE(422, "the replay does not check: %s", msg);
     if (replayed != score)
         REFUSE(422, "the replay scores %u, not %u", replayed, score);
+    if (!seed_block)
+        REFUSE(422, "the game was not seeded from a block (played offline, or an old version)");
+    if (seed_block >= block || block - seed_block > SEED_MAX_AGE)
+        REFUSE(422, "the seed's block %u must be one of the %u before the score's block %u",
+               seed_block, SEED_MAX_AGE, block);
     if (pdot_cid_compute(&cid, replay, replay_len) ||
         pdot_cid_to_string(&cid, r->replay_cid, sizeof r->replay_cid))
         REFUSE(500, "computing the replay's CID");
@@ -258,7 +297,14 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
     if (claimed(o, key))
         REFUSE(409, "this score was already claimed");
 
-    /* 3. The newest board and record. */
+    /* 3. The rocks came from that block's hash: the run could not be prepared. */
+    rc = seed_check(o, seed_block, seed, &r->seed_proven, msg, sizeof msg);
+    if (rc == PDOT_E_INVALID)
+        REFUSE(422, "%s", msg);
+    if (rc)
+        REFUSE(502, "checking the seed: %s", msg);
+
+    /* 4. The newest board and record. */
     if ((rc = board_read(o->ah, o->bul, o->collection, &b, r->board_cid, msg, sizeof msg)))
         REFUSE(502, "reading the board: %s", msg);
     if ((rc = board_record_read(o->ah, o->collection, &rec)))
@@ -272,7 +318,7 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
         return;  /* checked, but nothing to change */
     }
 
-    /* 4. The replay on Bulletin, where anyone can fetch and re-run it. */
+    /* 5. The replay on Bulletin, where anyone can fetch and re-run it. */
     if ((rc = store(o, replay, replay_len, text, sizeof text, &replay_block, &r->stores_proven,
                     msg, sizeof msg)))
         REFUSE(502, "storing the replay on Bulletin: %s", msg);
@@ -281,7 +327,7 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
 
     calls = cJSON_CreateArray();
 
-    /* 5. The board: unless this very score is on it already. */
+    /* 6. The board: unless this very score is on it already. */
     if (!r->rank) {
         board_entry e;
         memset(&e, 0, sizeof e);
@@ -309,7 +355,7 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
         }
     }
 
-    /* 6. The record: a trophy for a new best score, naming its replay. */
+    /* 7. The record: a trophy for a new best score, naming its replay. */
     if (r->record) {
         for (r->trophy = 0;; r->trophy++) {
             if ((rc = pdot_nft_item_get(o->ah, o->collection, r->trophy, &item))) {
@@ -336,7 +382,7 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
         add_call(calls, "set_attribute", attribute_args(o->collection, RECORD_KEY, text));
     }
 
-    /* 7. All Asset Hub changes in one transaction. */
+    /* 8. All Asset Hub changes in one transaction. */
     if (cJSON_GetArraySize(calls) > 0) {
         cJSON *wrap = cJSON_CreateArray();
         char *json;
@@ -501,8 +547,9 @@ static void serve(operator_t *o, int fd, char *buf, size_t cap)
         logf_("  refused (%d): %s", r.status, r.error);
         REPLY_ERROR(fd, r.status, r.error);
     }
-    logf_("  ok: replay of %u ticks re-ran to the score, remark %s, rank %d%s%s; results %s",
-          r.ticks, r.remark_proven ? "proven" : "checked (trusted RPC)", r.rank,
+    logf_("  ok: replay of %u ticks re-ran to the score, remark and seed %s, rank %d%s%s; "
+          "results %s", r.ticks,
+          r.remark_proven && r.seed_proven ? "proven" : "checked (trusted RPC)", r.rank,
           r.stored_at ? ", board stored" : "", r.record ? ", new record" : "",
           r.tx_block || r.stored_at ? (r.tx_proven && r.stores_proven ? "proven" : "trusted RPC")
                                     : "none");
@@ -510,7 +557,7 @@ static void serve(operator_t *o, int fd, char *buf, size_t cap)
     cJSON_AddBoolToObject(out, "ok", 1);
     cJSON_AddNumberToObject(out, "ticks", r.ticks);
     cJSON_AddStringToObject(out, "replay", r.replay_cid);
-    cJSON_AddBoolToObject(out, "score_proven", r.remark_proven);
+    cJSON_AddBoolToObject(out, "score_proven", r.remark_proven && r.seed_proven);
     cJSON_AddNumberToObject(out, "rank", r.rank);
     cJSON_AddStringToObject(out, "board", r.board_cid);
     cJSON_AddNumberToObject(out, "stored_at", r.stored_at);
@@ -692,7 +739,7 @@ static int audit(operator_t *o)
         pdot_cid cid;
         uint8_t *data;
         size_t len;
-        uint32_t score, ticks;
+        uint32_t score, ticks, seed_block, seed;
 
         printf("%2zu. %s %7u  block %-6u ", i + 1, e->name, e->score, e->block);
         if (!e->replay[0]) {
@@ -705,7 +752,7 @@ static int audit(operator_t *o)
             bad++;
             continue;
         }
-        if (replay_check(data, len, &score, &ticks, msg, sizeof msg)) {
+        if (replay_check(data, len, &score, &ticks, &seed_block, &seed, msg, sizeof msg)) {
             printf("replay does not check: %s\n", msg);
             bad++;
         } else if (score != e->score) {
@@ -713,11 +760,25 @@ static int audit(operator_t *o)
             bad++;
         } else {
             pdot_storage_proof p;
-            char line[160];
+            char line[160], seeded[200];
+            int seed_proven = 0, rc;
             expiry(o, e->replay, &p, line, sizeof line);
+            if (!seed_block)
+                snprintf(seeded, sizeof seeded, "not seeded from a block (an older replay)");
+            else if (!(rc = seed_check(o, seed_block, seed, &seed_proven, msg, sizeof msg)))
+                snprintf(seeded, sizeof seeded, "seeded from block %u%s", seed_block,
+                         seed_proven ? ", proven" : "");
+            else if (rc == PDOT_E_NOTFOUND)
+                snprintf(seeded, sizeof seeded, "seeded from block %u, no longer checkable: %s",
+                         seed_block, msg);
+            else {
+                snprintf(seeded, sizeof seeded, "SEED WRONG: %s", msg);
+                bad++;
+            }
             printf("replay re-runs to %u in %u ticks (%.0f s of play)\n"
+                   "                                %s\n"
                    "                                its replay %s\n", score, ticks,
-                   (double)ticks / SIM_HZ, line);
+                   (double)ticks / SIM_HZ, seeded, line);
         }
         pdot_free(data);
     }
