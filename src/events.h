@@ -32,4 +32,12 @@ int pdot_events_outcome(const pdot_metadata *md, const uint8_t *events, size_t l
 int pdot_dispatch_error(const pdot_metadata *md, uint32_t ty, pdot_reader *r,
                         char *out, size_t out_len);
 
+/*
+ * Finds a System.Remarked { sender, hash } event in an encoded
+ * Vec<EventRecord>. *index gets the extrinsic it was emitted in;
+ * PDOT_E_NOTFOUND when there is none.
+ */
+int pdot_events_find_remark(const pdot_metadata *md, const uint8_t *events, size_t len,
+                            const uint8_t sender[32], const uint8_t hash[32], uint32_t *index);
+
 #endif

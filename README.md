@@ -184,6 +184,8 @@ if (pdot_bulletin_verify_cid(c, &cid, &p) == 0)
 pdot_client_checkpoint(c, &ck, &ck_len);   /* save it: later runs start from here */
 ```
 
+`pdot_bulletin_stored(c, &cid, &p)` reads the same (where, and retained until when) with or without a verifier: proven with one, the RPC node's word without. Renew with `pdot_bulletin_renew` before `p.expires` to keep the data.
+
 The **checkpoint** is the one thing you must trust: a GRANDPA validator set at some relay block, a few KB. Create it once from a node you trust and ship it with your app; libpdot advances it through validator-set changes (one every few hours) and hands the newer one back for you to save. `pdot_checkpoint_fetch` creates one, trusting the given node for that call only.
 
 | Network | Relay RPC | Bulletin para id |
@@ -232,7 +234,7 @@ pdot_balance_get(c, player, &b);
 pdot_u128_format(b.free, 10, text, sizeof text);      /* balances are 128-bit: "293.325" */
 ```
 
-With a verifier (relay chain plus `1000`, Asset Hub's parachain id on every network), each value is proven, absence included. All the keys of one read share a single proof. `pdot_nft_owned` lists the items of a collection an account owns: the node does the listing, so it could leave items out, but every item it returns is proven owned. Also available: `pdot_asset_balance_get`, `pdot_nft_attribute_get` for item and collection attributes (game stats, for example), and `pdot_storage_get` for any other storage key.
+With a verifier (relay chain plus `1000`, Asset Hub's parachain id on every network), each value is proven, absence included. All the keys of one read share a single proof. `pdot_nft_owned` lists the items of a collection an account owns: the node does the listing, so it could leave items out, but every item it returns is proven owned. Also available: `pdot_asset_balance_get`, `pdot_nft_attribute_get` for item and collection attributes (game stats, for example), and `pdot_storage_get` for any other storage key. `pdot_block_hash_get` gives a recent block's hash (proven): a seed nobody could know before that block, which the asteroids sample uses for its rocks.
 
 ```sh
 pdot-bulletin --rpc https://polkadot-asset-hub-rpc.polkadot.io --relay https://rpc.polkadot.io \
@@ -259,6 +261,8 @@ pdot_free(call);                                         /* res.fee: what it did
 `pdot_transfer_submit` does both steps. Kinds: `PDOT_TRANSFER_NATIVE` (DOT, keeping the sender above the existential deposit), `_ASSET`, `_NFT`, and `_ALL` (every native token, closing the account). Options add a tip, or sign as a proxy (below).
 
 Anything else is one `pdot_call_from_json` away. Arguments are an array in order or an object by name. Integers are numbers or decimal strings. Accounts are SS58 or `0x` hex, and bytes are `0x` hex or text. Enums are written `"Variant"` or `{"Variant": value}`, with `null` for None. Encoding follows the runtime's metadata, and errors name the argument (`Balances.transfer_keep_alive.value: expected an unsigned integer`).
+
+Remarks work as attestations. `System.remark_with_event(data)` records the call's origin and `blake2_256(data)` in an event, and `pdot_remark_find(c, block, sender, data, len, &r)` checks it later from the block number alone. Through a proxy the sender is the account acted for. With a verifier, the block's events are proven. The asteroids operator uses this to check claimed scores.
 
 ```c
 pdot_call_from_json(c, "Nfts", "mint", "[0, 7, \"5Grwva...\", null]", &call, &len);
@@ -327,10 +331,11 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 - **Cancel** with `pdot_async_cancel(a, id)`. A queued job never runs; a running one stops at its next network call or wait. A store may still land on chain.
 - **Watches** live on a second thread with their own connection. Each new final block triggers one batched read of every watched key (one proof with a verifier), and a callback runs only when a value changed. A failed read is reported once and retried. New blocks are announced over a WebSocket subscription (`chain_subscribeFinalizedHeads`, on the relay chain when verifying) if libcurl supports WebSockets, and found by polling every 2 s otherwise.
 - **Wake-ups**: `pdot_async_set_wake` lets a loop that sleeps be woken when results are waiting.
+- **Pending transactions**: a transaction is in a block within seconds, but final (and proven) only tens of seconds later. `pdot_async_set_included_fn` reports each job's transaction as soon as it is in a best block, inside `pdot_async_poll` and before the job's own callback, so a game can show "in block N, waiting for finality" right away. It is not proven and a reorg can still drop it; the job's callback has the final word. `pdot_client_set_included_fn` does the same for blocking calls.
 - **Checkpoints**: jobs and watches verify on separate connections but share their progress, so a validator-set change is walked once. `pdot_async_checkpoint` returns the newest checkpoint; save it before `pdot_async_free`. A long-running app can also pass a function to `pdot_async_set_checkpoint_fn`, which runs inside `pdot_async_poll` whenever the checkpoint advances. `pdot-bulletin watch` saves `--checkpoint` that way.
 - `pdot_async_run(a, work, done, ud)` runs any blocking libpdot code of your own on the worker.
 
-[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line.
+[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line. [`examples/asteroids`](examples/asteroids) is a small SDL2 game built on it: it signs with a session key, records scores on chain, keeps a top-10 leaderboard on the Bulletin chain and mints NFT trophies through an operator server that re-runs each game from its replay and checks the score on chain.
 
 ### API overview
 
@@ -343,12 +348,12 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Authorizations | `pdot_bulletin_authorization`, `pdot_bulletin_is_authorized`, `pdot_bulletin_authorize_account` |
 | Metadata hash | `pdot_client_set_metadata_hash`, `pdot_client_metadata_hash` |
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
-| Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
-| Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
-| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit` |
+| Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_stored`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
+| Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_block_hash_get`, `pdot_client_token` |
+| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_client_set_included_fn`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit`, `pdot_remark_find` |
 | Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |
 | Amounts | `pdot_u128_format`, `pdot_u128_parse`, `pdot_u128_to_double` |
-| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_checkpoint`, `pdot_async_set_checkpoint_fn`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
+| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_set_included_fn`, `pdot_async_checkpoint`, `pdot_async_set_checkpoint_fn`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
 | Watches | `pdot_async_watch_head`, `pdot_async_watch_storage`, `pdot_async_watch_balance`, `pdot_async_watch_asset_balance`, `pdot_async_watch_nft_item` |
 
 ### Things to know
@@ -382,6 +387,7 @@ target_link_libraries(my_game PRIVATE pdot)
 | `PDOT_WITH_ECDSA` | `ON` | ECDSA secp256k1 signer (mbedTLS) |
 | `PDOT_BUILD_TESTS` | `ON` | Unit tests |
 | `PDOT_BUILD_EXAMPLES` | `ON` | Programs in `examples/` |
+| `PDOT_BUILD_ASTEROIDS` | `OFF` | The SDL2 sample game and its operator server in `examples/asteroids` (needs SDL2) |
 | `PDOT_SANITIZE` | `OFF` | Build with ASan and UBSan |
 | `PDOT_WERROR` | `OFF` | Warnings in libpdot's own code are errors (CI uses this) |
 | `PDOT_WITH_VERIFY` | `ON` | Relay-chain light client for verified results (needs `PDOT_WITH_SR25519`) |

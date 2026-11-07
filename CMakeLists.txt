@@ -7,6 +7,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 option(PDOT_BUILD_TESTS  "Build unit tests" ON)
 option(PDOT_BUILD_EXAMPLES "Build the programs in examples/" ON)
+option(PDOT_BUILD_ASTEROIDS "Build the SDL2 sample game in examples/asteroids (needs SDL2)" OFF)
 option(PDOT_SANITIZE     "Build with ASan and UBSan" OFF)
 option(PDOT_FUZZ         "Build libFuzzer targets (clang)" OFF)
 option(PDOT_WERROR       "Treat warnings in libpdot's own code as errors" OFF)
@@ -177,6 +178,10 @@ if(PDOT_BUILD_EXAMPLES AND PDOT_WITH_SR25519)
     target_link_libraries(example_${e} PRIVATE pdot)
     target_compile_options(example_${e} PRIVATE ${PDOT_WARNINGS})
   endforeach()
+endif()
+
+if(PDOT_BUILD_ASTEROIDS)
+  add_subdirectory(examples/asteroids)
 endif()
 
 if(PDOT_WITH_VERIFY AND PDOT_BUILD_TESTS)

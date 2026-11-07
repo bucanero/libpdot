@@ -38,6 +38,10 @@ struct pdot_client {
     /* Nonzero from stop(stop_ud) abandons the current call (pdot_async). */
     int    (*stop)(void *ud);
     void    *stop_ud;
+
+    /* pdot_client_set_included_fn; NULL: best blocks are not watched. */
+    void   (*included)(void *ud, const pdot_tx_result *where);
+    void    *included_ud;
 };
 
 /* MinGW checks printf formats against the Microsoft runtime unless told it is C99's. */

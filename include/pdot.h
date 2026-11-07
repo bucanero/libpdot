@@ -77,6 +77,21 @@ int pdot_client_metadata_hash(pdot_client *c, uint8_t out[32]);
 /* 1 when pdot_async asks the job running on c to stop (cancel or free). */
 int pdot_client_cancelled(pdot_client *c);
 
+struct pdot_tx_result;
+/*
+ * Optional: fn(ud, where) runs once per transaction submitted through c
+ * (pdot_tx_submit and every call built on it), as soon as the transaction
+ * is in a best block, before that block is final: where has tx_hash,
+ * block, block_hash and index set, nothing else. Never proven, and a reorg
+ * can still drop it; the call keeps waiting for finality and reports as
+ * usual. For progress displays: inclusion takes a block or two, finality
+ * tens of seconds more. Costs a few more RPC requests while waiting. NULL
+ * turns it off. With pdot_async, use pdot_async_set_included_fn instead.
+ */
+void pdot_client_set_included_fn(pdot_client *c,
+                                 void (*fn)(void *ud, const struct pdot_tx_result *where),
+                                 void *ud);
+
 /* The chain's native token symbol and decimals, from the node's system_properties. */
 int pdot_client_token(pdot_client *c, char *symbol, size_t cap, uint8_t *decimals);
 
@@ -205,7 +220,7 @@ typedef struct {
 #define PDOT_DISPATCH_OK        1
 
 /* Where a submitted transaction landed in a finalized block, and how it went. */
-typedef struct {
+typedef struct pdot_tx_result {
     uint8_t  tx_hash[32];
     uint8_t  block_hash[32];
     uint32_t block;
@@ -236,13 +251,14 @@ typedef struct {
     int      verified;                /* 1: read through a proof (needs a verifier) */
 } pdot_authorization;
 
-/* Where data is stored, proven from chain state. */
+/* Where data is stored, read from chain state (proven with a verifier). */
 typedef struct {
     uint32_t block;        /* Bulletin block of the newest stored copy */
     uint32_t index;        /* its position in that block's stored transactions */
     uint32_t expires;      /* retained until this block (block + RetentionPeriod) */
-    uint32_t proven_at;    /* final Bulletin block whose state was proven */
-    uint32_t relay_block;  /* relay block whose GRANDPA finality anchors the proof */
+    uint32_t proven_at;    /* final Bulletin block whose state was read */
+    uint32_t relay_block;  /* with verified: relay block whose GRANDPA finality anchors it */
+    int      verified;     /* 1: read through a proof */
 } pdot_storage_proof;
 
 /* Reads and decodes the account's authorization, if any. */
@@ -324,6 +340,14 @@ int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
 int pdot_bulletin_verify_cid(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out);
 
 /*
+ * Where the data behind cid is stored and until when it is retained, at the
+ * newest final block: proven with a verifier, the RPC node's word without.
+ * Renew (pdot_bulletin_renew) before `expires` to keep it. PDOT_E_NOTFOUND
+ * when it is not stored.
+ */
+int pdot_bulletin_stored(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out);
+
+/*
  * Fetches data by CID from the gateway, or from the node when the client has
  * none, and checks it against the CID. A dag-pb CID (a chunked file) is
  * resolved through its manifest: every block is fetched and verified, and the
@@ -374,6 +398,16 @@ typedef struct {
 /* Reads any storage key; use it for state the typed calls below do not cover. */
 int pdot_storage_get(pdot_client *c, const uint8_t *key, size_t key_len,
                      pdot_storage_value *out);
+
+/*
+ * The hash of block `number`, from System.BlockHash read at the newest final
+ * block `at` (proven with a verifier), or `at` itself. Covers the blocks the
+ * chain keeps hashes for (BlockHashCount, 4096 on Asset Hub): older ones,
+ * and blocks past `at`, are PDOT_E_NOTFOUND. A recent final block's hash is
+ * a seed nobody could know before that block: games use it so a run cannot
+ * be prepared in advance.
+ */
+int pdot_block_hash_get(pdot_client *c, uint32_t number, uint8_t hash[32], pdot_final_block *at);
 
 /* ---- Asset Hub: balances, assets and NFTs ----------------------------
 
@@ -466,8 +500,8 @@ int pdot_nft_owned(pdot_client *c, const uint8_t account_id[32], uint32_t collec
    For Asset Hub and any other chain the client points at. Calls are built
    from the runtime's metadata, so they follow its argument types. Where a
    transaction landed and how it went (dispatch outcome, fee) come from the
-   RPC node's blocks and events and are not proven, even with a verifier;
-   read balances afterwards to prove an effect. */
+   RPC node's blocks and events; with a verifier they are proven (see
+   pdot_tx_submit). */
 
 /* Options for a transaction; pass NULL for none. */
 typedef struct {
@@ -517,6 +551,28 @@ int pdot_tx_submit(pdot_client *c, const pdot_signer *s, const uint8_t *call, si
 /* The fee submitting would cost now. Signs, but submits nothing. */
 int pdot_tx_fee(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
                 const pdot_tx_options *o, pdot_fee *out);
+
+/*
+ * Remarks as attestations: System.remark_with_event(data) records an event
+ * with the dispatch origin and blake2_256(data), which anyone can check
+ * later from the block number alone.
+ */
+typedef struct {
+    pdot_final_block at;     /* the block searched; verified when proven */
+    uint32_t         index;  /* the extrinsic that made the remark */
+} pdot_remark;
+
+/*
+ * Looks in final block `block` for a System.Remarked event from sender over
+ * exactly data. The sender is the call's origin: through a proxy, the
+ * account acted for, not the proxy key. PDOT_E_NOTFOUND when the block has
+ * none, PDOT_E_INVALID when the block is not final yet. With a verifier the
+ * block's events are proven from relay-chain finality (PDOT_E_UNVERIFIED
+ * otherwise). Events are decoded with the client's current metadata, so
+ * blocks from before a runtime upgrade that changed them may not decode.
+ */
+int pdot_remark_find(pdot_client *c, uint32_t block, const uint8_t sender[32],
+                     const uint8_t *data, size_t len, pdot_remark *out);
 
 /* Transfers. "keep alive" ones fail rather than take the sender below the existential deposit. */
 #define PDOT_TRANSFER_NATIVE 0  /* Balances.transfer_keep_alive: amount of the native token */
@@ -637,6 +693,19 @@ void pdot_async_set_checkpoint_fn(pdot_async *a,
  * are waiting, for loops that sleep instead of polling every frame.
  */
 void pdot_async_set_wake(pdot_async *a, void (*wake)(void *ud), void *ud);
+
+/*
+ * Optional: fn(ud, job, job_ud, where) runs inside pdot_async_poll whenever
+ * a job's transaction is in a best block, before the job's own callback
+ * (see pdot_client_set_included_fn: not proven, not final yet). job and
+ * job_ud are the job's id and user data; a job that submits several
+ * transactions reports each. Takes effect from the next job on; NULL turns
+ * it off.
+ */
+void pdot_async_set_included_fn(pdot_async *a,
+                                void (*fn)(void *ud, uint64_t job, void *job_ud,
+                                           const pdot_tx_result *where),
+                                void *ud);
 
 /*
  * Cancels a queued or running job (its callback gets PDOT_E_CANCELLED) or

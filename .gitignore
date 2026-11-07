@@ -56,3 +56,7 @@ dkms.conf
 build*/
 .DS_Store
 tools/fixtures-gen/target/
+
+# pdot-asteroids session key and operator claims, written where they run
+asteroids-session.key
+asteroids-claims.txt

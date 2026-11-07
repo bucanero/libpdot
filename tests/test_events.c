@@ -214,11 +214,83 @@ static void test_storage_defaults(void)
     pdot_metadata_free(md);
 }
 
+
+/*
+ * A System.Remarked record built from the metadata's own indices and appended
+ * to captured events: found by sender and hash, in the right extrinsic.
+ */
+static void test_remark(void)
+{
+    pdot_metadata *md = load_md("metadata-v15-dev.scale");
+    pdot_md_storage st;
+    pdot_md_field fields[4];
+    enum pdot_typedef kind;
+    pdot_reader t;
+    uint64_t elem;
+    uint32_t phase_ty = 0, event_ty = 0, sys_ty, idx = 99;
+    uint8_t apply, sys, remarked, sender[32], hash[32], other[32];
+    uint8_t *ev, *blob = NULL;
+    size_t len, nf, i, cut;
+
+    memset(sender, 0x11, sizeof sender);
+    memset(hash, 0x22, sizeof hash);
+    memset(other, 0x33, sizeof other);
+    ev = load("events-dev-store.scale", &len);
+    CHECK(md && ev);
+    if (!md || !ev)
+        goto out;
+    CHECK(pdot_md_storage_entry(md, "System", "Events", &st) == 0);
+    CHECK(pdot_md_typedef(md, st.value_ty, &t, &kind) == 0 && kind == PDOT_TYPE_SEQUENCE);
+    CHECK(pdot_read_compact(&t, &elem) == 0);
+    CHECK(pdot_md_fields(md, (uint32_t)elem, fields, 4, &nf) == 0 && nf == 3);
+    for (i = 0; i < nf; i++) {
+        if (pdot_md_name_eq(fields[i].name, fields[i].name_len, "phase"))
+            phase_ty = fields[i].ty;
+        else if (pdot_md_name_eq(fields[i].name, fields[i].name_len, "event"))
+            event_ty = fields[i].ty;
+    }
+    CHECK(pdot_md_variant(md, phase_ty, "ApplyExtrinsic", &apply, &nf) == 0);
+    CHECK(pdot_md_variant_fields(md, event_ty, "System", &sys, &sys_ty, 1, &nf) == 0);
+    CHECK(pdot_md_variant(md, sys_ty, "Remarked", &remarked, &nf) == 0 && nf == 2);
+    /* A one-byte compact count (under 64 records), raised by one below. */
+    CHECK((ev[0] & 3) == 0 && ev[0] < 63 << 2);
+
+    /* count, the captured records, then { ApplyExtrinsic(1), System.Remarked, no topics } */
+    blob = malloc(len + 1 + 4 + 2 + 64 + 1);
+    CHECK(blob != NULL);
+    if (!blob)
+        goto out;
+    memcpy(blob, ev, len);
+    blob[0] = (uint8_t)(ev[0] + 4);
+    i = len;
+    blob[i++] = apply;
+    blob[i++] = 1; blob[i++] = 0; blob[i++] = 0; blob[i++] = 0;
+    blob[i++] = sys;
+    blob[i++] = remarked;
+    memcpy(blob + i, sender, 32); i += 32;
+    memcpy(blob + i, hash, 32); i += 32;
+    blob[i++] = 0;
+
+    CHECK(pdot_events_find_remark(md, blob, i, sender, hash, &idx) == 0 && idx == 1);
+    CHECK(pdot_events_find_remark(md, blob, i, other, hash, &idx) == PDOT_E_NOTFOUND);
+    CHECK(pdot_events_find_remark(md, blob, i, sender, other, &idx) == PDOT_E_NOTFOUND);
+    CHECK(pdot_events_find_remark(md, ev, len, sender, hash, &idx) == PDOT_E_NOTFOUND);
+    /* Any cut, even one that keeps the record, fails: the whole blob must decode. */
+    for (cut = 0; cut < i; cut++)
+        CHECK(pdot_events_find_remark(md, blob, cut, sender, hash, &idx) != 0);
+    CHECK(pdot_events_find_remark(md, blob, i, sender, hash, &idx) == 0);
+out:
+    free(blob);
+    free(ev);
+    pdot_metadata_free(md);
+}
+
 int main(void)
 {
     test_outcomes();
     test_hostile();
     test_authorization();
     test_storage_defaults();
+    test_remark();
     TEST_DONE();
 }
