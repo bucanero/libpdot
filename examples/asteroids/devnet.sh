@@ -1,12 +1,13 @@
 #!/bin/sh
 # Local dev chains for pdot-asteroids, built like tools/e2e-assethub.sh and
 # tools/e2e-devnode.sh from the runtimes deployed on Westend (no Rust build):
-#   Asset Hub  http://127.0.0.1:9944  //Bob, the game's operator, creates trophy collection 0
+#   Asset Hub  http://127.0.0.1:9944  //Bob, the operator's key, creates trophy collection 0
 #   Bulletin   http://127.0.0.1:9945  //Eve authorizes //Bob to store the leaderboard
 # The nodes run until Ctrl-C.
 #
 #   OMNI_NODE=/path/to/polkadot-omni-node examples/asteroids/devnet.sh [build-dir]
-#   build-dir/examples/asteroids/asteroids      # in another terminal
+#   build-dir/examples/asteroids/asteroids-operator   # in another terminal
+#   build-dir/examples/asteroids/asteroids            # and another
 set -eu
 
 BUILD=${1:-build-game}
@@ -84,5 +85,6 @@ echo "== //Eve authorizes //Bob on Bulletin: 1000 stores, 16 MiB"
 "$CLI" --rpc $BULLETIN --seed $EVE authorize $BOB_ADDR 1000 16777216 > "$WORK/tx.out"
 grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "authorize"; }
 
-echo "== ready: run $BUILD/examples/asteroids/asteroids (Ctrl-C here stops the nodes)"
+echo "== ready: run $BUILD/examples/asteroids/asteroids-operator, then"
+echo "   $BUILD/examples/asteroids/asteroids, each in its own terminal (Ctrl-C here stops the nodes)"
 wait "$AH_PID"

@@ -1,6 +1,7 @@
 /*
  * Transactions on any chain: calls from JSON, submission with a tip or
- * through a proxy, fee estimates, transfers and proxy management.
+ * through a proxy, fee estimates, transfers, proxy management and remark
+ * lookups.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -10,10 +11,13 @@
 #include "pdot.h"
 #include "client.h"
 #include "encode.h"
+#include "events.h"
+#include "hash.h"
 #include "hex.h"
 #include "rng.h"
 #include "jsonrpc.h"
 #include "tx.h"
+#include "verify.h"
 
 static int take(pdot_buf *b, uint8_t **out, size_t *len)
 {
@@ -358,4 +362,52 @@ int pdot_proxy_remove(pdot_client *c, const pdot_signer *s, const uint8_t delega
         rc = pdot_tx_submit(c, s, b.data, b.len, NULL, out);
     pdot_buf_free(&b);
     return rc;
+}
+
+/* ---- Remarks ------------------------------------------------------------ */
+
+int pdot_remark_find(pdot_client *c, uint32_t block, const uint8_t sender[32],
+                     const uint8_t *data, size_t len, pdot_remark *out)
+{
+    uint8_t hash[32], key[32], head[32], *events = NULL;
+    uint32_t finalized;
+    size_t events_len = 0;
+    int rc;
+
+    if (!c || !sender || (!data && len) || !out)
+        return PDOT_E_INVALID;
+    memset(out, 0, sizeof *out);
+    out->at.number = block;
+    if ((rc = pdot_chain_sync(c)))
+        return rc;
+    if (c->verifier) {
+        if ((rc = pdot_verify_block_events(c, block, out->at.hash, &events, &events_len)))
+            return rc;
+        out->at.verified = 1;
+        out->at.relay_block = c->verifier->head_relay;
+    } else {
+        if ((rc = pdot_rpc_finalized_head(c, head)) ||
+            (rc = pdot_rpc_block_number(c, head, &finalized)))
+            return rc;
+        if (block > finalized)
+            return pdot_fail(c, PDOT_E_INVALID, "block #%u is not final yet (final: #%u)",
+                             block, finalized);
+        if ((rc = pdot_rpc_block_hash(c, block, out->at.hash)))
+            return rc;
+        pdot_events_key(key);
+        rc = pdot_rpc_storage_at(c, key, sizeof key, out->at.hash, &events, &events_len);
+        if (rc == PDOT_E_NOTFOUND)
+            return pdot_fail(c, rc, "block #%u has no events", block);
+        if (rc)
+            return rc;
+    }
+    pdot_blake2b_256(hash, data ? data : (const uint8_t *)"", len);
+    rc = pdot_events_find_remark(c->md, events, events_len, sender, hash, &out->index);
+    free(events);
+    if (rc == PDOT_E_NOTFOUND)
+        return pdot_fail(c, rc, "block #%u has no such remark from that account", block);
+    if (rc)
+        return pdot_fail(c, rc, "block #%u: events do not decode with the current metadata",
+                         block);
+    return 0;
 }

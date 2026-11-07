@@ -260,6 +260,8 @@ pdot_free(call);                                         /* res.fee: what it did
 
 Anything else is one `pdot_call_from_json` away. Arguments are an array in order or an object by name. Integers are numbers or decimal strings. Accounts are SS58 or `0x` hex, and bytes are `0x` hex or text. Enums are written `"Variant"` or `{"Variant": value}`, with `null` for None. Encoding follows the runtime's metadata, and errors name the argument (`Balances.transfer_keep_alive.value: expected an unsigned integer`).
 
+Remarks work as attestations. `System.remark_with_event(data)` records the call's origin and `blake2_256(data)` in an event, and `pdot_remark_find(c, block, sender, data, len, &r)` checks it later from the block number alone. Through a proxy the sender is the account acted for. With a verifier, the block's events are proven. The asteroids operator uses this to check claimed scores.
+
 ```c
 pdot_call_from_json(c, "Nfts", "mint", "[0, 7, \"5Grwva...\", null]", &call, &len);
 ```
@@ -330,7 +332,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 - **Checkpoints**: jobs and watches verify on separate connections but share their progress, so a validator-set change is walked once. `pdot_async_checkpoint` returns the newest checkpoint; save it before `pdot_async_free`. A long-running app can also pass a function to `pdot_async_set_checkpoint_fn`, which runs inside `pdot_async_poll` whenever the checkpoint advances. `pdot-bulletin watch` saves `--checkpoint` that way.
 - `pdot_async_run(a, work, done, ud)` runs any blocking libpdot code of your own on the worker.
 
-[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line. [`examples/asteroids`](examples/asteroids) is a small SDL2 game built on it: it signs with a session key, records scores on chain, keeps a top-10 leaderboard on the Bulletin chain and mints NFT trophies.
+[`examples/game_loop.c`](examples/game_loop.c) is a complete 60 fps loop. `pdot-bulletin watch head|balance|asset|nft` does the same from the command line. [`examples/asteroids`](examples/asteroids) is a small SDL2 game built on it: it signs with a session key, records scores on chain, keeps a top-10 leaderboard on the Bulletin chain and mints NFT trophies through an operator server that re-runs each game from its replay and checks the score on chain.
 
 ### API overview
 
@@ -345,7 +347,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
 | Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
-| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit` |
+| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit`, `pdot_remark_find` |
 | Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |
 | Amounts | `pdot_u128_format`, `pdot_u128_parse`, `pdot_u128_to_double` |
 | Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_checkpoint`, `pdot_async_set_checkpoint_fn`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
@@ -382,7 +384,7 @@ target_link_libraries(my_game PRIVATE pdot)
 | `PDOT_WITH_ECDSA` | `ON` | ECDSA secp256k1 signer (mbedTLS) |
 | `PDOT_BUILD_TESTS` | `ON` | Unit tests |
 | `PDOT_BUILD_EXAMPLES` | `ON` | Programs in `examples/` |
-| `PDOT_BUILD_ASTEROIDS` | `OFF` | The SDL2 sample game in `examples/asteroids` (needs SDL2) |
+| `PDOT_BUILD_ASTEROIDS` | `OFF` | The SDL2 sample game and its operator server in `examples/asteroids` (needs SDL2) |
 | `PDOT_SANITIZE` | `OFF` | Build with ASan and UBSan |
 | `PDOT_WERROR` | `OFF` | Warnings in libpdot's own code are errors (CI uses this) |
 | `PDOT_WITH_VERIFY` | `ON` | Relay-chain light client for verified results (needs `PDOT_WITH_SR25519`) |

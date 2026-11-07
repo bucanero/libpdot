@@ -604,13 +604,30 @@ out:
     return rc;
 }
 
+/* System.Events at a block holds that block's events. */
+static int proven_events(pdot_client *c, const pdot_header *h, uint8_t block_hash[32],
+                         uint8_t **events, size_t *events_len)
+{
+    uint8_t key[32];
+    int rc;
+
+    pdot_twox128(key, "System", 6);
+    pdot_twox128(key + 16, "Events", 6);
+    rc = pdot_verify_read(c, h, key, sizeof key, events, events_len);
+    if (rc == PDOT_E_NOTFOUND)
+        return pdot_fail(c, PDOT_E_UNVERIFIED, "block #%u: proven to have no events", h->number);
+    if (rc)
+        return rc;
+    memcpy(block_hash, h->hash, 32);
+    return 0;
+}
+
 int pdot_verify_extrinsic(pdot_client *c, uint32_t number, const uint8_t tx_hash[32],
                           uint8_t block_hash[32], uint32_t *index, uint8_t **events,
                           size_t *events_len)
 {
     const pdot_header *head;
     pdot_header h;
-    uint8_t key[32];
     int rc;
 
     *events = NULL;
@@ -621,14 +638,22 @@ int pdot_verify_extrinsic(pdot_client *c, uint32_t number, const uint8_t tx_hash
         (rc = para_header_at(c, head, number, &h)) ||
         (rc = find_proven(c, &h, tx_hash, index)))
         return rc;
-    /* System.Events at a block holds that block's events. */
-    pdot_twox128(key, "System", 6);
-    pdot_twox128(key + 16, "Events", 6);
-    rc = pdot_verify_read(c, &h, key, sizeof key, events, events_len);
-    if (rc == PDOT_E_NOTFOUND)
-        return pdot_fail(c, PDOT_E_UNVERIFIED, "block #%u: proven to have no events", number);
-    if (rc)
+    return proven_events(c, &h, block_hash, events, events_len);
+}
+
+int pdot_verify_block_events(pdot_client *c, uint32_t number, uint8_t block_hash[32],
+                             uint8_t **events, size_t *events_len)
+{
+    const pdot_header *head;
+    pdot_header h;
+    int rc;
+
+    *events = NULL;
+    *events_len = 0;
+    if (!c->verifier)
+        return PDOT_E_INVALID;
+    if ((rc = pdot_verify_para_head(c, number, &head)) ||
+        (rc = para_header_at(c, head, number, &h)))
         return rc;
-    memcpy(block_hash, h.hash, 32);
-    return 0;
+    return proven_events(c, &h, block_hash, events, events_len);
 }

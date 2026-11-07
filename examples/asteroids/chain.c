@@ -10,14 +10,15 @@
  *   record  reads the collection's "best" attribute: the score to beat
  *   quote   the fee of the score transaction (TransactionPaymentApi)
  *   submit  the session key, acting for the player, sends
- *           System.remark_with_event("pdot-asteroids score=N name=ABC")
- *   trophy  on a new record the operator mints an NFT to the player and
- *           updates the collection's "best" attribute: "SCORE ADDRESS ABC"
+ *           System.remark_with_event("pdot-asteroids score=N name=ABC replay=CID"),
+ *           CID being the replay's (replay.h): the score commits to its game
+ *   claim   asks asteroids-operator (HTTP) to honour that score, sending the
+ *           replay: it re-runs the game, finds the remark on chain, then puts
+ *           a top-10 score on the board and mints a trophy for a new record.
+ *           The game holds no operator key.
  *   board   reads the leaderboard: the collection's "board" attribute holds
  *           the CID of a JSON document on the Bulletin chain (board.h),
  *           fetched and checked against the CID
- *   board+  a score that makes the top 10: the operator merges it into the
- *           newest board, stores that on Bulletin and points "board" at it
  *   close   leftover funds back to the player, then the player removes the proxy
  *
  * Watches keep the newest final block and the session key's balance current.
@@ -28,18 +29,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <cjson/cJSON.h>
+#include <curl/curl.h>
+
+#include "replay.h"
 #if !defined(_WIN32)
 #include <sys/stat.h>
 #endif
 
 #define PROXY_TYPE "NonTransfer"  /* the session key can do anything but move funds */
-#define RECORD_KEY "best"
-#define BOARD_KEY  "board"
+#define CLAIM_TIMEOUT_S 300       /* the operator may wait on several blocks */
 
 struct chain {
     pdot_async  *a;
     pdot_client *bul;            /* Bulletin, used only inside jobs on a's worker */
-    pdot_signer  player, op, session;
+    pdot_signer  player, session;
+    char         operator_url[256];  /* "" for none */
     int          has_saved;      /* session holds the key saved by an earlier run */
     char         session_file[512];
     int          funds_returned; /* closing: leftover funds went back */
@@ -48,12 +54,15 @@ struct chain {
     char         checkpoint[512];
     int          close_pending;  /* chain_close came while the session was opening */
     int          has_balance;    /* session_free read, shown once decimals are known */
+    uint32_t     score;          /* the finished game's, from chain_set_replay */
+    uint8_t     *replay;         /* its encoded replay; NULL if it could not be kept */
+    size_t       replay_len;
+    char         replay_cid[BOARD_CID_MAX];
     pdot_u128    session_free;
     chain_view   v;
 };
 
-enum { J_OPEN, J_RECORD, J_QUOTE, J_SUBMIT, J_TROPHY, J_BOARD, J_BOARD_ADD, J_CLOSE_FUNDS,
-       J_CLOSE_PROXY };
+enum { J_OPEN, J_RECORD, J_QUOTE, J_SUBMIT, J_CLAIM, J_BOARD, J_CLOSE_FUNDS, J_CLOSE_PROXY };
 
 struct job {
     chain         *ch;
@@ -62,7 +71,8 @@ struct job {
     char           name[4];     /* the player's initials, A-Z */
     pdot_tx_result tx;
     pdot_fee       fee;
-    uint32_t       item;
+    uint32_t       item;        /* claim: the trophy minted */
+    int            new_record;  /* claim: a new record */
     char           symbol[16];
     uint8_t        decimals;
     int            has_record, record_verified;
@@ -73,12 +83,17 @@ struct job {
     int            cleaned;     /* open: a half-closed saved session was cleaned up */
     pdot_signer    fresh;       /* open: the new session key */
     int            save_failed; /* open: the session file could not be written */
-    uint32_t       block;       /* board+: the block holding the score's remark */
-    board          b;           /* board, board+: the leaderboard read (and updated) */
+    uint32_t       block;       /* claim: the block holding the score's remark */
+    board          b;           /* board: the leaderboard read */
     char           board_cid[CHAIN_CID_STR_MAX];
-    int            rank;        /* board+: the place taken, 0 for none */
-    uint32_t       stored_at;   /* board+: the Bulletin block holding the new board */
-    char           msg[192];    /* a Bulletin error (the done callback only sees Asset Hub's) */
+    int            rank;        /* claim: the place taken, 0 for none */
+    uint32_t       stored_at;   /* claim: the Bulletin block holding the new board */
+    int            proven;      /* claim: the operator proved the score */
+    char           replay_cid[BOARD_CID_MAX];  /* quote, submit, claim: "" for none */
+    uint8_t       *replay;      /* submit, claim: owned, passed from submit to claim */
+    size_t         replay_len;
+    char           msg[256];    /* Bulletin and operator errors (the done callback
+                                   only sees Asset Hub's) */
 };
 
 #if defined(__GNUC__)
@@ -120,11 +135,15 @@ static void describe_tx(const chain *ch, const pdot_tx_result *tx, char *out, si
              tx->verified ? "proven" : "trusted RPC");
 }
 
-static int remark_call(pdot_client *c, uint32_t score, const char *name, uint8_t **call,
-                       size_t *len)
+/* The score remark; without a replay the operator will not honour it. */
+static int remark_call(pdot_client *c, const struct job *j, uint8_t **call, size_t *len)
 {
-    char args[80];
-    snprintf(args, sizeof args, "[\"pdot-asteroids score=%u name=%s\"]", score, name);
+    char args[80 + BOARD_CID_MAX];
+    if (j->replay_cid[0])
+        snprintf(args, sizeof args, "[\"pdot-asteroids score=%u name=%s replay=%s\"]", j->score,
+                 j->name, j->replay_cid);
+    else
+        snprintf(args, sizeof args, "[\"pdot-asteroids score=%u name=%s\"]", j->score, j->name);
     return pdot_call_from_json(c, "System", "remark_with_event", args, call, len);
 }
 
@@ -240,23 +259,16 @@ static int work_open(pdot_client *c, void *ud)
 static int work_record(pdot_client *c, void *ud)
 {
     struct job *j = ud;
-    pdot_nft_attribute attr;
-    char text[PDOT_NFT_DATA_MAX + 1];
-    unsigned long score;
+    board_record r;
     int rc;
 
-    rc = pdot_nft_attribute_get(c, j->ch->collection, 0, 0, PDOT_NFT_NS_COLLECTION_OWNER, NULL,
-                                (const uint8_t *)RECORD_KEY, strlen(RECORD_KEY), &attr);
-    if (rc || !attr.exists)
+    if ((rc = board_record_read(c, j->ch->collection, &r)) || !r.exists)
         return rc;
-    memcpy(text, attr.value, attr.len);
-    text[attr.len] = '\0';
-    /* "SCORE ADDRESS NAME", as work_trophy writes it; older records have no NAME */
-    if (sscanf(text, "%lu %63s %3[A-Z]", &score, j->holder, j->holder_name) >= 2) {
-        j->has_record = 1;
-        j->record = (uint32_t)score;
-        j->record_verified = attr.at.verified;
-    }
+    j->has_record = 1;
+    j->record = r.score;
+    j->record_verified = r.verified;
+    memcpy(j->holder, r.holder, sizeof j->holder);
+    memcpy(j->holder_name, r.name, sizeof j->holder_name);
     return 0;
 }
 
@@ -268,7 +280,7 @@ static int work_quote(pdot_client *c, void *ud)
     size_t len;
     int rc;
 
-    if ((rc = remark_call(c, j->score, j->name, &call, &len)))
+    if ((rc = remark_call(c, j, &call, &len)))
         return rc;
     rc = pdot_tx_fee(c, &j->ch->session, call, len, &o, &j->fee);
     pdot_free(call);
@@ -283,133 +295,131 @@ static int work_submit(pdot_client *c, void *ud)
     size_t len;
     int rc;
 
-    if ((rc = remark_call(c, j->score, j->name, &call, &len)))
+    if ((rc = remark_call(c, j, &call, &len)))
         return rc;
     rc = pdot_tx_submit(c, &j->ch->session, call, len, &o, &j->tx);
     pdot_free(call);
     return rc;
 }
 
-/* Encodes pallet.call from JSON and submits it signed by the operator. */
-static int op_submit(pdot_client *c, chain *ch, const char *call_name, const char *args,
-                     pdot_tx_result *tx)
-{
-    uint8_t *call;
-    size_t len;
-    int rc;
+/* ---- claim: HTTP to the operator, with libcurl ---------------------- */
 
-    if ((rc = pdot_call_from_json(c, "Nfts", call_name, args, &call, &len)))
-        return rc;
-    rc = pdot_tx_submit(c, &ch->op, call, len, NULL, tx);
-    pdot_free(call);
-    return rc;
+typedef struct {
+    char  *data;
+    size_t len;
+} http_body;
+
+static size_t on_body(char *p, size_t size, size_t n, void *ud)
+{
+    http_body *b = ud;
+    size_t add = size * n;
+    char *grown;
+
+    if (b->len + add > 65536 || !(grown = realloc(b->data, b->len + add + 1)))
+        return 0;  /* aborts the transfer */
+    memcpy(grown + b->len, p, add);
+    b->data = grown;
+    b->len += add;
+    b->data[b->len] = '\0';
+    return add;
 }
 
-static int work_trophy(pdot_client *c, void *ud)
+/* Gives up as soon as the game quits (pdot_async_free cancels the job). */
+static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un)
+{
+    (void)dt; (void)dn; (void)ut; (void)un;
+    return pdot_client_cancelled(ud);
+}
+
+static int work_claim(pdot_client *c, void *ud)
 {
     struct job *j = ud;
     chain *ch = j->ch;
-    pdot_nft_item it;
-    char args[256];
-    int rc;
+    char url[300], *req;
+    size_t req_cap, i, at;
+    http_body body = { NULL, 0 };
+    struct curl_slist *hdr = NULL;
+    cJSON *res = NULL;
+    const cJSON *ok, *v;
+    CURL *h;
+    CURLcode cc;
+    long status = 0;
+    int rc = PDOT_E_RPC;
 
-    /* The first free item id. */
-    for (j->item = 0;; j->item++) {
-        if ((rc = pdot_nft_item_get(c, ch->collection, j->item, &it)))
-            return rc;
-        if (!it.exists)
-            break;
+    snprintf(url, sizeof url, "%s/claim", ch->operator_url);
+    /* {"account", "score", "name", "block", "replay": hex} */
+    req_cap = 256 + 2 * j->replay_len;
+    if (!(req = malloc(req_cap)))
+        return PDOT_E_NOMEM;
+    at = (size_t)snprintf(req, req_cap,
+                          "{\"account\":\"%s\",\"score\":%u,\"name\":\"%s\",\"block\":%u,"
+                          "\"replay\":\"", ch->v.player, j->score, j->name, j->block);
+    for (i = 0; i < j->replay_len; i++)
+        at += (size_t)snprintf(req + at, req_cap - at, "%02x", j->replay[i]);
+    snprintf(req + at, req_cap - at, "\"}");
+    if (!(h = curl_easy_init())) {
+        free(req);
+        return PDOT_E_NOMEM;
     }
-    snprintf(args, sizeof args, "[%u, %u, \"%s\", null]", ch->collection, j->item, ch->v.player);
-    if ((rc = op_submit(c, ch, "mint", args, &j->tx)))
-        return rc;
-    snprintf(args, sizeof args, "[%u, %u, \"pdot-asteroids record %u by %s\"]", ch->collection,
-             j->item, j->score, j->name);
-    if ((rc = op_submit(c, ch, "set_metadata", args, &j->tx)))
-        return rc;
-    snprintf(args, sizeof args, "[%u, null, \"CollectionOwner\", \"" RECORD_KEY "\", \"%u %s %s\"]",
-             ch->collection, j->score, ch->v.player, j->name);
-    return op_submit(c, ch, "set_attribute", args, &j->tx);
-}
+    hdr = curl_slist_append(hdr, "Content-Type: application/json");
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdr);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDS, req);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_body);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, (long)CLAIM_TIMEOUT_S);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, on_progress);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, c);
+    cc = curl_easy_perform(h);
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(hdr);
+    curl_easy_cleanup(h);
 
-/* The leaderboard behind the "board" attribute; an empty one if there is none yet. */
-static int read_board(pdot_client *c, struct job *j)
-{
-    chain *ch = j->ch;
-    pdot_nft_attribute attr;
-    pdot_cid cid;
-    uint8_t *data;
-    size_t len;
-    int rc;
-
-    memset(&j->b, 0, sizeof j->b);
-    j->board_cid[0] = '\0';
-    rc = pdot_nft_attribute_get(c, ch->collection, 0, 0, PDOT_NFT_NS_COLLECTION_OWNER, NULL,
-                                (const uint8_t *)BOARD_KEY, strlen(BOARD_KEY), &attr);
-    if (rc || !attr.exists)
-        return rc;
-    if (attr.len >= sizeof j->board_cid) {
-        snprintf(j->msg, sizeof j->msg, "the board attribute is not a CID");
-        return PDOT_E_DECODE;
+    if (cc == CURLE_ABORTED_BY_CALLBACK && pdot_client_cancelled(c)) {
+        rc = PDOT_E_CANCELLED;
+        goto out;
     }
-    memcpy(j->board_cid, attr.value, attr.len);
-    j->board_cid[attr.len] = '\0';
-    if ((rc = pdot_cid_from_string(&cid, j->board_cid))) {
-        snprintf(j->msg, sizeof j->msg, "the board attribute is not a CID");
-        return rc;
+    if (cc != CURLE_OK) {
+        snprintf(j->msg, sizeof j->msg, "operator at %s: %s", ch->operator_url,
+                 curl_easy_strerror(cc));
+        goto out;
     }
-    /* Checked against the CID: a node can withhold the board, not change it. */
-    if ((rc = pdot_bulletin_fetch(ch->bul, &cid, &data, &len))) {
-        snprintf(j->msg, sizeof j->msg, "fetching the board from Bulletin: %s",
-                 pdot_last_error(ch->bul));
-        return rc;
+    res = body.data ? cJSON_Parse(body.data) : NULL;
+    ok = cJSON_GetObjectItemCaseSensitive(res, "ok");
+    if (!cJSON_IsBool(ok)) {
+        snprintf(j->msg, sizeof j->msg, "operator: HTTP %ld, not a claim answer", status);
+        goto out;
     }
-    rc = board_parse(data, len, &j->b) ? PDOT_E_DECODE : 0;
-    if (rc)
-        snprintf(j->msg, sizeof j->msg, "%.60s is not a leaderboard", j->board_cid);
-    pdot_free(data);
+    if (!cJSON_IsTrue(ok)) {
+        v = cJSON_GetObjectItemCaseSensitive(res, "error");
+        snprintf(j->msg, sizeof j->msg, "operator refused: %s",
+                 cJSON_IsString(v) ? v->valuestring : "no reason given");
+        goto out;
+    }
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(res, "rank")))
+        j->rank = v->valueint;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(res, "stored_at")))
+        j->stored_at = (uint32_t)v->valuedouble;
+    j->new_record = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "record"));
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(res, "trophy")))
+        j->item = (uint32_t)v->valuedouble;
+    j->proven = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "score_proven"));
+    rc = 0;
+out:
+    cJSON_Delete(res);
+    free(body.data);
+    free(req);
     return rc;
 }
 
 static int work_board(pdot_client *c, void *ud)
 {
-    return read_board(c, ud);
-}
-
-static int work_board_add(pdot_client *c, void *ud)
-{
     struct job *j = ud;
-    chain *ch = j->ch;
-    pdot_store_result sr;
-    board_entry e;
-    char args[256], *json;
-    int rc;
-
-    /* Merged into the newest board, which another game may have changed. */
-    if ((rc = read_board(c, j)))
-        return rc;
-    memset(&e, 0, sizeof e);
-    e.score = j->score;
-    memcpy(e.name, j->name, sizeof e.name);
-    memcpy(e.account, ch->v.player, sizeof e.account);
-    e.block = j->block;
-    if (!(j->rank = board_insert(&j->b, &e)))
-        return 0;
-    if (!(json = board_json(&j->b)))
-        return PDOT_E_NOMEM;
-    rc = pdot_bulletin_store(ch->bul, &ch->op, (const uint8_t *)json, strlen(json), &sr);
-    free(json);
-    if (rc) {
-        snprintf(j->msg, sizeof j->msg, "storing the board on Bulletin: %s",
-                 rc == PDOT_E_DISPATCH ? sr.tx.error : pdot_last_error(ch->bul));
-        return rc;
-    }
-    j->stored_at = sr.tx.block;
-    if ((rc = pdot_cid_to_string(&sr.cid, j->board_cid, sizeof j->board_cid)))
-        return rc;
-    snprintf(args, sizeof args, "[%u, null, \"CollectionOwner\", \"" BOARD_KEY "\", \"%s\"]",
-             ch->collection, j->board_cid);
-    return op_submit(c, ch, "set_attribute", args, &j->tx);
+    return board_read(c, j->ch->bul, j->ch->collection, &j->b, j->board_cid, j->msg,
+                      sizeof j->msg);
 }
 
 static int work_close_funds(pdot_client *c, void *ud)
@@ -443,7 +453,14 @@ static void show_balance(chain *ch)
 
 static struct job *queue(chain *ch, int kind, uint32_t score, const char *name);
 static struct job *queue_at(chain *ch, int kind, uint32_t score, const char *name,
-                            uint32_t block);
+                            uint32_t block, const char *cid, uint8_t *replay, size_t replay_len);
+
+static void job_free(struct job *j)
+{
+    pdot_signer_wipe(&j->fresh);
+    free(j->replay);
+    free(j);
+}
 static void on_session_balance(void *ud, int rc, const char *error, const void *result);
 
 static void on_owned(void *ud, int rc, const char *error, const void *result)
@@ -477,8 +494,7 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         if (j->kind == J_OPEN || j->kind == J_CLOSE_FUNDS || j->kind == J_CLOSE_PROXY)
             fprintf(stderr, "[chain] quit before the session closed: the next run resumes "
                     "or cleans it up from %s\n", ch->session_file);
-        pdot_signer_wipe(&j->fresh);
-        free(j);
+        job_free(j);
         return;
     }
     if (j->kind == J_OPEN && rc == 0) {
@@ -546,24 +562,35 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
             break;
         }
         status(ch, 0, "%s's score %u recorded: %s", j->name, j->score, tx);
-        /* The worker merges into the newest board; a stale one only gates the try. */
-        if (ch->bul && (ch->v.board_state != 1 || board_rank(&ch->v.board, j->score)))
-            queue_at(ch, J_BOARD_ADD, j->score, j->name, j->tx.block);
-        if (!ch->v.has_record || j->score > ch->v.record) {
-            ch->v.has_record = 1;  /* shown at once; reread after the trophy */
-            ch->v.record = j->score;
-            memcpy(ch->v.record_holder, ch->v.player, sizeof ch->v.record_holder);
-            memcpy(ch->v.record_name, j->name, sizeof ch->v.record_name);
-            ch->v.record_verified = 0;
-            queue(ch, J_TROPHY, j->score, j->name);
+        /* The operator decides on the newest board; a stale one only gates the claim. */
+        if (ch->operator_url[0] &&
+            (ch->v.board_state != 1 || board_rank(&ch->v.board, j->score) ||
+             !ch->v.has_record || j->score > ch->v.record)) {
+            status(ch, 0, "%s's score %u recorded (%s); claiming it with the operator...",
+                   j->name, j->score, tx);
+            queue_at(ch, J_CLAIM, j->score, j->name, j->tx.block, j->replay_cid, j->replay,
+                     j->replay_len);
+            j->replay = NULL;  /* the claim owns it now */
         }
         break;
-    case J_TROPHY:
-        if (rc)
-            status(ch, 1, "trophy not minted: %s", rc == PDOT_E_DISPATCH ? j->tx.error : error);
+    case J_CLAIM:
+        if (rc) {
+            status(ch, 1, "score not claimed: %s", j->msg[0] ? j->msg : error);
+            break;
+        }
+        if (j->new_record)
+            status(ch, 0, "new record! trophy %u minted%s%s", j->item,
+                   j->rank ? ", and on the leaderboard" : "",
+                   j->proven ? " (score proven by the operator)" : "");
+        else if (j->rank)
+            status(ch, 0, "%s is number %d on the leaderboard (Bulletin block %u)%s", j->name,
+                   j->rank, j->stored_at, j->proven ? ", score proven by the operator" : "");
         else
-            status(ch, 0, "new record! trophy %u minted (%s)", j->item, tx);
+            status(ch, 0, "the top 10 moved on: %u no longer makes it", j->score);
+        /* Read back from the chain, not from the operator's answer. */
         queue(ch, J_RECORD, 0, NULL);
+        if (ch->bul)
+            queue(ch, J_BOARD, 0, NULL);
         refresh_trophies(ch);
         break;
     case J_BOARD:
@@ -575,21 +602,6 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         ch->v.board = j->b;
         ch->v.board_state = 1;
         memcpy(ch->v.board_cid, j->board_cid, sizeof ch->v.board_cid);
-        break;
-    case J_BOARD_ADD:
-        if (rc) {
-            status(ch, 1, "leaderboard not updated: %s",
-                   j->msg[0] ? j->msg : rc == PDOT_E_DISPATCH ? j->tx.error : error);
-            break;
-        }
-        ch->v.board = j->b;
-        ch->v.board_state = 1;
-        memcpy(ch->v.board_cid, j->board_cid, sizeof ch->v.board_cid);
-        if (j->rank)
-            status(ch, 0, "%s is number %d on the leaderboard (stored on Bulletin block %u)",
-                   j->name, j->rank, j->stored_at);
-        else
-            status(ch, 0, "the top 10 moved on: %u no longer makes it", j->score);
         break;
     case J_CLOSE_FUNDS:
         ch->funds_returned = rc == 0;
@@ -610,24 +622,26 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         ch->v.state = CHAIN_CLOSED;
         break;
     }
-    free(j);
+    job_free(j);
 }
 
 static struct job *queue(chain *ch, int kind, uint32_t score, const char *name)
 {
-    return queue_at(ch, kind, score, name, 0);
+    return queue_at(ch, kind, score, name, 0, NULL, NULL, 0);
 }
 
+/* replay, when given, is owned by the job from here on, queued or not. */
 static struct job *queue_at(chain *ch, int kind, uint32_t score, const char *name,
-                            uint32_t block)
+                            uint32_t block, const char *cid, uint8_t *replay, size_t replay_len)
 {
     static int (*const work[])(pdot_client *, void *) = {
-        work_open, work_record, work_quote, work_submit, work_trophy, work_board,
-        work_board_add, work_close_funds, work_close_proxy,
+        work_open, work_record, work_quote, work_submit, work_claim, work_board,
+        work_close_funds, work_close_proxy,
     };
     struct job *j = calloc(1, sizeof *j);
 
     if (!j) {
+        free(replay);
         status(ch, 1, "out of memory");
         return NULL;
     }
@@ -636,9 +650,12 @@ static struct job *queue_at(chain *ch, int kind, uint32_t score, const char *nam
     j->score = score;
     j->block = block;
     snprintf(j->name, sizeof j->name, "%s", name ? name : "");
+    snprintf(j->replay_cid, sizeof j->replay_cid, "%s", cid ? cid : "");
+    j->replay = replay;
+    j->replay_len = replay_len;
     if (!pdot_async_run(ch->a, work[kind], job_done, j)) {
         status(ch, 1, "could not queue a job");
-        free(j);
+        job_free(j);
         return NULL;
     }
     ch->v.busy++;
@@ -728,13 +745,19 @@ chain *chain_open(const chain_config *cfg, char *err, size_t err_len)
     snprintf(ch->fund, sizeof ch->fund, "%s", cfg->fund);
     ch->v.trophies = -1;
     snprintf(ch->v.session_balance, sizeof ch->v.session_balance, "...");
-    if ((rc = pdot_signer_sr25519_from_seed(&ch->player, cfg->player_seed)) ||
-        (rc = pdot_signer_sr25519_from_seed(&ch->op, cfg->operator_seed))) {
+    if ((rc = pdot_signer_sr25519_from_seed(&ch->player, cfg->player_seed))) {
         snprintf(err, err_len, "keys: %s", pdot_strerror(rc));
         goto fail;
     }
     pdot_ss58_encode(ch->player.account_id, 42, ch->v.player, sizeof ch->v.player);
     snprintf(ch->session_file, sizeof ch->session_file, "%s", cfg->session_file);
+    if (cfg->operator_url) {
+        size_t n = strlen(cfg->operator_url);
+        while (n && cfg->operator_url[n - 1] == '/')
+            n--;  /* "/claim" is appended */
+        snprintf(ch->operator_url, sizeof ch->operator_url, "%.*s", (int)n, cfg->operator_url);
+        ch->v.has_operator = 1;
+    }
     ch->has_saved = load_session(ch);
 
     if (!(c = pdot_client_new(cfg->rpc, NULL))) {
@@ -784,7 +807,6 @@ fail:
     if (ch->bul)
         pdot_client_free(ch->bul);
     pdot_signer_wipe(&ch->player);
-    pdot_signer_wipe(&ch->op);
     pdot_signer_wipe(&ch->session);
     free(ch);
     return NULL;
@@ -810,20 +832,37 @@ static int valid_name(const char *name)
     return name[3] == '\0';
 }
 
-void chain_quote(chain *ch, uint32_t score)
+void chain_set_replay(chain *ch, const replay *r, uint32_t score)
 {
+    pdot_cid cid;
+
+    free(ch->replay);
+    ch->replay = replay_encode(r, &ch->replay_len);
+    ch->replay_cid[0] = '\0';
+    ch->score = score;
+    if (!ch->replay)
+        status(ch, 1, "this game is too long to replay: its score cannot be claimed");
+    else if (pdot_cid_compute(&cid, ch->replay, ch->replay_len) ||
+             pdot_cid_to_string(&cid, ch->replay_cid, sizeof ch->replay_cid))
+        ch->replay_cid[0] = '\0';
     if (ch->v.state != CHAIN_READY)
         return;
     ch->v.fee[0] = '\0';
-    queue(ch, J_QUOTE, score, "AAA");  /* any initials: the same length, the same fee */
+    /* any initials: the same length, the same fee */
+    queue_at(ch, J_QUOTE, score, "AAA", 0, ch->replay_cid, NULL, 0);
 }
 
-void chain_submit(chain *ch, uint32_t score, const char *name)
+void chain_submit(chain *ch, const char *name)
 {
+    uint8_t *copy = NULL;
+
     if (ch->v.state != CHAIN_READY || !valid_name(name))
         return;
-    status(ch, 0, "submitting %s's score %u...", name, score);
-    queue(ch, J_SUBMIT, score, name);
+    if (ch->replay && (copy = malloc(ch->replay_len)))
+        memcpy(copy, ch->replay, ch->replay_len);
+    status(ch, 0, "submitting %s's score %u...", name, ch->score);
+    queue_at(ch, J_SUBMIT, ch->score, name, 0, copy ? ch->replay_cid : "", copy,
+             copy ? ch->replay_len : 0);
 }
 
 void chain_close(chain *ch)
@@ -847,10 +886,10 @@ void chain_free(chain *ch)
     if (!ch)
         return;
     pdot_async_free(ch->a);  /* joins the worker, the only user of ch->bul */
+    free(ch->replay);
     if (ch->bul)
         pdot_client_free(ch->bul);
     pdot_signer_wipe(&ch->player);
-    pdot_signer_wipe(&ch->op);
     pdot_signer_wipe(&ch->session);
     free(ch);
 }

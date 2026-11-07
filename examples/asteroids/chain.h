@@ -11,14 +11,15 @@
 #include <pdot.h>
 
 #include "board.h"
+#include "replay.h"
 
-#define CHAIN_CID_STR_MAX 112  /* base32 text of any CID up to PDOT_CID_MAX bytes */
+#define CHAIN_CID_STR_MAX BOARD_CID_MAX
 
 typedef struct {
     const char *rpc;               /* Asset Hub */
     const char *bulletin_rpc;      /* Bulletin, for the leaderboard; NULL for none */
+    const char *operator_url;      /* asteroids-operator: claims scores; NULL for none */
     uint8_t     player_seed[32];   /* the player's account: signs to open and close the session */
-    uint8_t     operator_seed[32]; /* the game's account: owns the trophy collection */
     uint32_t    collection;        /* the trophy collection, owned by the operator */
     const char *fund;              /* native token sent to the session key, e.g. "1" */
     const char *session_file;      /* where the session key is kept between runs */
@@ -54,6 +55,7 @@ typedef struct {
     board    board;             /* the top 10, from the Bulletin chain */
     char     board_cid[CHAIN_CID_STR_MAX];
     int      has_bulletin;      /* a Bulletin node is configured */
+    int      has_operator;      /* an operator is configured */
 } chain_view;
 
 typedef struct chain chain;
@@ -64,11 +66,17 @@ chain *chain_open(const chain_config *cfg, char *err, size_t err_len);
 void chain_poll(chain *ch);
 const chain_view *chain_view_get(const chain *ch);
 
-/* What submitting this score would cost (fills view.fee). */
-void chain_quote(chain *ch, uint32_t score);
-/* Records the score and the player's initials (3 letters A-Z) on chain;
-   beating the record also mints a trophy. */
-void chain_submit(chain *ch, uint32_t score, const char *name);
+/*
+ * The game just ended with this score: keeps its replay (encoded, with its
+ * CID) for chain_submit and quotes the fee of recording it (view.fee).
+ */
+void chain_set_replay(chain *ch, const replay *r, uint32_t score);
+/*
+ * Records that score, its replay's CID and the player's initials (3 letters
+ * A-Z) on chain, then claims it with the operator, replay attached: a
+ * top-10 score goes on the board, a new record wins a trophy.
+ */
+void chain_submit(chain *ch, const char *name);
 
 /* Starts closing: leftover funds back to the player, proxy removed. */
 void chain_close(chain *ch);

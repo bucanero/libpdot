@@ -75,4 +75,11 @@ int pdot_verify_extrinsic(pdot_client *c, uint32_t number, const uint8_t tx_hash
                           uint8_t block_hash[32], uint32_t *index, uint8_t **events,
                           size_t *events_len);
 
+/*
+ * System.Events of final parachain block `number`, through a read proof
+ * against its header, reached from a relay-final head by parent hashes.
+ */
+int pdot_verify_block_events(pdot_client *c, uint32_t number, uint8_t block_hash[32],
+                             uint8_t **events, size_t *events_len);
+
 #endif

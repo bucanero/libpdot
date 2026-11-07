@@ -518,6 +518,28 @@ int pdot_tx_submit(pdot_client *c, const pdot_signer *s, const uint8_t *call, si
 int pdot_tx_fee(pdot_client *c, const pdot_signer *s, const uint8_t *call, size_t len,
                 const pdot_tx_options *o, pdot_fee *out);
 
+/*
+ * Remarks as attestations: System.remark_with_event(data) records an event
+ * with the dispatch origin and blake2_256(data), which anyone can check
+ * later from the block number alone.
+ */
+typedef struct {
+    pdot_final_block at;     /* the block searched; verified when proven */
+    uint32_t         index;  /* the extrinsic that made the remark */
+} pdot_remark;
+
+/*
+ * Looks in final block `block` for a System.Remarked event from sender over
+ * exactly data. The sender is the call's origin: through a proxy, the
+ * account acted for, not the proxy key. PDOT_E_NOTFOUND when the block has
+ * none, PDOT_E_INVALID when the block is not final yet. With a verifier the
+ * block's events are proven from relay-chain finality (PDOT_E_UNVERIFIED
+ * otherwise). Events are decoded with the client's current metadata, so
+ * blocks from before a runtime upgrade that changed them may not decode.
+ */
+int pdot_remark_find(pdot_client *c, uint32_t block, const uint8_t sender[32],
+                     const uint8_t *data, size_t len, pdot_remark *out);
+
 /* Transfers. "keep alive" ones fail rather than take the sender below the existential deposit. */
 #define PDOT_TRANSFER_NATIVE 0  /* Balances.transfer_keep_alive: amount of the native token */
 #define PDOT_TRANSFER_ASSET  1  /* Assets.transfer_keep_alive: amount of asset id */

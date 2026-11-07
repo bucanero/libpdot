@@ -3,14 +3,20 @@
  * through libpdot. The frame loop never waits on the network: chain work runs
  * in pdot_async (see chain.c) and the HUD shows how it is going.
  *
- *   asteroids [--rpc URL] [--bulletin URL|off] [--player SEED] [--operator SEED] [--collection N]
+ *   asteroids [--rpc URL] [--bulletin URL|off] [--operator URL|off] [--player SEED] [--collection N]
  *             [--fund AMOUNT] [--session FILE] [--metadata-hash on|off|SYM:DEC]
  *             [--relay URL --checkpoint FILE [--para-id N]] [--offline]
  *             [--screenshot FILE]
  *
- * Defaults suit devnet.sh: local Asset Hub and Bulletin dev nodes (the
- * leaderboard lives on Bulletin), //Alice as the player and //Bob as the
- * game's operator. Never pass a real key on the command line.
+ * Defaults suit devnet.sh and asteroids-operator: local Asset Hub and
+ * Bulletin dev nodes (the leaderboard lives on Bulletin), the operator on
+ * http://127.0.0.1:8090 and //Alice as the player. The game holds no
+ * operator key: the operator checks each score on chain before it updates
+ * the board or mints a trophy. Never pass a real key on the command line.
+ *
+ * The game itself is sim.c, stepped at a fixed 60 ticks a second; each
+ * tick's input is recorded, and the replay goes with the score so the
+ * operator can re-run the game (replay.h).
  *
  * Keys: arrows turn and thrust, space fires. At game over, type your initials
  * (or pick them with the arrows) and press enter to record the score; escape
@@ -25,218 +31,75 @@
 
 #include "chain.h"
 #include "font.h"
+#include "replay.h"
+#include "sim.h"
 
-#define W 960
-#define H 720
-#define MAX_ROCKS   64
-#define MAX_SHOTS   8
-#define ROCK_VERTS  11
-#define PI_F        3.14159265f
+#define W SIM_W
+#define H SIM_H
+#define PI_F SIM_PI
 
-/* //Alice and //Bob, the well-known dev keys (`subkey inspect //Alice`). */
+/* //Alice, the well-known dev key (`subkey inspect //Alice`). */
 static const char *DEV_PLAYER = "e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
-static const char *DEV_OPERATOR = "398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89";
-
-typedef struct { float x, y; } vec2;
-
-typedef struct {
-    vec2  p, v;
-    float angle, spin;
-    int   size;  /* 3 big, 2, 1 small; 0 free slot */
-    float shape[ROCK_VERTS];
-} rock;
-
-typedef struct {
-    vec2  p, v;
-    float life;
-} shot;
 
 enum { S_TITLE, S_PLAY, S_OVER, S_QUIT };
 
 typedef struct {
     int      state;
-    vec2     p, v;
-    float    angle;
-    float    invulnerable;  /* seconds */
-    float    fire_cooldown;
-    int      lives, level;
-    uint32_t score;
+    sim      s;             /* the game, or drifting rocks behind the menus */
+    replay   rec;           /* this game's inputs */
     int      submitted;     /* this game's score was sent */
     Uint32   quit_at;       /* when closing started */
     char     name[4];       /* initials for the score, kept between games */
     int      cursor;        /* the initial being edited, 0..2 */
-    rock     rocks[MAX_ROCKS];
-    shot     shots[MAX_SHOTS];
-    vec2     stars[80];
+    SDL_FPoint stars[80];
 } game;
 
+/* Rendering only: the game's own randomness is sim.c's. */
 static float frand(float lo, float hi)
 {
     return lo + (hi - lo) * (float)rand() / (float)RAND_MAX;
 }
 
-static float rock_radius(int size)
+/* Any seed will do: the replay carries it. */
+static uint32_t new_seed(void)
 {
-    return size == 3 ? 44.0f : size == 2 ? 24.0f : 12.0f;
-}
-
-static void wrap(vec2 *p)
-{
-    if (p->x < 0) p->x += W;
-    if (p->x >= W) p->x -= W;
-    if (p->y < 0) p->y += H;
-    if (p->y >= H) p->y -= H;
-}
-
-static void spawn_rock(game *g, vec2 p, int size)
-{
-    int i, k;
-    float speed = frand(30.0f, 70.0f) * (4 - size) * (1.0f + 0.1f * (float)g->level);
-    float dir = frand(0, 2 * PI_F);
-
-    for (i = 0; i < MAX_ROCKS && g->rocks[i].size; i++)
-        ;
-    if (i == MAX_ROCKS)
-        return;
-    g->rocks[i].p = p;
-    g->rocks[i].v.x = cosf(dir) * speed;
-    g->rocks[i].v.y = sinf(dir) * speed;
-    g->rocks[i].angle = 0;
-    g->rocks[i].spin = frand(-1.5f, 1.5f);
-    g->rocks[i].size = size;
-    for (k = 0; k < ROCK_VERTS; k++)
-        g->rocks[i].shape[k] = frand(0.7f, 1.15f);
-}
-
-static void start_level(game *g)
-{
-    int i;
-    for (i = 0; i < 3 + g->level; i++) {
-        vec2 p;
-        do {  /* not on top of the ship */
-            p.x = frand(0, W);
-            p.y = frand(0, H);
-        } while (fabsf(p.x - g->p.x) < 150 && fabsf(p.y - g->p.y) < 150);
-        spawn_rock(g, p, 3);
-    }
-}
-
-static void reset_ship(game *g)
-{
-    g->p.x = W / 2.0f;
-    g->p.y = H / 2.0f;
-    g->v.x = g->v.y = 0;
-    g->angle = -PI_F / 2;
-    g->invulnerable = 2.5f;
+    return (uint32_t)SDL_GetPerformanceCounter() ^ ((uint32_t)rand() << 16) ^ (uint32_t)rand();
 }
 
 static void new_game(game *g)
 {
-    memset(g->rocks, 0, sizeof g->rocks);
-    memset(g->shots, 0, sizeof g->shots);
-    g->lives = 3;
-    g->level = 0;
-    g->score = 0;
+    uint32_t seed = new_seed();
+    sim_new(&g->s, seed);
+    replay_begin(&g->rec, seed);
     g->submitted = 0;
-    reset_ship(g);
-    start_level(g);
     g->state = S_PLAY;
 }
 
-static int rocks_left(const game *g)
+static uint8_t read_input(const Uint8 *keys)
 {
-    int i, n = 0;
-    for (i = 0; i < MAX_ROCKS; i++)
-        n += g->rocks[i].size != 0;
-    return n;
+    return (uint8_t)((keys[SDL_SCANCODE_LEFT] ? SIM_LEFT : 0) |
+                     (keys[SDL_SCANCODE_RIGHT] ? SIM_RIGHT : 0) |
+                     (keys[SDL_SCANCODE_UP] ? SIM_THRUST : 0) |
+                     (keys[SDL_SCANCODE_SPACE] ? SIM_FIRE : 0));
 }
 
-static void update(game *g, const Uint8 *keys, float dt, chain *ch)
+/* One fixed tick: the game while playing, drifting rocks otherwise. */
+static void tick(game *g, const Uint8 *keys, chain *ch)
 {
-    int i, j;
+    uint8_t input;
 
-    if (keys[SDL_SCANCODE_LEFT])
-        g->angle -= 4.0f * dt;
-    if (keys[SDL_SCANCODE_RIGHT])
-        g->angle += 4.0f * dt;
-    if (keys[SDL_SCANCODE_UP]) {
-        g->v.x += cosf(g->angle) * 300.0f * dt;
-        g->v.y += sinf(g->angle) * 300.0f * dt;
+    if (g->state != S_PLAY) {
+        sim_drift(&g->s);
+        return;
     }
-    g->v.x *= 1.0f - 0.4f * dt;
-    g->v.y *= 1.0f - 0.4f * dt;
-    g->p.x += g->v.x * dt;
-    g->p.y += g->v.y * dt;
-    wrap(&g->p);
-    if (g->invulnerable > 0)
-        g->invulnerable -= dt;
-
-    g->fire_cooldown -= dt;
-    if (keys[SDL_SCANCODE_SPACE] && g->fire_cooldown <= 0) {
-        for (i = 0; i < MAX_SHOTS && g->shots[i].life > 0; i++)
-            ;
-        if (i < MAX_SHOTS) {
-            g->shots[i].p.x = g->p.x + cosf(g->angle) * 14;
-            g->shots[i].p.y = g->p.y + sinf(g->angle) * 14;
-            g->shots[i].v.x = g->v.x + cosf(g->angle) * 520.0f;
-            g->shots[i].v.y = g->v.y + sinf(g->angle) * 520.0f;
-            g->shots[i].life = 1.0f;
-            g->fire_cooldown = 0.18f;
-        }
-    }
-    for (i = 0; i < MAX_SHOTS; i++) {
-        shot *s = &g->shots[i];
-        if (s->life <= 0)
-            continue;
-        s->life -= dt;
-        s->p.x += s->v.x * dt;
-        s->p.y += s->v.y * dt;
-        wrap(&s->p);
-    }
-
-    for (i = 0; i < MAX_ROCKS; i++) {
-        rock *r = &g->rocks[i];
-        float rad;
-        if (!r->size)
-            continue;
-        r->p.x += r->v.x * dt;
-        r->p.y += r->v.y * dt;
-        r->angle += r->spin * dt;
-        wrap(&r->p);
-        rad = rock_radius(r->size);
-        for (j = 0; j < MAX_SHOTS; j++) {
-            shot *s = &g->shots[j];
-            float dx = s->p.x - r->p.x, dy = s->p.y - r->p.y;
-            if (s->life > 0 && dx * dx + dy * dy < rad * rad) {
-                int size = r->size;
-                vec2 p = r->p;
-                s->life = 0;
-                r->size = 0;
-                g->score += size == 3 ? 20 : size == 2 ? 50 : 100;
-                if (size > 1) {
-                    spawn_rock(g, p, size - 1);
-                    spawn_rock(g, p, size - 1);
-                }
-                break;
-            }
-        }
-        if (r->size && g->invulnerable <= 0) {
-            float dx = g->p.x - r->p.x, dy = g->p.y - r->p.y;
-            if (dx * dx + dy * dy < (rad + 10) * (rad + 10)) {
-                if (--g->lives <= 0) {
-                    g->state = S_OVER;
-                    g->cursor = 0;
-                    if (ch)
-                        chain_quote(ch, g->score);
-                    return;
-                }
-                reset_ship(g);
-            }
-        }
-    }
-    if (!rocks_left(g)) {
-        g->level++;
-        start_level(g);
+    input = read_input(keys);
+    replay_add(&g->rec, input);
+    sim_step(&g->s, input);
+    if (g->s.over) {
+        g->state = S_OVER;
+        g->cursor = 0;
+        if (ch)
+            chain_set_replay(ch, &g->rec, g->s.score);
     }
 }
 
@@ -258,7 +121,7 @@ static void save_screenshot(SDL_Renderer *r, const char *path)
 
 /* ---- drawing ------------------------------------------------------------ */
 
-static void draw_ship(SDL_Renderer *r, const game *g, int thrust)
+static void draw_ship(SDL_Renderer *r, const sim *g, int thrust)
 {
     float c = cosf(g->angle), s = sinf(g->angle);
     static const float pts[][2] = { { 16, 0 }, { -10, -10 }, { -5, 0 }, { -10, 10 }, { 16, 0 } };
@@ -306,19 +169,19 @@ static void draw_life(SDL_Renderer *r, float x, float y, int filled)
     SDL_RenderDrawLinesF(r, p, 5);
 }
 
-static void draw_rock(SDL_Renderer *ren, const rock *r)
+static void draw_rock(SDL_Renderer *ren, const sim_rock *r)
 {
-    SDL_FPoint v[ROCK_VERTS + 1];
-    float rad = rock_radius(r->size);
+    SDL_FPoint v[SIM_VERTS + 1];
+    float rad = sim_rock_radius(r->size);
     int k;
 
-    for (k = 0; k <= ROCK_VERTS; k++) {
-        float a = r->angle + 2 * PI_F * (float)k / ROCK_VERTS;
-        float d = rad * r->shape[k % ROCK_VERTS];
+    for (k = 0; k <= SIM_VERTS; k++) {
+        float a = r->angle + 2 * PI_F * (float)k / SIM_VERTS;
+        float d = rad * r->shape[k % SIM_VERTS];
         v[k].x = r->p.x + cosf(a) * d;
         v[k].y = r->p.y + sinf(a) * d;
     }
-    SDL_RenderDrawLinesF(ren, v, ROCK_VERTS + 1);
+    SDL_RenderDrawLinesF(ren, v, SIM_VERTS + 1);
 }
 
 /* The bottom bar: chain state for everyone to see. */
@@ -438,8 +301,8 @@ static void draw_initials(SDL_Renderer *r, const game *g, const chain_view *v)
     snprintf(line, sizeof line, "ENTER: RECORD IT ON CHAIN (FEE %s)", v->fee[0] ? v->fee : "...");
     font_draw_centered(r, W / 2.0f, 488, 1.5f, line);
     {
-        int rank = v->board_state == 1 ? board_rank(&v->board, g->score) : 0;
-        int record = !v->has_record || g->score > v->record;
+        int rank = v->board_state == 1 ? board_rank(&v->board, g->s.score) : 0;
+        int record = !v->has_record || g->s.score > v->record;
         if (rank)
             snprintf(line, sizeof line, "NUMBER %d IN THE TOP 10%s", rank,
                      record ? ", AND A NEW RECORD: A TROPHY NFT" : "");
@@ -485,13 +348,12 @@ static void draw(SDL_Renderer *r, const game *g, const chain_view *v, int offlin
     SDL_SetRenderDrawColor(r, 4, 6, 12, 255);
     SDL_RenderClear(r);
     SDL_SetRenderDrawColor(r, 70, 80, 100, 255);
-    for (i = 0; i < 80; i++)
-        SDL_RenderDrawPointF(r, g->stars[i].x, g->stars[i].y);
+    SDL_RenderDrawPointsF(r, g->stars, 80);
 
     SDL_SetRenderDrawColor(r, 220, 220, 230, 255);
-    for (i = 0; i < MAX_ROCKS; i++)
-        if (g->rocks[i].size)
-            draw_rock(r, &g->rocks[i]);
+    for (i = 0; i < SIM_ROCKS; i++)
+        if (g->s.rocks[i].size)
+            draw_rock(r, &g->s.rocks[i]);
 
     switch (g->state) {
     case S_TITLE:
@@ -513,20 +375,20 @@ static void draw(SDL_Renderer *r, const game *g, const chain_view *v, int offlin
         break;
     case S_PLAY:
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-        for (i = 0; i < MAX_SHOTS; i++)
-            if (g->shots[i].life > 0)
-                SDL_RenderDrawPointF(r, g->shots[i].p.x, g->shots[i].p.y),
-                SDL_RenderDrawPointF(r, g->shots[i].p.x + 1, g->shots[i].p.y);
-        draw_ship(r, g, keys[SDL_SCANCODE_UP]);
-        snprintf(line, sizeof line, "%06u", g->score);
+        for (i = 0; i < SIM_SHOTS; i++)
+            if (g->s.shots[i].life > 0)
+                SDL_RenderDrawPointF(r, g->s.shots[i].p.x, g->s.shots[i].p.y),
+                SDL_RenderDrawPointF(r, g->s.shots[i].p.x + 1, g->s.shots[i].p.y);
+        draw_ship(r, &g->s, keys[SDL_SCANCODE_UP]);
+        snprintf(line, sizeof line, "%06u", g->s.score);
         font_draw(r, 16, 14, 2.0f, line);
         for (i = 0; i < 3; i++)  /* right to left: lost lives go hollow from the left */
-            draw_life(r, (float)(W - 24 - i * 26), 30, i < g->lives);
+            draw_life(r, (float)(W - 24 - i * 26), 30, i < g->s.lives);
         break;
     case S_OVER:
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
         font_draw_centered(r, W / 2.0f, 160, 4.0f, "GAME OVER");
-        snprintf(line, sizeof line, "SCORE %u", g->score);
+        snprintf(line, sizeof line, "SCORE %u", g->s.score);
         font_draw_centered(r, W / 2.0f, 240, 2.5f, line);
         SDL_SetRenderDrawColor(r, 120, 200, 255, 255);
         if (!offline) {
@@ -576,7 +438,7 @@ static int parse_seed(const char *hex, uint8_t out[32])
 static int usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--rpc URL] [--bulletin URL|off] [--player SEED] [--operator SEED] [--collection N]\n"
+            "usage: %s [--rpc URL] [--bulletin URL|off] [--operator URL|off] [--player SEED] [--collection N]\n"
             "          [--fund AMOUNT] [--session FILE] [--metadata-hash on|off|SYM:DEC]\n"
             "          [--relay URL --checkpoint FILE [--para-id N]] [--offline]\n",
             argv0);
@@ -586,7 +448,7 @@ static int usage(const char *argv0)
 int main(int argc, char **argv)
 {
     chain_config cfg;
-    const char *player = DEV_PLAYER, *op = DEV_OPERATOR;
+    const char *player = DEV_PLAYER;
     static game g;
     chain_view offline_view;
     chain *ch = NULL;
@@ -595,11 +457,13 @@ int main(int argc, char **argv)
     SDL_Window *win;
     SDL_Renderer *ren;
     Uint64 last;
+    double behind = 0;  /* simulated time owed to the clock, in seconds */
     char err[256];
 
     memset(&cfg, 0, sizeof cfg);
     cfg.rpc = "http://127.0.0.1:9944";
     cfg.bulletin_rpc = "http://127.0.0.1:9945";
+    cfg.operator_url = "http://127.0.0.1:8090";
     cfg.fund = "1";
     cfg.session_file = "asteroids-session.key";
     cfg.metadata_hash = "on";
@@ -615,7 +479,7 @@ int main(int argc, char **argv)
         if (strcmp(a, "--rpc") == 0) cfg.rpc = val;
         else if (strcmp(a, "--bulletin") == 0) cfg.bulletin_rpc = strcmp(val, "off") ? val : NULL;
         else if (strcmp(a, "--player") == 0) player = val;
-        else if (strcmp(a, "--operator") == 0) op = val;
+        else if (strcmp(a, "--operator") == 0) cfg.operator_url = strcmp(val, "off") ? val : NULL;
         else if (strcmp(a, "--collection") == 0) cfg.collection = (uint32_t)strtoul(val, NULL, 10);
         else if (strcmp(a, "--fund") == 0) cfg.fund = val;
         else if (strcmp(a, "--session") == 0) cfg.session_file = val;
@@ -627,7 +491,7 @@ int main(int argc, char **argv)
         else return usage(argv[0]);
         i++;
     }
-    if (parse_seed(player, cfg.player_seed) || parse_seed(op, cfg.operator_seed)) {
+    if (parse_seed(player, cfg.player_seed)) {
         fprintf(stderr, "error: seeds are 32 bytes of hex\n");
         return 2;
     }
@@ -661,20 +525,19 @@ int main(int argc, char **argv)
     }
     g.state = S_TITLE;
     memcpy(g.name, "AAA", 4);
-    reset_ship(&g);
-    start_level(&g);  /* drifting rocks behind the title */
+    sim_new(&g.s, new_seed());  /* drifting rocks behind the title */
 
     last = SDL_GetPerformanceCounter();
     while (running) {
         const Uint8 *keys = SDL_GetKeyboardState(NULL);
         const chain_view *v = ch ? chain_view_get(ch) : &offline_view;
         Uint64 now = SDL_GetPerformanceCounter();
-        float dt = (float)(now - last) / (float)SDL_GetPerformanceFrequency();
         SDL_Event e;
 
+        behind += (double)(now - last) / (double)SDL_GetPerformanceFrequency();
         last = now;
-        if (dt > 0.05f)
-            dt = 0.05f;
+        if (behind > 0.25)
+            behind = 0.25;  /* after a stall: slow down rather than jump */
         if (ch)
             chain_poll(ch);  /* chain callbacks run here, on the game thread */
 
@@ -702,26 +565,17 @@ int main(int argc, char **argv)
                     new_game(&g);
                 } else if ((k == SDLK_RETURN || k == SDLK_KP_ENTER) && can_submit) {
                     g.submitted = 1;
-                    chain_submit(ch, g.score, g.name);
+                    chain_submit(ch, g.name);
                 } else if (can_submit) {
                     edit_initials(&g, k);
                 }
             }
         }
 
-        if (g.state == S_PLAY) {
-            update(&g, keys, dt, ch);
-        } else {
-            int k;  /* rocks keep drifting behind the menus */
-            for (k = 0; k < MAX_ROCKS; k++) {
-                rock *r = &g.rocks[k];
-                if (!r->size)
-                    continue;
-                r->p.x += r->v.x * dt;
-                r->p.y += r->v.y * dt;
-                r->angle += r->spin * dt;
-                wrap(&r->p);
-            }
+        /* Fixed ticks, as many as the clock asks for: never the frame time. */
+        while (behind >= 1.0 / SIM_HZ) {
+            tick(&g, keys, ch);
+            behind -= 1.0 / SIM_HZ;
         }
         if (g.state == S_QUIT && v->state == CHAIN_CLOSED && !v->busy)
             running = 0;
@@ -741,6 +595,7 @@ int main(int argc, char **argv)
     }
 
     chain_free(ch);
+    replay_free(&g.rec);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
