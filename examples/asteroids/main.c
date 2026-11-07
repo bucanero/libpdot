@@ -24,7 +24,8 @@
  *
  * Keys: arrows turn and thrust, space fires. At game over, type your initials
  * (or pick them with the arrows) and press enter to record the score; escape
- * quits, closing the session on chain first.
+ * goes back to the title and its top 10. On the title, escape (or closing
+ * the window, anywhere) quits, closing the session on chain first.
  */
 #include <math.h>
 #include <stdio.h>
@@ -305,6 +306,28 @@ static void draw_board(SDL_Renderer *r, const chain_view *v)
 }
 
 /* Game over: the initials to record with the score, arcade style. */
+/* The submitted score: pending in a block first, then final and claimed. */
+static void draw_score_step(SDL_Renderer *r, const chain_view *v)
+{
+    static const char spin[] = "-/|\\";
+    char line[128];
+    int waiting = v->score_step == CHAIN_STEP_SENT || v->score_step == CHAIN_STEP_INCLUDED ||
+                  v->score_step == CHAIN_STEP_CLAIMING;
+
+    if (v->score_step == CHAIN_STEP_FAILED)
+        SDL_SetRenderDrawColor(r, 255, 110, 110, 255);
+    else if (v->score_step == CHAIN_STEP_INCLUDED)
+        SDL_SetRenderDrawColor(r, 255, 230, 120, 255);  /* pending: a reorg could drop it */
+    else if (v->score_step == CHAIN_STEP_DONE)
+        SDL_SetRenderDrawColor(r, 160, 255, 160, 255);
+    else
+        SDL_SetRenderDrawColor(r, 200, 200, 210, 255);
+    font_draw_centered(r, W / 2.0f, 384, 1.4f, "YOUR SCORE");
+    snprintf(line, sizeof line, "%s%s%c", v->score_text, waiting ? " " : "",
+             waiting ? spin[(SDL_GetTicks() / 120) % 4] : ' ');
+    font_draw_centered(r, W / 2.0f, 414, 1.4f, line);
+}
+
 static void draw_initials(SDL_Renderer *r, const game *g, const chain_view *v)
 {
     const float scale = 4.0f, step = 64.0f, x0 = W / 2.0f - step;
@@ -460,9 +483,11 @@ static void draw(SDL_Renderer *r, const game *g, const chain_view *v, int offlin
             draw_record(r, v, 300);
             if (!g->submitted && v->state == CHAIN_READY)
                 draw_initials(r, g, v);
+            else if (g->submitted && v->score_step != CHAIN_STEP_NONE)
+                draw_score_step(r, v);
         }
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-        font_draw_centered(r, W / 2.0f, 590, 1.5f, "SPACE: PLAY AGAIN   ESC: QUIT");
+        font_draw_centered(r, W / 2.0f, 590, 1.5f, "SPACE: PLAY AGAIN   ESC: TOP 10");
         break;
     case S_QUIT:
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
@@ -612,8 +637,9 @@ int main(int argc, char **argv)
                        (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE);
             if (e.type == SDL_KEYDOWN && e.key.repeat) {
                 continue;
-            } else if (quit && g.state == S_WATCH) {
-                g.state = S_TITLE;  /* back from the replay, not a quit */
+            } else if (quit && e.type == SDL_KEYDOWN && (g.state == S_WATCH || g.state == S_OVER)) {
+                /* escape from a replay or the game over: back to the title and its top 10 */
+                g.state = S_TITLE;
                 sim_new(&g.s, new_seed());
             } else if (quit) {
                 if (!ch) {

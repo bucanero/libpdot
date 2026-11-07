@@ -77,6 +77,21 @@ int pdot_client_metadata_hash(pdot_client *c, uint8_t out[32]);
 /* 1 when pdot_async asks the job running on c to stop (cancel or free). */
 int pdot_client_cancelled(pdot_client *c);
 
+struct pdot_tx_result;
+/*
+ * Optional: fn(ud, where) runs once per transaction submitted through c
+ * (pdot_tx_submit and every call built on it), as soon as the transaction
+ * is in a best block, before that block is final: where has tx_hash,
+ * block, block_hash and index set, nothing else. Never proven, and a reorg
+ * can still drop it; the call keeps waiting for finality and reports as
+ * usual. For progress displays: inclusion takes a block or two, finality
+ * tens of seconds more. Costs a few more RPC requests while waiting. NULL
+ * turns it off. With pdot_async, use pdot_async_set_included_fn instead.
+ */
+void pdot_client_set_included_fn(pdot_client *c,
+                                 void (*fn)(void *ud, const struct pdot_tx_result *where),
+                                 void *ud);
+
 /* The chain's native token symbol and decimals, from the node's system_properties. */
 int pdot_client_token(pdot_client *c, char *symbol, size_t cap, uint8_t *decimals);
 
@@ -205,7 +220,7 @@ typedef struct {
 #define PDOT_DISPATCH_OK        1
 
 /* Where a submitted transaction landed in a finalized block, and how it went. */
-typedef struct {
+typedef struct pdot_tx_result {
     uint8_t  tx_hash[32];
     uint8_t  block_hash[32];
     uint32_t block;
@@ -668,6 +683,19 @@ void pdot_async_set_checkpoint_fn(pdot_async *a,
  * are waiting, for loops that sleep instead of polling every frame.
  */
 void pdot_async_set_wake(pdot_async *a, void (*wake)(void *ud), void *ud);
+
+/*
+ * Optional: fn(ud, job, job_ud, where) runs inside pdot_async_poll whenever
+ * a job's transaction is in a best block, before the job's own callback
+ * (see pdot_client_set_included_fn: not proven, not final yet). job and
+ * job_ud are the job's id and user data; a job that submits several
+ * transactions reports each. Takes effect from the next job on; NULL turns
+ * it off.
+ */
+void pdot_async_set_included_fn(pdot_async *a,
+                                void (*fn)(void *ud, uint64_t job, void *job_ud,
+                                           const pdot_tx_result *where),
+                                void *ud);
 
 /*
  * Cancels a queued or running job (its callback gets PDOT_E_CANCELLED) or

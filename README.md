@@ -331,6 +331,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 - **Cancel** with `pdot_async_cancel(a, id)`. A queued job never runs; a running one stops at its next network call or wait. A store may still land on chain.
 - **Watches** live on a second thread with their own connection. Each new final block triggers one batched read of every watched key (one proof with a verifier), and a callback runs only when a value changed. A failed read is reported once and retried. New blocks are announced over a WebSocket subscription (`chain_subscribeFinalizedHeads`, on the relay chain when verifying) if libcurl supports WebSockets, and found by polling every 2 s otherwise.
 - **Wake-ups**: `pdot_async_set_wake` lets a loop that sleeps be woken when results are waiting.
+- **Pending transactions**: a transaction is in a block within seconds, but final (and proven) only tens of seconds later. `pdot_async_set_included_fn` reports each job's transaction as soon as it is in a best block, inside `pdot_async_poll` and before the job's own callback, so a game can show "in block N, waiting for finality" right away. It is not proven and a reorg can still drop it; the job's callback has the final word. `pdot_client_set_included_fn` does the same for blocking calls.
 - **Checkpoints**: jobs and watches verify on separate connections but share their progress, so a validator-set change is walked once. `pdot_async_checkpoint` returns the newest checkpoint; save it before `pdot_async_free`. A long-running app can also pass a function to `pdot_async_set_checkpoint_fn`, which runs inside `pdot_async_poll` whenever the checkpoint advances. `pdot-bulletin watch` saves `--checkpoint` that way.
 - `pdot_async_run(a, work, done, ud)` runs any blocking libpdot code of your own on the worker.
 
@@ -349,10 +350,10 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
 | Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_stored`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
 | Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
-| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit`, `pdot_remark_find` |
+| Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_client_set_included_fn`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit`, `pdot_remark_find` |
 | Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |
 | Amounts | `pdot_u128_format`, `pdot_u128_parse`, `pdot_u128_to_double` |
-| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_checkpoint`, `pdot_async_set_checkpoint_fn`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
+| Non-blocking | `pdot_async_new`, `pdot_async_free`, `pdot_async_poll`, `pdot_async_cancel`, `pdot_async_set_wake`, `pdot_async_set_included_fn`, `pdot_async_checkpoint`, `pdot_async_set_checkpoint_fn`, `pdot_async_run`, `pdot_client_cancelled`, and `pdot_async_` versions of the store, renew, fetch, verify, read, submit, fee, transfer and proxies calls |
 | Watches | `pdot_async_watch_head`, `pdot_async_watch_storage`, `pdot_async_watch_balance`, `pdot_async_watch_asset_balance`, `pdot_async_watch_nft_item` |
 
 ### Things to know

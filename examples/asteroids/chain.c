@@ -63,6 +63,7 @@ struct chain {
     pdot_u128    session_free;
     uint8_t     *watch;          /* a fetched replay, until chain_take_watch */
     size_t       watch_len;
+    unsigned     game;           /* counts chain_set_replay calls: whose score_step it is */
     chain_view   v;
 };
 
@@ -99,6 +100,11 @@ struct job {
     size_t         replay_len;
     char           msg[256];    /* Bulletin and operator errors (the done callback
                                    only sees Asset Hub's) */
+    unsigned       game;        /* submit, claim: chain->game when submitted */
+    uint32_t       included;    /* game thread: the best block its last transaction is in */
+    int            reports;     /* game thread: included reports so far */
+    int            cleanup_txs; /* open: cleanup transactions before the new key's, set
+                                   before any is submitted */
 };
 
 #if defined(__GNUC__)
@@ -112,6 +118,22 @@ static void status(chain *ch, int error, const char *fmt, ...)
     va_end(ap);
     ch->v.status_error = error;
     fprintf(stderr, "[chain] %s\n", ch->v.status);
+}
+
+/* The score step, if j is about the game the player is looking at. */
+#if defined(__GNUC__)
+__attribute__((format(printf, 4, 5)))
+#endif
+static void score_step(chain *ch, const struct job *j, int step, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (j->game != ch->game)
+        return;
+    ch->v.score_step = step;
+    va_start(ap, fmt);
+    vsnprintf(ch->v.score_text, sizeof ch->v.score_text, fmt, ap);
+    va_end(ap);
 }
 
 /* At most 6 decimals: enough for fees, short enough for the HUD. */
@@ -237,6 +259,7 @@ static int work_open(pdot_client *c, void *ud)
             return 0;
         }
         j->cleaned = 1;
+        j->cleanup_txs = bal.exists + listed;
         if (bal.exists) {
             memset(&t, 0, sizeof t);
             t.kind = PDOT_TRANSFER_ALL;
@@ -459,7 +482,16 @@ static int work_close_funds(pdot_client *c, void *ud)
 {
     struct job *j = ud;
     pdot_transfer t;
+    pdot_balance bal;
+    int rc;
 
+    /* An earlier run's transfer may have landed since: nothing to return. */
+    if ((rc = pdot_balance_get(c, j->ch->session.account_id, &bal)))
+        return rc;
+    if (!bal.exists) {
+        j->cleaned = 1;
+        return 0;
+    }
     memset(&t, 0, sizeof t);
     t.kind = PDOT_TRANSFER_ALL;
     memcpy(t.dest, j->ch->player.account_id, 32);
@@ -514,6 +546,41 @@ static void refresh_trophies(chain *ch)
         ch->v.busy++;
 }
 
+/*
+ * A job's transaction is in a best block: shown at once as pending, while
+ * the job waits for finality (and its proof) before its done callback.
+ */
+static void on_included(void *ud, uint64_t id, void *job_ud, const pdot_tx_result *where)
+{
+    chain *ch = ud;
+    struct job *j = job_ud;
+    const char *wait = ch->v.proven ? "waiting for finality and its proof" : "waiting for finality";
+
+    (void)id;
+    j->included = where->block;
+    j->reports++;
+    switch (j->kind) {
+    case J_OPEN:
+        status(ch, 0, "%s in block %u; %s...",
+               j->reports <= j->cleanup_txs ? "last session's cleanup" : "new session key",
+               where->block, wait);
+        break;
+    case J_SUBMIT:
+        status(ch, 0, "%s's score %u is in block %u; %s...", j->name, j->score, where->block,
+               wait);
+        score_step(ch, j, CHAIN_STEP_INCLUDED, "IN BLOCK %u, WAITING FOR FINALITY", where->block);
+        break;
+    case J_CLOSE_FUNDS:
+        status(ch, 0, "leftover funds in block %u; %s...", where->block, wait);
+        break;
+    case J_CLOSE_PROXY:
+        status(ch, 0, "proxy removal in block %u; %s...", where->block, wait);
+        break;
+    default:
+        break;
+    }
+}
+
 static void job_done(void *ud, int rc, const char *error, const void *result)
 {
     struct job *j = ud;
@@ -559,14 +626,8 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
             status(ch, 0, "last session cleaned up; new session key ready (%s)", tx);
         else
             status(ch, 0, "session key ready (%s)", tx);
-        if (ch->close_pending) {
+        if (ch->close_pending)
             chain_close(ch);
-            break;
-        }
-        queue(ch, J_RECORD, 0, NULL);
-        if (ch->bul)
-            queue(ch, J_BOARD, 0, NULL);
-        refresh_trophies(ch);
         break;
     case J_RECORD:
         if (rc) {
@@ -591,26 +652,50 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         break;
     case J_SUBMIT:
         if (rc) {
-            status(ch, 1, "score not recorded: %s", rc == PDOT_E_DISPATCH ? j->tx.error : error);
+            /* In a best block once, then dropped, failed or not provable. */
+            char was[48] = "";
+            if (j->included)
+                snprintf(was, sizeof was, " (it was in block %u)", j->included);
+            status(ch, 1, "score not recorded%s: %s", was,
+                   rc == PDOT_E_DISPATCH ? j->tx.error : error);
+            score_step(ch, j, CHAIN_STEP_FAILED, "NOT RECORDED%s",
+                       j->included ? ": DROPPED OR FAILED AFTER ITS BLOCK" : "");
             break;
         }
         status(ch, 0, "%s's score %u recorded: %s", j->name, j->score, tx);
+        score_step(ch, j, CHAIN_STEP_DONE, "RECORDED IN BLOCK %u%s", j->tx.block,
+                   j->tx.verified ? ", PROVEN" : "");
         /* The operator decides on the newest board; a stale one only gates the claim. */
         if (ch->operator_url[0] &&
             (ch->v.board_state != 1 || board_rank(&ch->v.board, j->score) ||
              !ch->v.has_record || j->score > ch->v.record)) {
+            struct job *claim;
             status(ch, 0, "%s's score %u recorded (%s); claiming it with the operator...",
                    j->name, j->score, tx);
-            queue_at(ch, J_CLAIM, j->score, j->name, j->tx.block, j->replay_cid, j->replay,
-                     j->replay_len);
+            claim = queue_at(ch, J_CLAIM, j->score, j->name, j->tx.block, j->replay_cid,
+                             j->replay, j->replay_len);
             j->replay = NULL;  /* the claim owns it now */
+            if (claim) {
+                claim->game = j->game;
+                score_step(ch, j, CHAIN_STEP_CLAIMING,
+                           "RECORDED IN BLOCK %u%s; OPERATOR CHECKING", j->tx.block,
+                           j->tx.verified ? ", PROVEN" : "");
+            }
         }
         break;
     case J_CLAIM:
         if (rc) {
             status(ch, 1, "score not claimed: %s", j->msg[0] ? j->msg : error);
+            score_step(ch, j, CHAIN_STEP_FAILED, "RECORDED, BUT THE OPERATOR REFUSED IT");
             break;
         }
+        if (j->new_record)
+            score_step(ch, j, CHAIN_STEP_DONE, "NEW RECORD: TROPHY %u%s", j->item,
+                       j->rank ? " AND ON THE BOARD" : "");
+        else if (j->rank)
+            score_step(ch, j, CHAIN_STEP_DONE, "NUMBER %d ON THE BOARD", j->rank);
+        else
+            score_step(ch, j, CHAIN_STEP_DONE, "RECORDED; THE TOP 10 MOVED ON");
         if (j->new_record)
             status(ch, 0, "new record! trophy %u minted%s%s", j->item,
                    j->rank ? ", and on the leaderboard" : "",
@@ -654,6 +739,8 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         ch->funds_returned = rc == 0;
         if (rc)
             status(ch, 1, "funds not returned: %s", rc == PDOT_E_DISPATCH ? j->tx.error : error);
+        else if (j->cleaned)
+            status(ch, 0, "no funds left on the session key: already returned");
         else
             status(ch, 0, "leftover funds returned (%s)", tx);
         queue(ch, J_CLOSE_PROXY, 0, NULL);
@@ -842,7 +929,14 @@ chain *chain_open(const chain_config *cfg, char *err, size_t err_len)
     c = NULL;  /* owned by ch->a */
     if (ch->v.proven)
         pdot_async_set_checkpoint_fn(ch->a, save_checkpoint, ch);
+    pdot_async_set_included_fn(ch->a, on_included, ch);
     pdot_async_watch_head(ch->a, on_head, ch);
+    /* Reads first: they take milliseconds, while opening the session waits
+       for a transaction (proven, half a minute or more). */
+    queue(ch, J_RECORD, 0, NULL);
+    if (ch->bul)
+        queue(ch, J_BOARD, 0, NULL);
+    refresh_trophies(ch);
     status(ch, 0, ch->has_saved ? "checking the session saved by the last run"
                                 : "opening a session: the player adds a session key");
     queue(ch, J_OPEN, 0, NULL);
@@ -883,6 +977,9 @@ void chain_set_replay(chain *ch, const replay *r, uint32_t score)
 {
     pdot_cid cid;
 
+    ch->game++;  /* a new game: earlier scores no longer drive score_step */
+    ch->v.score_step = CHAIN_STEP_NONE;
+    ch->v.score_text[0] = '\0';
     free(ch->replay);
     ch->replay = replay_encode(r, &ch->replay_len);
     ch->replay_cid[0] = '\0';
@@ -902,14 +999,19 @@ void chain_set_replay(chain *ch, const replay *r, uint32_t score)
 void chain_submit(chain *ch, const char *name)
 {
     uint8_t *copy = NULL;
+    struct job *j;
 
     if (ch->v.state != CHAIN_READY || !valid_name(name))
         return;
     if (ch->replay && (copy = malloc(ch->replay_len)))
         memcpy(copy, ch->replay, ch->replay_len);
     status(ch, 0, "submitting %s's score %u...", name, ch->score);
-    queue_at(ch, J_SUBMIT, ch->score, name, 0, copy ? ch->replay_cid : "", copy,
-             copy ? ch->replay_len : 0);
+    j = queue_at(ch, J_SUBMIT, ch->score, name, 0, copy ? ch->replay_cid : "", copy,
+                 copy ? ch->replay_len : 0);
+    if (j) {
+        j->game = ch->game;
+        score_step(ch, j, CHAIN_STEP_SENT, "SENT, WAITING FOR A BLOCK");
+    }
 }
 
 void chain_watch(chain *ch, const char *cid)

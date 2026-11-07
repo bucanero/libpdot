@@ -169,6 +169,15 @@ int pdot_client_wait(pdot_client *c, unsigned ms)
     return pdot_client_stopped(c) ? PDOT_E_CANCELLED : 0;
 }
 
+void pdot_client_set_included_fn(pdot_client *c,
+                                 void (*fn)(void *ud, const pdot_tx_result *where), void *ud)
+{
+    if (c) {
+        c->included = fn;
+        c->included_ud = fn ? ud : NULL;
+    }
+}
+
 void pdot_client_set_stop(pdot_client *c, int (*stop)(void *), void *ud)
 {
     c->stop = stop;

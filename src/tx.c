@@ -333,15 +333,28 @@ static int prove_outcome(pdot_client *c, const pdot_tx_params *p, pdot_tx_result
     return rc;
 }
 
+/* The included hook gets where the transaction is, not how it went. */
+static void report_included(pdot_client *c, const pdot_tx_result *found)
+{
+    pdot_tx_result where;
+
+    memset(&where, 0, sizeof where);
+    memcpy(where.tx_hash, found->tx_hash, 32);
+    memcpy(where.block_hash, found->block_hash, 32);
+    where.block = found->block;
+    where.index = found->index;
+    c->included(c->included_ud, &where);
+}
+
 int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
                          const uint8_t *xt, size_t len, pdot_tx_result *out,
                          pdot_ext_outcome *oc)
 {
     pdot_ext_outcome local;
     uint8_t node_hash[32], head[32];
-    uint32_t next = p->era_block + 1, finalized;
+    uint32_t next = p->era_block + 1, finalized, best, best_next = next;
     uint32_t last = p->era_block + (p->era_period ? p->era_period : PDOT_ERA_PERIOD);
-    int rc, found;
+    int rc, found, seen = !c->included;
 
     memset(out, 0, sizeof *out);
     pdot_blake2b_256(out->tx_hash, xt, len);
@@ -365,12 +378,35 @@ int pdot_tx_submit_watch(pdot_client *c, const pdot_tx_params *p,
         for (; next <= finalized; next++) {
             if ((rc = find_in_block(c, next, out->tx_hash, len, out, &found)))
                 return rc;
-            if (found)
+            if (found) {
+                if (!seen)  /* final before a best-block scan saw it */
+                    report_included(c, out);
                 return c->verifier ? prove_outcome(c, p, out, oc ? oc : &local)
                                    : read_outcome(c, p, out, oc ? oc : &local);
+            }
             if (next >= last)
                 return pdot_fail(c, PDOT_E_TIMEOUT,
                                  "not included by block %u (mortality window)", last);
+        }
+        /* Best blocks past the final one, for the included hook. A block a
+           reorg replaces is not looked at again: finality decides anyway. */
+        if (!seen) {
+            if ((rc = pdot_rpc_best_number(c, &best)))
+                return rc;
+            if (best_next < next)
+                best_next = next;
+            for (; !seen && best_next <= best; best_next++) {
+                pdot_tx_result where;
+
+                memset(&where, 0, sizeof where);
+                memcpy(where.tx_hash, out->tx_hash, 32);
+                if ((rc = find_in_block(c, best_next, out->tx_hash, len, &where, &found)))
+                    return rc;
+                if (found) {
+                    seen = 1;
+                    report_included(c, &where);
+                }
+            }
         }
         if ((rc = pdot_client_wait(c, c->poll_ms)))
             return pdot_fail(c, rc, "cancelled");

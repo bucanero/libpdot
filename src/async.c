@@ -30,7 +30,7 @@
 #define WS_HEARTBEAT_MS 30000  /* read anyway this often while subscribed */
 #define WS_RETRY_S      30     /* after a WebSocket failure, poll this long first */
 
-enum { IT_JOB, IT_PROGRESS, IT_EVENT };
+enum { IT_JOB, IT_PROGRESS, IT_EVENT, IT_INCLUDED };
 
 union result {
     pdot_store_result   store;
@@ -81,9 +81,12 @@ struct item {
     uint8_t           proxy_for[32];
     pdot_transfer     transfer;
 
-    /* Progress report. */
+    /* Progress report; tx is also where an IT_INCLUDED transaction is. */
     size_t            index, total;
     pdot_tx_result    tx;
+    void            (*included)(void *ud, uint64_t job, void *job_ud,
+                                const pdot_tx_result *where);
+    void             *job_ud;
 };
 
 struct watch {
@@ -124,6 +127,9 @@ struct pdot_async {
     uint64_t      next_id;
     void        (*wake)(void *ud);
     void         *wake_ud;
+    void        (*included)(void *ud, uint64_t job, void *job_ud, const pdot_tx_result *where);
+    void         *included_ud;
+    struct item  *current;  /* the running job, for included reports (worker only) */
 
     /* The furthest verifier checkpoint either thread reached; NULL: no verifier. */
     uint8_t      *ck;
@@ -192,6 +198,10 @@ static void deliver(struct item *it)
 {
     if (it->kind == IT_PROGRESS) {
         it->progress(it->ud, it->index, it->total, &it->cid, &it->tx, it->rc);
+        return;
+    }
+    if (it->kind == IT_INCLUDED) {
+        it->included(it->ud, it->id, it->job_ud, &it->tx);
         return;
     }
     if (it->done)
@@ -272,6 +282,27 @@ static int worker_stop(void *ud)
     return stop;
 }
 
+/* The client's included hook on the worker: queued for pdot_async_poll. */
+static void on_included(void *ud, const pdot_tx_result *where)
+{
+    pdot_async *a = ud;
+    struct item *job = a->current, *it;
+    void (*fn)(void *, uint64_t, void *, const pdot_tx_result *);
+    void *fn_ud;
+
+    pdot_mutex_lock(&a->lock);
+    fn = a->included;
+    fn_ud = a->included_ud;
+    pdot_mutex_unlock(&a->lock);
+    if (!fn || !job || !(it = new_item(a, IT_INCLUDED, NULL, fn_ud)))
+        return;
+    it->included = fn;
+    it->id = job->id;
+    it->job_ud = job->ud;
+    it->tx = *where;
+    finish(a, it);
+}
+
 static void worker_main(void *arg)
 {
     pdot_async *a = arg;
@@ -292,8 +323,10 @@ static void worker_main(void *arg)
         it->next = NULL;
         a->running = it->id;
         a->cancel_running = 0;
+        pdot_client_set_included_fn(a->c, a->included ? on_included : NULL, a);
         pdot_mutex_unlock(&a->lock);
 
+        a->current = it;
         a->c->err[0] = '\0';
         ck_catch_up(a, a->c);
         rc = it->work(a->c, it);
@@ -306,6 +339,7 @@ static void worker_main(void *arg)
         pdot_signer_wipe(&it->signer);
         free(it->data);
         it->data = NULL;
+        a->current = NULL;
 
         pdot_mutex_lock(&a->lock);
         a->running = 0;
@@ -839,6 +873,19 @@ void pdot_async_set_wake(pdot_async *a, void (*wake)(void *ud), void *ud)
     pdot_mutex_lock(&a->lock);
     a->wake = wake;
     a->wake_ud = ud;
+    pdot_mutex_unlock(&a->lock);
+}
+
+void pdot_async_set_included_fn(pdot_async *a,
+                                void (*fn)(void *ud, uint64_t job, void *job_ud,
+                                           const pdot_tx_result *where),
+                                void *ud)
+{
+    if (!a)
+        return;
+    pdot_mutex_lock(&a->lock);
+    a->included = fn;
+    a->included_ud = fn ? ud : NULL;
     pdot_mutex_unlock(&a->lock);
 }
 

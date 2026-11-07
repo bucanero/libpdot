@@ -31,6 +31,20 @@ typedef struct {
 
 enum { CHAIN_OPENING, CHAIN_READY, CHAIN_FAILED, CHAIN_CLOSING, CHAIN_CLOSED };
 
+/*
+ * Where the newest submitted score is. A transaction is in a best block
+ * within seconds, final (and proven) tens of seconds later: the game shows
+ * both, the first as pending only, since a reorg could still drop it.
+ */
+enum {
+    CHAIN_STEP_FAILED = -1,
+    CHAIN_STEP_NONE,      /* nothing submitted for this game */
+    CHAIN_STEP_SENT,      /* submitted, not in a block yet */
+    CHAIN_STEP_INCLUDED,  /* in a best block: pending finality */
+    CHAIN_STEP_CLAIMING,  /* final (proven with a verifier), the operator is checking it */
+    CHAIN_STEP_DONE       /* final, and claimed if it was worth claiming */
+};
+
 typedef struct {
     int      state;             /* CHAIN_* */
     char     symbol[16];
@@ -57,6 +71,8 @@ typedef struct {
     int      has_bulletin;      /* a Bulletin node is configured */
     int      has_operator;      /* an operator is configured */
     int      watch_state;       /* replay fetch: 0 none, 1 fetching, 2 ready, -1 failed */
+    int      score_step;        /* CHAIN_STEP_*, for the game chain_set_replay last named */
+    char     score_text[96];    /* that step, for the game-over screen */
 } chain_view;
 
 typedef struct chain chain;

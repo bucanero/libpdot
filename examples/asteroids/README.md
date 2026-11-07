@@ -19,8 +19,12 @@ its replay and checks the score on chain before it acts on it.
   score would cost (`pdot_tx_fee`). Enter sends
   `System.remark_with_event("pdot-asteroids score=N name=ABC replay=CID")`
   from the session key, acting for the player. The CID is the replay's
-  (`pdot_cid_compute`), so the score commits to the game that made it. All chain work runs on `pdot_async`, and the HUD
-  shows the result: block, fee paid, and whether it was proven.
+  (`pdot_cid_compute`), so the score commits to the game that made it. All chain work runs on `pdot_async`. Every
+  transaction shows up in two steps: "in block N, waiting for finality"
+  within seconds (`pdot_async_set_included_fn`, pending, since a reorg could
+  still drop it), then the result once final: block, fee paid, and whether
+  it was proven. The game-over screen follows the score the same way, on to
+  the operator's answer.
 - **A top-10 leaderboard on the Bulletin chain.** The board is a small JSON
   document (see [`board.h`](board.h)) stored on Bulletin. The trophy
   collection's `board` attribute on Asset Hub holds its CID. The title

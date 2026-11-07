@@ -608,6 +608,19 @@ static void forged(int f, const uint8_t *ck, size_t ck_len, const pdot_cid *cid)
     pdot_client_free(c);
 }
 
+/* The included hook's calls during the last submit_tx. */
+static struct {
+    int n;
+    pdot_tx_result where;
+} included;
+
+static void on_included(void *ud, const pdot_tx_result *where)
+{
+    (void)ud;
+    included.n++;
+    included.where = *where;
+}
+
 /* Submits the recorded transaction to the fake node and waits for its result. */
 static int submit_tx(int f, const uint8_t *ck, size_t ck_len, pdot_tx_result *out)
 {
@@ -621,6 +634,8 @@ static int submit_tx(int f, const uint8_t *ck, size_t ck_len, pdot_tx_result *ou
     set(&srv.forge, f);
     memset(&p, 0, sizeof p);
     memset(out, 0, sizeof *out);
+    memset(&included, 0, sizeof included);
+    pdot_client_set_included_fn(c, on_included, NULL);
     if (!(rc = pdot_chain_sync(c)) &&
         !(rc = pdot_hex_decode_alloc(x->valuestring, &xt, &len))) {
         p.md = c->md;
@@ -778,6 +793,11 @@ int main(void)
             CHECK(rc == 0 && r.verified && r.block == srv.tx_number &&
                   r.index == (uint32_t)srv.tx_index && r.dispatch == PDOT_DISPATCH_OK &&
                   memcmp(r.block_hash, blk->hash, 32) == 0);
+            /* final at once: the included hook still runs, once, before the result */
+            CHECK(included.n == 1 && included.where.block == r.block &&
+                  included.where.index == r.index && !included.where.verified &&
+                  memcmp(included.where.tx_hash, r.tx_hash, 32) == 0 &&
+                  memcmp(included.where.block_hash, blk->hash, 32) == 0);
         }
         printf("  tx: proven in Bulletin #%u at index %u, dispatch ok%s\n", r.block, r.index,
                r.has_fee ? ", fee from its event" : "");
