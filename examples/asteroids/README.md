@@ -42,8 +42,18 @@ its replay and checks the score on chain before it acts on it.
   `board` and `best` attributes go in one `Utility.batch_all`, all or
   nothing. Each remark is honoured once.
 - **Anyone can check the board.** `asteroids-operator --audit` needs no key:
-  it fetches every entry's replay from Bulletin (checked against its CID)
-  and re-runs it to the score.
+  it fetches every entry's replay from Bulletin (checked against its CID),
+  re-runs it to the score, and shows when each item expires
+  (`pdot_bulletin_stored`).
+- **Watch any score being made.** On the title screen, a row's number (0
+  for the tenth) fetches that entry's replay from Bulletin and plays it
+  back with the same `sim.c`; holding shift plays it four times as fast.
+  The end shows whether it reaches the board's score. Rows from before
+  replays are dimmed.
+- **What the board names stays stored.** Bulletin keeps data for a
+  retention period. Every few minutes the operator checks the board and
+  every replay on it (`pdot_bulletin_stored`) and renews those within a
+  quarter of the period of expiring (`pdot_bulletin_renew`).
 - **Trophies.** `best` holds `SCORE ADDRESS ABC`, the score, the account and
   the initials. The title screen reads it and the board back from the
   chain, not from the operator's answer, along with how many trophies the
@@ -133,21 +143,39 @@ to only record scores), `--fund` and `--session FILE` change them.
 `--offline` plays without a chain. `--screenshot FILE` saves the title
 screen as a BMP, closes the session and quits. The operator takes `--rpc`,
 `--bulletin`, `--operator SEED`, `--collection`, `--listen ADDR:PORT`
-(127.0.0.1:8090) and `--claims FILE`.
+(127.0.0.1:8090), `--claims FILE`, `--renew-check SECONDS` (300) and
+`--renew-before BLOCKS` (a quarter of the retention period).
 
 ## Proven results
 
 Pass `--relay URL --checkpoint FILE` (create the file with `pdot-bulletin
 checkpoint`) and every result is proven from relay-chain finality:
 
-- in the game: the score transaction's block, its place in the block body,
-  and its events; the record, board attribute and trophy reads; the head
-  and balance watches. The HUD then says "proven" instead of "trusted RPC".
+- in the game: the session key and score transactions (block, place in the
+  block body, events), the record, board attribute and trophy reads, and
+  the head and balance watches. The HUD then says "proven" instead of
+  "trusted RPC".
 - in the operator: the claimed remark (the block's events, through a read
-  proof), the board and record reads, and its own transactions. It keeps
-  its checkpoint file current as it goes.
+  proof), the board and record reads, the replay and board stores on
+  Bulletin, its Asset Hub batch, and the retention reads and renewals. It
+  keeps its checkpoint file current as it goes.
 
-The local dev nodes have no relay chain, so they always show "trusted RPC".
+`devnet.sh` has no relay chain, so it always shows "trusted RPC". For proven
+mode, [`devnet-relay.sh`](devnet-relay.sh) runs a westend-local relay chain
+(validators //Alice and //Bob) with Asset Hub as parachain 1000 and Bulletin
+as parachain 2487, on the same ports, does the same setup with proven
+results, and writes a checkpoint:
+
+```bash
+VALIDATOR_EXTRA_ARGS=--insecure-validator-i-know-what-i-do \
+POLKADOT=/path/to/polkadot OMNI_NODE=/path/to/polkadot-omni-node \
+  examples/asteroids/devnet-relay.sh
+```
+
+Validators want Linux's secure-validator sandbox; on macOS pass the opt-out
+above, for these throwaway local validators only. Once it prints `ready`,
+it shows the operator and game commands, each with `--relay` and its own
+copy of the checkpoint.
 
 ## Not covered yet
 
@@ -167,9 +195,10 @@ The local dev nodes have no relay chain, so they always show "trusted RPC".
   limits or TLS, and a claim blocks the next one for a few blocks. It
   listens on loopback by default; put it behind a proper front end before
   exposing it.
-- **The board expires.** Bulletin keeps data for a retention period, so a
-  board that doesn't change for that long needs renewing
-  (`pdot_bulletin_renew`). The game doesn't do that yet.
+- **Renewal needs the operator running.** If it is down for longer than
+  the margin, items can expire; the audit shows each one's expiry. Boards
+  replaced by newer ones and replays that fell off the board are left to
+  expire.
 - **Events from older runtimes.** The operator decodes a claimed block's
   events with the current metadata, so claims for blocks from before a
   runtime upgrade that changed events may fail.

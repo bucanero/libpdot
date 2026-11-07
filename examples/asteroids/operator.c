@@ -21,6 +21,11 @@
  * and the "best" and "board" attributes go in one Utility.batch_all, all or
  * nothing. Each remark is honoured once (--claims file).
  *
+ * Bulletin keeps data for a retention period. Every --renew-check seconds
+ * the operator renews the board and every replay on it that is within
+ * --renew-before blocks of expiring (default: a quarter of the period), so
+ * what the board names stays fetchable.
+ *
  * Claims are handled one at a time, in the order they arrive, so two games
  * can never overwrite each other's board update. The server is plain HTTP on
  * loopback for the sample; put TLS and rate limits in front of it before
@@ -34,8 +39,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -64,6 +71,7 @@ typedef struct {
     const char  *checkpoint;
     uint64_t    *claims;  /* block << 32 | extrinsic index of each honoured remark */
     size_t       nclaims;
+    uint32_t     renew_before;  /* blocks; 0: a quarter of the retention period */
 } operator_t;
 
 static volatile sig_atomic_t stopping;
@@ -141,6 +149,7 @@ typedef struct {
     uint32_t trophy;
     uint32_t tx_block;      /* Asset Hub block of the operator's batch, 0 if none */
     int      tx_proven;
+    int      stores_proven; /* the Bulletin stores' results */
 } claim_result;
 
 #if defined(__GNUC__)
@@ -188,7 +197,7 @@ static cJSON *attribute_args(uint32_t collection, const char *key, const char *v
 
 /* Stores bytes on Bulletin, signed by the operator; cid gets the CID text. */
 static int store(operator_t *o, const uint8_t *data, size_t len, char *cid, size_t cid_len,
-                 uint32_t *block, char *msg, size_t msg_len)
+                 uint32_t *block, int *proven, char *msg, size_t msg_len)
 {
     pdot_store_result sr;
     int rc = pdot_bulletin_store(o->bul, &o->op, data, len, &sr);
@@ -198,6 +207,7 @@ static int store(operator_t *o, const uint8_t *data, size_t len, char *cid, size
         return rc;
     }
     *block = sr.tx.block;
+    *proven = sr.tx.verified;
     return pdot_cid_to_string(&sr.cid, cid, cid_len);
 }
 
@@ -209,6 +219,7 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
     char remark[80 + BOARD_CID_MAX], msg[192] = "", text[PDOT_NFT_DATA_MAX];
     pdot_cid cid;
     uint32_t replayed, replay_block;
+    int proven = 0;
     pdot_remark rm;
     board b;
     board_record rec;
@@ -262,7 +273,8 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
     }
 
     /* 4. The replay on Bulletin, where anyone can fetch and re-run it. */
-    if ((rc = store(o, replay, replay_len, text, sizeof text, &replay_block, msg, sizeof msg)))
+    if ((rc = store(o, replay, replay_len, text, sizeof text, &replay_block, &r->stores_proven,
+                    msg, sizeof msg)))
         REFUSE(502, "storing the replay on Bulletin: %s", msg);
     if (strcmp(text, r->replay_cid) != 0)
         REFUSE(502, "Bulletin stored the replay as %s, expected %s", text, r->replay_cid);
@@ -285,7 +297,8 @@ static void handle_claim(operator_t *o, const char *account, uint32_t score, con
                 REFUSE(500, "out of memory");
             }
             rc = store(o, (const uint8_t *)json, strlen(json), r->board_cid, sizeof r->board_cid,
-                       &r->stored_at, msg, sizeof msg);
+                       &r->stored_at, &proven, msg, sizeof msg);
+            r->stores_proven = r->stores_proven && proven;
             free(json);
             if (rc) {
                 cJSON_Delete(calls);
@@ -488,9 +501,11 @@ static void serve(operator_t *o, int fd, char *buf, size_t cap)
         logf_("  refused (%d): %s", r.status, r.error);
         REPLY_ERROR(fd, r.status, r.error);
     }
-    logf_("  ok: replay of %u ticks re-ran to the score, remark %s, rank %d%s%s", r.ticks,
-          r.remark_proven ? "proven" : "checked (trusted RPC)", r.rank,
-          r.stored_at ? ", board stored" : "", r.record ? ", new record" : "");
+    logf_("  ok: replay of %u ticks re-ran to the score, remark %s, rank %d%s%s; results %s",
+          r.ticks, r.remark_proven ? "proven" : "checked (trusted RPC)", r.rank,
+          r.stored_at ? ", board stored" : "", r.record ? ", new record" : "",
+          r.tx_block || r.stored_at ? (r.tx_proven && r.stores_proven ? "proven" : "trusted RPC")
+                                    : "none");
     out = cJSON_CreateObject();
     cJSON_AddBoolToObject(out, "ok", 1);
     cJSON_AddNumberToObject(out, "ticks", r.ticks);
@@ -506,6 +521,7 @@ static void serve(operator_t *o, int fd, char *buf, size_t cap)
         cJSON_AddNullToObject(out, "trophy");
     cJSON_AddNumberToObject(out, "block", r.tx_block);
     cJSON_AddBoolToObject(out, "block_proven", r.tx_proven);
+    cJSON_AddBoolToObject(out, "stores_proven", r.stores_proven);
     reply(fd, 200, out);
     cJSON_Delete(out);
 }
@@ -574,6 +590,81 @@ static void save_checkpoint(operator_t *o)
     pdot_free(blob);
 }
 
+/* ---- retention --------------------------------------------------------- */
+
+/* "expires at #N, in M blocks" for one stored item; 0 when it is still stored. */
+static int expiry(operator_t *o, const char *cid_text, pdot_storage_proof *p, char *out,
+                  size_t cap)
+{
+    pdot_cid cid;
+    int rc;
+
+    if (pdot_cid_from_string(&cid, cid_text)) {
+        snprintf(out, cap, "not a CID");
+        return PDOT_E_INVALID;
+    }
+    if ((rc = pdot_bulletin_stored(o->bul, &cid, p))) {
+        snprintf(out, cap, "%s", rc == PDOT_E_NOTFOUND ? "EXPIRED: no longer stored"
+                                                        : pdot_last_error(o->bul));
+        return rc;
+    }
+    snprintf(out, cap, "expires at #%u, in %d blocks%s", p->expires,
+             (int)(p->expires - p->proven_at), p->verified ? " (proven)" : "");
+    return 0;
+}
+
+/* Renews one item if it expires within the margin. 1 when renewed. */
+static int renew_one(operator_t *o, const char *what, const char *cid_text)
+{
+    pdot_storage_proof p;
+    pdot_tx_result tx;
+    pdot_cid cid;
+    char line[160];
+    uint32_t margin;
+    int rc;
+
+    if (expiry(o, cid_text, &p, line, sizeof line)) {
+        logf_("retention: %s %.24s...: %s", what, cid_text, line);
+        return 0;
+    }
+    margin = o->renew_before ? o->renew_before : (p.expires - p.block) / 4;
+    if (p.expires > p.proven_at + margin)
+        return 0;
+    pdot_cid_from_string(&cid, cid_text);
+    rc = pdot_bulletin_renew(o->bul, &o->op, &cid, &tx);
+    if (rc) {
+        logf_("retention: renewing %s %.24s... failed: %s", what, cid_text,
+              rc == PDOT_E_DISPATCH ? tx.error : pdot_last_error(o->bul));
+        return 0;
+    }
+    expiry(o, cid_text, &p, line, sizeof line);
+    logf_("retention: renewed %s %.24s... in block %u%s: %s", what, cid_text, tx.block,
+          tx.verified ? " (proven)" : "", line);
+    return 1;
+}
+
+/* The board and every replay it names. */
+static void renew_due(operator_t *o)
+{
+    board b;
+    char cid[BOARD_CID_MAX], msg[192] = "";
+    size_t i;
+    int n = 0;
+
+    if (board_read(o->ah, o->bul, o->collection, &b, cid, msg, sizeof msg)) {
+        logf_("retention: reading the board: %s", msg);
+        return;
+    }
+    if (!cid[0])
+        return;  /* no board yet */
+    n += renew_one(o, "board", cid);
+    for (i = 0; i < b.n; i++)
+        if (b.e[i].replay[0])
+            n += renew_one(o, "replay", b.e[i].replay);
+    if (n)
+        logf_("retention: %d item(s) renewed", n);
+}
+
 /*
  * --audit: what anyone can do with no key at all. Reads the board, fetches
  * each entry's replay from Bulletin (checked against its CID) and re-runs it.
@@ -590,6 +681,12 @@ static int audit(operator_t *o)
         return 1;
     }
     printf("board %s: %zu entries\n", cid_text[0] ? cid_text : "(none yet)", b.n);
+    if (cid_text[0]) {
+        pdot_storage_proof p;
+        char line[160];
+        expiry(o, cid_text, &p, line, sizeof line);
+        printf("    the board %s\n", line);
+    }
     for (i = 0; i < b.n; i++) {
         const board_entry *e = &b.e[i];
         pdot_cid cid;
@@ -615,8 +712,12 @@ static int audit(operator_t *o)
             printf("replay scores %u: WRONG\n", score);
             bad++;
         } else {
-            printf("replay re-runs to %u in %u ticks (%.0f s of play)\n", score, ticks,
-                   (double)ticks / SIM_HZ);
+            pdot_storage_proof p;
+            char line[160];
+            expiry(o, e->replay, &p, line, sizeof line);
+            printf("replay re-runs to %u in %u ticks (%.0f s of play)\n"
+                   "                                its replay %s\n", score, ticks,
+                   (double)ticks / SIM_HZ, line);
         }
         pdot_free(data);
     }
@@ -634,9 +735,14 @@ static void usage(void)
             "  --listen ADDR:PORT   where to serve (127.0.0.1:8090)\n"
             "  --claims FILE        honoured claims (asteroids-claims.txt)\n"
             "  --metadata-hash M    on, off or SYMBOL:DECIMALS (on)\n"
-            "  --relay URL --checkpoint FILE [--para-id N]\n"
+            "  --relay URL --checkpoint FILE [--para-id N] [--bulletin-para-id N]\n"
             "                       prove scores and results from relay-chain finality\n"
-            "  --audit              no server: re-run every replay on the board, then exit\n");
+            "                       (Asset Hub 1000, Bulletin 2487)\n"
+            "  --renew-check S      check retention every S seconds (300; 0: never)\n"
+            "  --renew-before N     renew what expires within N blocks (a quarter of\n"
+            "                       the retention period)\n"
+            "  --audit              no server: re-run every replay on the board, show\n"
+            "                       when each expires, then exit\n");
 }
 
 int main(int argc, char **argv)
@@ -645,14 +751,15 @@ int main(int argc, char **argv)
     const char *rpc = "http://127.0.0.1:9944", *bulletin = "http://127.0.0.1:9945";
     const char *seed = DEV_OPERATOR, *listen_at = "127.0.0.1:8090", *mdhash = "on";
     const char *relay = NULL;
-    uint32_t para_id = 1000;
+    uint32_t para_id = 1000, bulletin_para_id = 2487;
     uint8_t seed_bytes[32];
     char host[64];
     const char *colon;
     struct sockaddr_in sa;
     struct sigaction sig;
     char *reqbuf;
-    int audit_only = 0;
+    int audit_only = 0, renew_check = 300;
+    time_t next_renew = 0;
     int i, lfd, one = 1, rc;
 
     memset(&o, 0, sizeof o);
@@ -678,6 +785,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--relay")) relay = v;
         else if (!strcmp(a, "--checkpoint")) o.checkpoint = v;
         else if (!strcmp(a, "--para-id")) para_id = (uint32_t)strtoul(v, NULL, 10);
+        else if (!strcmp(a, "--bulletin-para-id")) bulletin_para_id = (uint32_t)strtoul(v, NULL, 10);
+        else if (!strcmp(a, "--renew-check")) renew_check = atoi(v);
+        else if (!strcmp(a, "--renew-before")) o.renew_before = (uint32_t)strtoul(v, NULL, 10);
         else {
             usage();
             return 2;
@@ -712,6 +822,11 @@ int main(int argc, char **argv)
         if ((rc = set_verifier(o.ah, relay, para_id, o.checkpoint))) {
             fprintf(stderr, "verifier: %s\n",
                     rc == PDOT_E_NOTFOUND ? "no checkpoint file" : pdot_last_error(o.ah));
+            return 1;
+        }
+        /* Bulletin too: store results and the board's attribute reads are proven. */
+        if ((rc = set_verifier(o.bul, relay, bulletin_para_id, o.checkpoint))) {
+            fprintf(stderr, "verifier (Bulletin): %s\n", pdot_last_error(o.bul));
             return 1;
         }
         o.proven = 1;
@@ -762,9 +877,19 @@ int main(int argc, char **argv)
     }
     while (!stopping) {
         struct timeval tv = { 10, 0 };
-        int fd = accept(lfd, NULL, NULL);
-        if (fd < 0)
-            continue;  /* EINTR on Ctrl-C */
+        struct pollfd pfd = { 0, POLLIN, 0 };
+        int fd;
+
+        if (renew_check > 0 && time(NULL) >= next_renew) {
+            renew_due(&o);
+            save_checkpoint(&o);
+            next_renew = time(NULL) + renew_check;
+        }
+        pfd.fd = lfd;
+        if (poll(&pfd, 1, 5000) <= 0)
+            continue;  /* timeout, or EINTR on Ctrl-C */
+        if ((fd = accept(lfd, NULL, NULL)) < 0)
+            continue;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 #if defined(SO_NOSIGPIPE)

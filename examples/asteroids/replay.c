@@ -107,13 +107,12 @@ static int bad(char *msg, size_t len, const char *fmt, ...)
     return -1;
 }
 
-int replay_check(const uint8_t *data, size_t len, uint32_t *score, uint32_t *ticks,
-                 char *msg, size_t msg_len)
+int replay_decode(const uint8_t *data, size_t len, replay *r, char *msg, size_t msg_len)
 {
-    sim s;
-    uint32_t total, done = 0;
+    uint32_t total;
     size_t at = HEADER;
 
+    memset(r, 0, sizeof *r);
     if (len < HEADER || len > REPLAY_MAX_BYTES || memcmp(data, "PDAR", 4) != 0)
         return bad(msg, msg_len, "not a replay");
     if (data[4] != REPLAY_VERSION)
@@ -121,39 +120,69 @@ int replay_check(const uint8_t *data, size_t len, uint32_t *score, uint32_t *tic
     total = get32(data + 9);
     if (total == 0 || total > REPLAY_MAX_TICKS)
         return bad(msg, msg_len, "%u ticks: more than an hour, or none", total);
-    sim_new(&s, get32(data + 5));
+    if (!(r->inputs = malloc(total)))
+        return bad(msg, msg_len, "out of memory");
+    r->cap = total;
+    r->seed = get32(data + 5);
     while (at < len) {
         uint8_t input = data[at++];
         uint32_t run = 0;
         int shift = 0;
 
-        if (input & ~SIM_INPUTS)
-            return bad(msg, msg_len, "input 0x%02x at tick %u", input, done);
+        if (input & ~SIM_INPUTS) {
+            bad(msg, msg_len, "input 0x%02x at tick %zu", input, r->n);
+            goto fail;
+        }
         for (;;) {
             uint8_t b;
-            if (at == len || shift > 28)
-                return bad(msg, msg_len, "truncated run at tick %u", done);
+            if (at == len || shift > 28) {
+                bad(msg, msg_len, "truncated run at tick %zu", r->n);
+                goto fail;
+            }
             b = data[at++];
             run |= (uint32_t)(b & 0x7f) << shift;
             shift += 7;
             if (!(b & 0x80))
                 break;
         }
-        if (run == 0 || run > total - done)
-            return bad(msg, msg_len, "runs do not add up to %u ticks", total);
-        while (run--) {
-            if (s.over)
-                return bad(msg, msg_len, "inputs after the game ended at tick %u", done);
-            sim_step(&s, input);
-            done++;
+        if (run == 0 || run > total - r->n) {
+            bad(msg, msg_len, "runs do not add up to %u ticks", total);
+            goto fail;
         }
+        memset(r->inputs + r->n, input, run);
+        r->n += run;
     }
-    if (done != total)
-        return bad(msg, msg_len, "runs cover %u of %u ticks", done, total);
-    if (!s.over)
-        return bad(msg, msg_len, "the game has not ended after %u ticks", total);
-    *score = s.score;
-    *ticks = total;
+    if (r->n != total) {
+        bad(msg, msg_len, "runs cover %zu of %u ticks", r->n, total);
+        goto fail;
+    }
     return 0;
+fail:
+    replay_free(r);
+    return -1;
 }
 
+int replay_check(const uint8_t *data, size_t len, uint32_t *score, uint32_t *ticks,
+                 char *msg, size_t msg_len)
+{
+    replay r;
+    sim s;
+    size_t i;
+
+    if (replay_decode(data, len, &r, msg, msg_len))
+        return -1;
+    sim_new(&s, r.seed);
+    for (i = 0; i < r.n; i++) {
+        if (s.over) {
+            replay_free(&r);
+            return bad(msg, msg_len, "inputs after the game ended at tick %zu", i);
+        }
+        sim_step(&s, r.inputs[i]);
+    }
+    replay_free(&r);
+    if (!s.over)
+        return bad(msg, msg_len, "the game has not ended after %zu ticks", i);
+    *score = s.score;
+    *ticks = (uint32_t)i;
+    return 0;
+}

@@ -34,6 +34,9 @@ void replay_add(replay *r, uint8_t input);
 uint8_t *replay_encode(const replay *r, size_t *len);
 void replay_free(replay *r);
 
+/* Decodes a replay into r (seed and one input per tick), to play it back. */
+int replay_decode(const uint8_t *data, size_t len, replay *r, char *msg, size_t msg_len);
+
 /*
  * Decodes and re-runs a replay. 0 with the final score and tick count when
  * it is one finished game; -1 otherwise, with the reason in msg.

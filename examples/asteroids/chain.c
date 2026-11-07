@@ -16,6 +16,8 @@
  *           replay: it re-runs the game, finds the remark on chain, then puts
  *           a top-10 score on the board and mints a trophy for a new record.
  *           The game holds no operator key.
+ *   watch   fetches a board entry's replay from Bulletin, checked against
+ *           its CID, for the game to play back
  *   board   reads the leaderboard: the collection's "board" attribute holds
  *           the CID of a JSON document on the Bulletin chain (board.h),
  *           fetched and checked against the CID
@@ -59,10 +61,13 @@ struct chain {
     size_t       replay_len;
     char         replay_cid[BOARD_CID_MAX];
     pdot_u128    session_free;
+    uint8_t     *watch;          /* a fetched replay, until chain_take_watch */
+    size_t       watch_len;
     chain_view   v;
 };
 
-enum { J_OPEN, J_RECORD, J_QUOTE, J_SUBMIT, J_CLAIM, J_BOARD, J_CLOSE_FUNDS, J_CLOSE_PROXY };
+enum { J_OPEN, J_RECORD, J_QUOTE, J_SUBMIT, J_CLAIM, J_BOARD, J_CLOSE_FUNDS, J_CLOSE_PROXY,
+       J_WATCH };
 
 struct job {
     chain         *ch;
@@ -422,6 +427,34 @@ static int work_board(pdot_client *c, void *ud)
                       sizeof j->msg);
 }
 
+static int work_watch(pdot_client *c, void *ud)
+{
+    struct job *j = ud;
+    pdot_cid cid;
+    uint8_t *data;
+    size_t len;
+    int rc;
+
+    (void)c;
+    if (pdot_cid_from_string(&cid, j->replay_cid)) {
+        snprintf(j->msg, sizeof j->msg, "not a CID");
+        return PDOT_E_INVALID;
+    }
+    /* Checked against the CID: the node can refuse it, not change it. */
+    if ((rc = pdot_bulletin_fetch(j->ch->bul, &cid, &data, &len))) {
+        snprintf(j->msg, sizeof j->msg, "%s", pdot_last_error(j->ch->bul));
+        return rc;
+    }
+    if (!(j->replay = malloc(len ? len : 1))) {
+        pdot_free(data);
+        return PDOT_E_NOMEM;
+    }
+    memcpy(j->replay, data, len);
+    j->replay_len = len;
+    pdot_free(data);
+    return 0;
+}
+
 static int work_close_funds(pdot_client *c, void *ud)
 {
     struct job *j = ud;
@@ -603,6 +636,20 @@ static void job_done(void *ud, int rc, const char *error, const void *result)
         ch->v.board_state = 1;
         memcpy(ch->v.board_cid, j->board_cid, sizeof ch->v.board_cid);
         break;
+    case J_WATCH:
+        if (rc) {
+            ch->v.watch_state = -1;
+            status(ch, 1, "replay not fetched: %s", j->msg[0] ? j->msg : error);
+            break;
+        }
+        free(ch->watch);
+        ch->watch = j->replay;  /* taken over */
+        ch->watch_len = j->replay_len;
+        j->replay = NULL;
+        ch->v.watch_state = 2;
+        status(ch, 0, "replay %.24s... fetched from Bulletin (%zu bytes, checked against its CID)",
+               j->replay_cid, ch->watch_len);
+        break;
     case J_CLOSE_FUNDS:
         ch->funds_returned = rc == 0;
         if (rc)
@@ -636,7 +683,7 @@ static struct job *queue_at(chain *ch, int kind, uint32_t score, const char *nam
 {
     static int (*const work[])(pdot_client *, void *) = {
         work_open, work_record, work_quote, work_submit, work_claim, work_board,
-        work_close_funds, work_close_proxy,
+        work_close_funds, work_close_proxy, work_watch,
     };
     struct job *j = calloc(1, sizeof *j);
 
@@ -865,6 +912,26 @@ void chain_submit(chain *ch, const char *name)
              copy ? ch->replay_len : 0);
 }
 
+void chain_watch(chain *ch, const char *cid)
+{
+    if (!ch->bul || ch->v.watch_state == 1)
+        return;
+    ch->v.watch_state = 1;
+    status(ch, 0, "fetching replay %.24s... from Bulletin", cid);
+    queue_at(ch, J_WATCH, 0, NULL, 0, cid, NULL, 0);
+}
+
+int chain_take_watch(chain *ch, uint8_t **data, size_t *len)
+{
+    if (ch->v.watch_state != 2)
+        return -1;
+    *data = ch->watch;
+    *len = ch->watch_len;
+    ch->watch = NULL;
+    ch->v.watch_state = 0;
+    return 0;
+}
+
 void chain_close(chain *ch)
 {
     if (ch->v.state == CHAIN_OPENING) {
@@ -887,6 +954,7 @@ void chain_free(chain *ch)
         return;
     pdot_async_free(ch->a);  /* joins the worker, the only user of ch->bul */
     free(ch->replay);
+    free(ch->watch);
     if (ch->bul)
         pdot_client_free(ch->bul);
     pdot_signer_wipe(&ch->player);

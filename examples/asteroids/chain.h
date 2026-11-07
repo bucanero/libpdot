@@ -56,6 +56,7 @@ typedef struct {
     char     board_cid[CHAIN_CID_STR_MAX];
     int      has_bulletin;      /* a Bulletin node is configured */
     int      has_operator;      /* an operator is configured */
+    int      watch_state;       /* replay fetch: 0 none, 1 fetching, 2 ready, -1 failed */
 } chain_view;
 
 typedef struct chain chain;
@@ -77,6 +78,11 @@ void chain_set_replay(chain *ch, const replay *r, uint32_t score);
  * top-10 score goes on the board, a new record wins a trophy.
  */
 void chain_submit(chain *ch, const char *name);
+
+/* Fetches a replay from Bulletin by CID (a board entry's), checked against it. */
+void chain_watch(chain *ch, const char *cid);
+/* Once watch_state is 2: the replay, freed with free(); resets watch_state. */
+int chain_take_watch(chain *ch, uint8_t **data, size_t *len);
 
 /* Starts closing: leftover funds back to the player, proxy removed. */
 void chain_close(chain *ch);

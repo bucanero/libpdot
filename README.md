@@ -184,6 +184,8 @@ if (pdot_bulletin_verify_cid(c, &cid, &p) == 0)
 pdot_client_checkpoint(c, &ck, &ck_len);   /* save it: later runs start from here */
 ```
 
+`pdot_bulletin_stored(c, &cid, &p)` reads the same (where, and retained until when) with or without a verifier: proven with one, the RPC node's word without. Renew with `pdot_bulletin_renew` before `p.expires` to keep the data.
+
 The **checkpoint** is the one thing you must trust: a GRANDPA validator set at some relay block, a few KB. Create it once from a node you trust and ship it with your app; libpdot advances it through validator-set changes (one every few hours) and hands the newer one back for you to save. `pdot_checkpoint_fetch` creates one, trusting the given node for that call only.
 
 | Network | Relay RPC | Bulletin para id |
@@ -345,7 +347,7 @@ static void on_sword(void *ud, int rc, const char *error, const void *result)
 | Authorizations | `pdot_bulletin_authorization`, `pdot_bulletin_is_authorized`, `pdot_bulletin_authorize_account` |
 | Metadata hash | `pdot_client_set_metadata_hash`, `pdot_client_metadata_hash` |
 | Verification | `pdot_checkpoint_fetch`, `pdot_checkpoint_fetch_at`, `pdot_client_set_verifier`, `pdot_client_checkpoint`, `pdot_bulletin_verify_cid` |
-| Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
+| Data | `pdot_bulletin_store`, `pdot_bulletin_store_chunked`, `pdot_bulletin_fetch`, `pdot_bulletin_stored`, `pdot_bulletin_renew`, `pdot_bulletin_renew_tree` |
 | Chain state | `pdot_balance_get`, `pdot_asset_balance_get`, `pdot_asset_info_get`, `pdot_nft_item_get`, `pdot_nft_attribute_get`, `pdot_nft_owned`, `pdot_storage_get`, `pdot_client_token` |
 | Transactions | `pdot_call_from_json`, `pdot_tx_submit`, `pdot_tx_fee`, `pdot_transfer_call`, `pdot_transfer_submit`, `pdot_remark_find` |
 | Proxies | `pdot_signer_sr25519_random`, `pdot_proxy_add`, `pdot_proxy_remove`, `pdot_proxies_get` |

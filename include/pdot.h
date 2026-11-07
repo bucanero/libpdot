@@ -236,13 +236,14 @@ typedef struct {
     int      verified;                /* 1: read through a proof (needs a verifier) */
 } pdot_authorization;
 
-/* Where data is stored, proven from chain state. */
+/* Where data is stored, read from chain state (proven with a verifier). */
 typedef struct {
     uint32_t block;        /* Bulletin block of the newest stored copy */
     uint32_t index;        /* its position in that block's stored transactions */
     uint32_t expires;      /* retained until this block (block + RetentionPeriod) */
-    uint32_t proven_at;    /* final Bulletin block whose state was proven */
-    uint32_t relay_block;  /* relay block whose GRANDPA finality anchors the proof */
+    uint32_t proven_at;    /* final Bulletin block whose state was read */
+    uint32_t relay_block;  /* with verified: relay block whose GRANDPA finality anchors it */
+    int      verified;     /* 1: read through a proof */
 } pdot_storage_proof;
 
 /* Reads and decodes the account's authorization, if any. */
@@ -322,6 +323,14 @@ int pdot_bulletin_authorize_account(pdot_client *c, const pdot_signer *s,
  * PDOT_E_NOTFOUND when the proof shows it is not stored.
  */
 int pdot_bulletin_verify_cid(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out);
+
+/*
+ * Where the data behind cid is stored and until when it is retained, at the
+ * newest final block: proven with a verifier, the RPC node's word without.
+ * Renew (pdot_bulletin_renew) before `expires` to keep it. PDOT_E_NOTFOUND
+ * when it is not stored.
+ */
+int pdot_bulletin_stored(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out);
 
 /*
  * Fetches data by CID from the gateway, or from the node when the client has

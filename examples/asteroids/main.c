@@ -18,6 +18,10 @@
  * tick's input is recorded, and the replay goes with the score so the
  * operator can re-run the game (replay.h).
  *
+ * On the title screen a row's number (0 for the tenth) plays that board
+ * entry's replay, fetched from Bulletin: the same sim.c re-runs the game
+ * on screen, and the end shows whether it reaches the board's score.
+ *
  * Keys: arrows turn and thrust, space fires. At game over, type your initials
  * (or pick them with the arrows) and press enter to record the score; escape
  * quits, closing the session on chain first.
@@ -41,7 +45,7 @@
 /* //Alice, the well-known dev key (`subkey inspect //Alice`). */
 static const char *DEV_PLAYER = "e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
 
-enum { S_TITLE, S_PLAY, S_OVER, S_QUIT };
+enum { S_TITLE, S_PLAY, S_OVER, S_QUIT, S_WATCH };
 
 typedef struct {
     int      state;
@@ -52,6 +56,13 @@ typedef struct {
     char     name[4];       /* initials for the score, kept between games */
     int      cursor;        /* the initial being edited, 0..2 */
     SDL_FPoint stars[80];
+    /* watching a replay */
+    int         watch_pending;  /* asked the chain for one */
+    board_entry watch_entry;    /* whose game it is */
+    replay      watch;          /* its inputs */
+    size_t      watch_at;       /* ticks played */
+    uint8_t     watch_input;    /* the current tick's, for the thrust flame */
+    char        watch_error[96];
 } game;
 
 /* Rendering only: the game's own randomness is sim.c's. */
@@ -88,6 +99,15 @@ static void tick(game *g, const Uint8 *keys, chain *ch)
 {
     uint8_t input;
 
+    if (g->state == S_WATCH) {
+        /* holding shift plays four ticks per tick */
+        int n = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT] ? 4 : 1;
+        while (n-- && g->watch_at < g->watch.n && !g->s.over) {
+            g->watch_input = g->watch.inputs[g->watch_at++];
+            sim_step(&g->s, g->watch_input);
+        }
+        return;
+    }
     if (g->state != S_PLAY) {
         sim_drift(&g->s);
         return;
@@ -273,7 +293,9 @@ static void draw_board(SDL_Renderer *r, const chain_view *v)
         short_addr(e->account, who, sizeof who);
         snprintf(line, sizeof line, "%2u. %s %8u   %-14s BLOCK %-8u", (unsigned)(i + 1),
                  e->name, e->score, who, e->block);
-        if (strcmp(e->account, v->player) == 0)
+        if (!e->replay[0])  /* from before replays: nothing to watch */
+            SDL_SetRenderDrawColor(r, 90, 100, 120, 255);
+        else if (strcmp(e->account, v->player) == 0)
             SDL_SetRenderDrawColor(r, 255, 230, 120, 255);
         else
             SDL_SetRenderDrawColor(r, 120, 200, 255, 255);
@@ -372,6 +394,49 @@ static void draw(SDL_Renderer *r, const game *g, const chain_view *v, int offlin
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
         font_draw_centered(r, W / 2.0f, 560, 2.0f, "PRESS SPACE TO PLAY");
         font_draw_centered(r, W / 2.0f, 600, 1.0f, "ARROWS TURN AND THRUST, SPACE FIRES, ESC QUITS");
+        if (!offline && v->board_state == 1 && v->board.n) {
+            SDL_SetRenderDrawColor(r, 120, 200, 255, 255);
+            if (g->watch_pending)
+                font_draw_centered(r, W / 2.0f, 626, 1.0f, "FETCHING THE REPLAY FROM BULLETIN...");
+            else if (g->watch_error[0])
+                font_draw_centered(r, W / 2.0f, 626, 1.0f, g->watch_error);
+            else
+                font_draw_centered(r, W / 2.0f, 626, 1.0f,
+                                   "A ROW'S NUMBER WATCHES ITS REPLAY (0 FOR 10)");
+        }
+        break;
+    case S_WATCH:
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        for (i = 0; i < SIM_SHOTS; i++)
+            if (g->s.shots[i].life > 0)
+                SDL_RenderDrawPointF(r, g->s.shots[i].p.x, g->s.shots[i].p.y),
+                SDL_RenderDrawPointF(r, g->s.shots[i].p.x + 1, g->s.shots[i].p.y);
+        if (!g->s.over)
+            draw_ship(r, &g->s, g->watch_input & SIM_THRUST);
+        snprintf(line, sizeof line, "%06u", g->s.score);
+        font_draw(r, 16, 14, 2.0f, line);
+        for (i = 0; i < 3; i++)
+            draw_life(r, (float)(W - 24 - i * 26), 30, i < g->s.lives);
+        SDL_SetRenderDrawColor(r, 255, 230, 120, 255);
+        snprintf(line, sizeof line, "REPLAY: %s %u (BLOCK %u)", g->watch_entry.name,
+                 g->watch_entry.score, g->watch_entry.block);
+        font_draw_centered(r, W / 2.0f, 20, 1.4f, line);
+        snprintf(line, sizeof line, "%u:%02u   HOLD SHIFT: FAST   ESC: BACK",
+                 (unsigned)(g->watch_at / SIM_HZ / 60), (unsigned)(g->watch_at / SIM_HZ % 60));
+        font_draw_centered(r, W / 2.0f, 46, 1.0f, line);
+        if (g->s.over || g->watch_at == g->watch.n) {
+            int ok = g->s.over && g->watch_at == g->watch.n && g->s.score == g->watch_entry.score;
+            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+            snprintf(line, sizeof line, "REPLAY ENDED: SCORE %u", g->s.score);
+            font_draw_centered(r, W / 2.0f, 260, 2.5f, line);
+            if (ok)
+                SDL_SetRenderDrawColor(r, 160, 255, 160, 255);
+            else
+                SDL_SetRenderDrawColor(r, 255, 110, 110, 255);
+            font_draw_centered(r, W / 2.0f, 320, 1.5f,
+                               ok ? "IT MATCHES THE BOARD: THE GAME WAS PLAYED"
+                                  : "IT DOES NOT MATCH THE BOARD");
+        }
         break;
     case S_PLAY:
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
@@ -547,6 +612,9 @@ int main(int argc, char **argv)
                        (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE);
             if (e.type == SDL_KEYDOWN && e.key.repeat) {
                 continue;
+            } else if (quit && g.state == S_WATCH) {
+                g.state = S_TITLE;  /* back from the replay, not a quit */
+                sim_new(&g.s, new_seed());
             } else if (quit) {
                 if (!ch) {
                     running = 0;
@@ -563,6 +631,21 @@ int main(int argc, char **argv)
                                  v->state == CHAIN_READY;
                 if (k == SDLK_SPACE && (g.state == S_TITLE || g.state == S_OVER)) {
                     new_game(&g);
+                } else if (g.state == S_TITLE && ch && k >= SDLK_0 && k <= SDLK_9 &&
+                           !g.watch_pending && v->board_state == 1) {
+                    size_t row = k == SDLK_0 ? 9 : (size_t)(k - SDLK_1);
+                    g.watch_error[0] = '\0';
+                    if (row >= v->board.n)
+                        ;
+                    else if (!v->board.e[row].replay[0])
+                        snprintf(g.watch_error, sizeof g.watch_error,
+                                 "ROW %u HAS NO REPLAY: IT IS FROM BEFORE REPLAYS",
+                                 (unsigned)row + 1);
+                    else {
+                        g.watch_entry = v->board.e[row];
+                        g.watch_pending = 1;
+                        chain_watch(ch, g.watch_entry.replay);
+                    }
                 } else if ((k == SDLK_RETURN || k == SDLK_KP_ENTER) && can_submit) {
                     g.submitted = 1;
                     chain_submit(ch, g.name);
@@ -572,6 +655,26 @@ int main(int argc, char **argv)
             }
         }
 
+        if (g.watch_pending && v->watch_state != 1) {
+            uint8_t *data;
+            size_t len;
+            g.watch_pending = 0;
+            if (v->watch_state == -1 || chain_take_watch(ch, &data, &len)) {
+                snprintf(g.watch_error, sizeof g.watch_error, "THE REPLAY COULD NOT BE FETCHED");
+            } else {
+                char why[96];
+                replay_free(&g.watch);
+                if (replay_decode(data, len, &g.watch, why, sizeof why)) {
+                    snprintf(g.watch_error, sizeof g.watch_error, "NOT A REPLAY");
+                } else if (g.state == S_TITLE) {
+                    sim_new(&g.s, g.watch.seed);
+                    g.watch_at = 0;
+                    g.watch_input = 0;
+                    g.state = S_WATCH;
+                }
+                free(data);
+            }
+        }
         /* Fixed ticks, as many as the clock asks for: never the frame time. */
         while (behind >= 1.0 / SIM_HZ) {
             tick(&g, keys, ch);
@@ -596,6 +699,7 @@ int main(int argc, char **argv)
 
     chain_free(ch);
     replay_free(&g.rec);
+    replay_free(&g.watch);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();

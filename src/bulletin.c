@@ -253,68 +253,110 @@ static int proven_uint(const pdot_metadata *md, uint32_t ty, const uint8_t *v, s
 }
 
 /*
- * Proves TransactionByContentHash[digest] = (block, index) in a final
- * Bulletin block at or past min_block, and the retention period with it.
+ * TransactionByContentHash[digest] = (block, index) and the retention period,
+ * read together at final block `at`: through a read proof when head is set.
  */
+static int read_stored(pdot_client *c, const uint8_t digest[32], const pdot_final_block *at,
+                       const pdot_header *head, pdot_storage_proof *out)
+{
+    pdot_md_storage st, rst;
+    pdot_buf k0, k1;
+    const uint8_t *keys[2];
+    size_t lens[2], nf;
+    pdot_value v[2];
+    uint64_t block = 0, index = 0, retention = 0;
+    pdot_md_field f[2];
+    const char *how = head ? "proven: " : "";
+    int rc;
+
+    memset(out, 0, sizeof *out);
+    out->proven_at = at->number;
+    out->relay_block = at->relay_block;
+    out->verified = at->verified;
+    pdot_buf_init(&k0);
+    pdot_buf_init(&k1);
+    if ((rc = storage_key(c, c->md, "TransactionByContentHash", digest, 32, &st, &k0)) ||
+        (rc = storage_key(c, c->md, "RetentionPeriod", NULL, 0, &rst, &k1))) {
+        pdot_buf_free(&k0);
+        pdot_buf_free(&k1);
+        return rc;
+    }
+    keys[0] = k0.data;
+    lens[0] = k0.len;
+    keys[1] = k1.data;
+    lens[1] = k1.len;
+    rc = pdot_storage_read_at(c, at, head, keys, lens, 2, v);
+    pdot_buf_free(&k0);
+    pdot_buf_free(&k1);
+    if (rc)
+        return rc;
+    if (!v[0].present) {
+        rc = pdot_fail(c, PDOT_E_NOTFOUND, "%snot stored as of Bulletin #%u", how, at->number);
+        goto out;
+    }
+    /* (BlockNumber, u32) */
+    if (pdot_md_fields(c->md, st.value_ty, f, 2, &nf) || nf != 2) {
+        rc = pdot_fail(c, PDOT_E_METADATA, "TransactionByContentHash is not (block, index)");
+        goto out;
+    }
+    {
+        pdot_reader r;
+        pdot_reader_init(&r, v[0].data, v[0].len);
+        rc = pdot_decode_uint(c->md, f[0].ty, &r, &block) ||
+             pdot_decode_uint(c->md, f[1].ty, &r, &index);
+    }
+    if (rc || block > UINT32_MAX || index > UINT32_MAX) {
+        rc = pdot_fail(c, head ? PDOT_E_UNVERIFIED : PDOT_E_DECODE,
+                       "%sTransactionByContentHash does not decode", how);
+        goto out;
+    }
+    /* ValueQuery: absent means the default, 0 */
+    if (v[1].present && proven_uint(c->md, rst.value_ty, v[1].data, v[1].len, "", &retention)) {
+        rc = pdot_fail(c, PDOT_E_DECODE, "%sRetentionPeriod does not decode", how);
+        goto out;
+    }
+    out->block = (uint32_t)block;
+    out->index = (uint32_t)index;
+    out->expires = out->block + (uint32_t)retention;
+out:
+    pdot_values_free(v, 2);
+    return rc;
+}
+
+/* The same, proven in a final Bulletin block at or past min_block. */
 static int prove_stored(pdot_client *c, const uint8_t digest[32], uint32_t min_block,
                         pdot_storage_proof *out)
 {
     const pdot_header *head;
-    pdot_md_storage st, rst;
-    pdot_buf key;
-    uint8_t *v = NULL;
-    size_t vlen = 0;
-    uint64_t block = 0, index = 0, retention = 0;
-    pdot_md_field f[2];
-    size_t nf;
+    pdot_final_block at;
     int rc;
 
-    memset(out, 0, sizeof *out);
     if ((rc = pdot_chain_sync(c)) || (rc = pdot_verify_para_head(c, min_block, &head)))
         return rc;
-    out->proven_at = head->number;
-    out->relay_block = c->verifier->head_relay;
+    memset(&at, 0, sizeof at);
+    at.number = head->number;
+    memcpy(at.hash, head->hash, 32);
+    at.verified = 1;
+    at.relay_block = c->verifier->head_relay;
+    return read_stored(c, digest, &at, head, out);
+}
 
-    pdot_buf_init(&key);
-    if (!(rc = storage_key(c, c->md, "TransactionByContentHash", digest, 32, &st, &key)))
-        rc = pdot_verify_read(c, head, key.data, key.len, &v, &vlen);
-    pdot_buf_free(&key);
-    if (rc == PDOT_E_NOTFOUND)
-        return pdot_fail(c, rc, "proven: not stored as of Bulletin #%u", head->number);
-    if (rc)
-        return rc;
-    /* (BlockNumber, u32) */
-    if (pdot_md_fields(c->md, st.value_ty, f, 2, &nf) || nf != 2) {
-        free(v);
-        return pdot_fail(c, PDOT_E_METADATA, "TransactionByContentHash is not (block, index)");
-    }
-    {
-        pdot_reader r;
-        pdot_reader_init(&r, v, vlen);
-        rc = pdot_decode_uint(c->md, f[0].ty, &r, &block) ||
-             pdot_decode_uint(c->md, f[1].ty, &r, &index);
-    }
-    free(v);
-    if (rc || block > UINT32_MAX || index > UINT32_MAX)
-        return pdot_fail(c, PDOT_E_UNVERIFIED, "proven TransactionByContentHash does not decode");
-    out->block = (uint32_t)block;
-    out->index = (uint32_t)index;
+int pdot_bulletin_stored(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out)
+{
+    const pdot_header *head;
+    pdot_final_block at;
+    const uint8_t *digest;
+    size_t dlen;
+    uint64_t code;
+    int rc;
 
-    pdot_buf_init(&key);
-    if (!(rc = storage_key(c, c->md, "RetentionPeriod", NULL, 0, &rst, &key))) {
-        rc = pdot_verify_read(c, head, key.data, key.len, &v, &vlen);
-        if (rc == 0) {
-            rc = proven_uint(c->md, rst.value_ty, v, vlen, "", &retention);
-            free(v);
-        } else if (rc == PDOT_E_NOTFOUND) {
-            rc = 0;  /* ValueQuery: absent means the default, 0 */
-        }
-    }
-    pdot_buf_free(&key);
-    if (rc)
+    if (!c || !cid || !out)
+        return PDOT_E_INVALID;
+    if (pdot_cid_digest(cid, &code, &digest, &dlen) || dlen != 32)
+        return pdot_fail(c, PDOT_E_INVALID, "CID needs a 32-byte digest");
+    if ((rc = pdot_chain_sync(c)) || (rc = pdot_final_block_get(c, &at, &head)))
         return rc;
-    out->expires = out->block + (uint32_t)retention;
-    return 0;
+    return read_stored(c, digest, &at, head, out);
 }
 
 int pdot_bulletin_verify_cid(pdot_client *c, const pdot_cid *cid, pdot_storage_proof *out)
