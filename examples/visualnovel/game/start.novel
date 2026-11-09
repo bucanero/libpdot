@@ -40,14 +40,20 @@
 
 #
 # The story begins on chain: the player signs to start it (and, at the
-# end, to seal it).
+# end, to seal it). Watching a friend's story comes here too, with their
+# name, traits and answers, and writes nothing.
 #
 
-[text text="Opening your story on chain. You sign twice: now, to start it, and at the end, to seal it."]
+[label name="summer"]
+[if lhs="${mode}" op="==" rhs="play"]
+  [text text="Opening your story on chain. You sign twice: now, to start it, and at the end, to seal it."]
+[endif]
 
 [chain_start collection="1" name="Player" ask_name="true" traits="xiao_bold mido_trust xiao_patience"]
 
-[if lhs="${chain_resumed}" op="==" rhs="1"]
+[if lhs="${chain_status}" op="==" rhs="watching"]
+  [text text="Story #${chain_item}: ${player_name}'s summer, as they lived it. Their answers are picked for them."]
+[elseif lhs="${chain_resumed}" op="==" rhs="1"]
   [text text="Welcome back. Story #${chain_item} continues from where you left it: your choices so far are on chain."]
 [elseif lhs="${chain_status}" op="==" rhs="ok"]
   [text text="Story #${chain_item} begins, seeded from block ${chain_block}. No one else will live this summer the same way."]
@@ -269,7 +275,9 @@
 [ch left="none" right="none" center="none" time="0.5"]
 [bg file="images/bg/black.png" time="1.0"]
 
-[if lhs="${chain_status}" op="==" rhs="ok"]
+[if lhs="${chain_status}" op="==" rhs="watching"]
+  [text text="That was ${player_name}'s summer, story #${chain_item}. Play your own: same questions, a different Xiaoling and Midori."]
+[elseif lhs="${chain_status}" op="==" rhs="ok"]
   [text text="Your story is sealed on Asset Hub as story #${chain_item}, with every choice you made. A friend can read it from the title screen, by that number, and play their own: their summer will not be yours."]
 [else]
   [text text="The end. (${chain_status})"]
@@ -282,8 +290,23 @@
 # their characters, their answers, their ending.
 #
 
+[label name="watch_unfinished"]
+[ch left="none" right="none" center="none" time="0.5"]
+[bg file="images/bg/black.png" time="1.0"]
+[text text="Their story stops here: ${player_name} has not lived the rest of this summer yet."]
+[goto name="title"]
+
 [label name="friend"]
 [chain_friend collection="1" traits="xiao_bold mido_trust xiao_patience"]
+
+# Watch it, when its traits can be worked out (the seed block's hash is
+# still on chain); else the summary below.
+[if lhs="${friend_status}" op="==" rhs="ok"]
+  [if lhs="${friend_traits_known}" op="==" rhs="1"]
+    [chain_watch end_label="watch_unfinished"]
+    [goto name="summer"]
+  [endif]
+[endif]
 
 [if lhs="${friend_status}" op="==" rhs="ok"]
   [text text="Story #${friend_item}: ${friend_name}'s summer, seeded from block ${friend_block}."]

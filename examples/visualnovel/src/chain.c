@@ -55,6 +55,14 @@
  *	friend_traits_known is 1 (the seed block is within the last 4096,
  *	which the chain keeps hashes for).
  *
+ *   [chain_watch end_label="watch_unfinished"]
+ *	After a [chain_friend] that found a story with known traits: the next
+ *	[chain_start] plays that story instead of opening one, with the
+ *	friend's name and traits, [chain_choose] picks their recorded answers
+ *	(saying which at the top left), and [chain_ending] records nothing.
+ *	chain_status is "watching". An unfinished story jumps to end_label
+ *	after its last recorded answer.
+ *
  * Continuing: [chain_start] saves the session key and the story's item
  * and seed block to pdot-story.txt (readable by this user only) before
  * the story goes on chain, and the ending deletes it. If the game quits
@@ -169,6 +177,15 @@ static struct {
 
 	/* [chain_friend]: 0 idle, 1 asking the number, 2 reading, 3 done */
 	int		friend;
+
+	/* watching the friend's story: replayed from their record, nothing written */
+	int		watch_ready;	/* the last friend's story can be watched */
+	int		watching;
+	uint32_t	watch_item;
+	char		watch_name[NAME_MAX + 1];
+	uint8_t		watch_hash[32], watch_owner[32];
+	char		watch_choices[CHOICES_MAX + 1];
+	char		watch_end_label[64];	/* where an unfinished story stops */
 	char		traits[TRAITS_MAX];
 	char		choices[CHOICES_MAX + 1];
 	int		state;
@@ -795,6 +812,13 @@ friend_done(
 	}
 	s3_set_variable_int("friend_count", n);
 	s3_set_variable_int("friend_traits_known", j->has_hash);
+	/* Watchable with its traits, which need the seed block's hash. */
+	g.watch_ready = j->has_hash;
+	g.watch_item = j->item;
+	snprintf(g.watch_name, sizeof(g.watch_name), "%s", j->name[0] ? j->name : "Someone");
+	memcpy(g.watch_hash, j->block_hash, 32);
+	memcpy(g.watch_owner, j->owner, 32);
+	snprintf(g.watch_choices, sizeof(g.watch_choices), "%s", j->choices);
 	if (j->has_hash)
 		set_traits_as(g.traits, "friend_", j->block_hash, j->owner, 0);
 	status("friend's story %u/%u: %s's, seeded from block %u%s; choices \"%s\"%s%s",
@@ -902,7 +926,8 @@ replay_end(void)
 	s3_stop_skip_mode();
 	s3_show_skipmode_banner(false);
 	s3_set_config("msgbox.skip_unseen", "false");
-	status("caught up: the story continues from here");
+	if (!g.watching)
+		status("caught up: the story continues from here");
 }
 
 /* The next recorded choice into value; 0 when there are none left. */
@@ -1371,6 +1396,22 @@ tag_chain_start(
 		if (!s3i_check_tag_properties(start_props))
 			return false;
 		s3_evaluate_tag();  /* ${var} in arguments */
+		if (g.watching) {
+			/* The friend's story: their name, traits and answers; no chain. */
+			snprintf(g.traits, sizeof(g.traits), "%s",
+				 s3_get_tag_arg_string("traits", true, ""));
+			set_traits_as(g.traits, "", g.watch_hash, g.watch_owner, 1);
+			s3_set_variable_string("player_name", g.watch_name);
+			s3_set_variable_string("chain_status", "watching");
+			s3_set_variable_int("chain_resumed", 0);
+			s3_set_variable_int("chain_item", (int)g.watch_item);
+			snprintf(g.replay, sizeof(g.replay), "%s", g.watch_choices);
+			g.replay_at = 0;
+			g.replaying = 1;  /* at normal speed: no skip mode */
+			status("watching story %u: %s's summer, answers \"%s\"", g.watch_item,
+			       g.watch_name, g.watch_choices);
+			return s3_move_to_next_tag();
+		}
 		if (g.state == ST_ENDED) {
 			/* the last story is sealed: another one can start */
 			pdot_signer_wipe(&g.session);
@@ -1498,8 +1539,32 @@ tag_chain_choose(
 			if (replay_next(value, sizeof(value))) {
 				s3_set_variable_string(g.choose_var, value);
 				status("replayed choice %s = %s", g.choose_var, value);
-				if (!g.replay[g.replay_at])
+				if (g.watching) {
+					/* say which answer they gave, in the option's words */
+					char key[16], buf[200];
+					const char *text = value;
+					int i;
+					for (i = 1; i <= 8; i++) {
+						snprintf(key, sizeof(key), "value%d", i);
+						if (strcmp(s3_get_tag_arg_string(key, true, ""), value) == 0) {
+							snprintf(key, sizeof(key), "text%d", i);
+							text = s3_get_tag_arg_string(key, true, value);
+							break;
+						}
+					}
+					snprintf(buf, sizeof(buf), "%s chose: %s", g.watch_name, text);
+					notice(buf, 0, 1);
+				} else if (!g.replay[g.replay_at]) {
 					replay_end();
+				}
+				return s3_move_to_next_tag();
+			}
+			if (g.watching) {
+				/* an unfinished story: they have not lived the rest yet */
+				g.watching = g.replaying = 0;
+				status("story %u ends here for now", g.watch_item);
+				if (g.watch_end_label[0] && s3_move_to_label_tag(g.watch_end_label))
+					return true;
 				return s3_move_to_next_tag();
 			}
 			replay_end();
@@ -1530,6 +1595,11 @@ tag_chain_ending(
 	if (!s3_is_in_command_repetition()) {
 		if (!s3i_check_tag_properties(ending_props))
 			return false;
+		if (g.watching) {
+			g.watching = g.replaying = 0;
+			status("watched story %u to its ending", g.watch_item);
+			return s3_move_to_next_tag();  /* someone else's: nothing to record */
+		}
 		if (g.state != ST_OPEN)
 			return s3_move_to_next_tag();  /* offline: nothing to record */
 		s3_evaluate_tag();
@@ -1618,6 +1688,30 @@ tag_chain_friend(
 	return s3_move_to_next_tag();
 }
 
+static const char *watch_props[] = { "end_label", NULL };
+
+/*
+ * [chain_watch end_label="..."]: the next [chain_start] plays the friend's
+ * story [chain_friend] last read, with their name and traits, picking their
+ * recorded answers, and writes nothing. An unfinished story jumps to
+ * end_label after its last recorded answer.
+ */
+static bool
+tag_chain_watch(
+	void *p)
+{
+	(void)p;
+	if (!s3i_check_tag_properties(watch_props))
+		return false;
+	s3_evaluate_tag();
+	if (g.watch_ready) {
+		g.watching = 1;
+		snprintf(g.watch_end_label, sizeof(g.watch_end_label), "%s",
+			 s3_get_tag_arg_string("end_label", true, ""));
+	}
+	return s3_move_to_next_tag();
+}
+
 bool
 s3i_install_chain_tags(void)
 {
@@ -1625,7 +1719,8 @@ s3i_install_chain_tags(void)
 	       s3_install_tag("Tag_chain_choose", tag_chain_choose) &&
 	       s3_install_tag("Tag_chain_choice", tag_chain_choice) &&
 	       s3_install_tag("Tag_chain_ending", tag_chain_ending) &&
-	       s3_install_tag("Tag_chain_friend", tag_chain_friend);
+	       s3_install_tag("Tag_chain_friend", tag_chain_friend) &&
+	       s3_install_tag("Tag_chain_watch", tag_chain_watch);
 }
 
 void
@@ -1644,6 +1739,8 @@ s3i_chain_poll(void)
 void
 s3i_chain_save(void)
 {
+	if (g.watching)
+		return;  /* someone else's story: saved locally only, as any save */
 	if (g.state != ST_OPEN) {
 		if (g.state != ST_NONE)
 			save_notice("Saved locally only: this story is not on chain", 1, 1);
