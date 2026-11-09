@@ -5,11 +5,12 @@ Polkadot Asset Hub, built on the [Suika3](https://github.com/awemorris/suika3)
 engine with libpdot. There is no game server and no operator: the player's
 account and the chain are all there is.
 
-- **One signature, then the game signs alone.** Starting a story, the player
-  signs one `Utility.batch_all`: it funds a fresh session key, mints the
-  story NFT to the player in the game's collection (public minting), approves
-  the session key to write attributes on it, and records the player's name
-  and the seed block as the player's own attribute.
+- **Two signatures: one to start, one to seal.** Starting a story, the
+  player signs one `Utility.batch_all`: it funds a fresh session key, mints
+  the story NFT to the player in the game's collection (public minting),
+  approves the session key to write attributes on it, and records the
+  player's name and the seed block as the player's own attribute. In
+  between, the game signs alone.
 - **Every summer is different.** The hash of the newest final block when the
   story starts, together with the player's account, sets three character
   traits from 0 to 100: how bold Xiaoling is, how much Midori trusts you, how
@@ -20,10 +21,16 @@ account and the chain are all there is.
   attribute namespace) through `pdot_async`. A write shows up within seconds
   when it is in a block (`pdot_async_set_included_fn`), and again once
   final.
-- **The ending, confirmed.** The last choices, the ending and the return of
-  the session key's funds go in one transaction. The game waits until it is
-  final and says so on screen ("Story saved on chain: all 4 choices and the
-  ending, block B, final") before the closing scene.
+- **The player seals the ending, and nothing is left behind.** pallet-nfts
+  takes an attribute's deposit from whoever pays for writing it, so the
+  session key's choices hold about 0.01 WND each. At the end the session
+  key signs the final choices and ending for its namespace, and the player
+  submits them (`Nfts.set_attributes_pre_signed`): the player, who owns the
+  NFT, now holds the deposits, and the session key's are released. Once
+  that is final, the session key sends everything back (`transfer_all`) and
+  its account is gone. The game waits for both and says so on screen
+  ("Story sealed on chain: all 4 choices and the ending, block B, final")
+  before the closing scene.
 - **Save and Load.** The engine's own save also makes sure every choice so
   far is on the NFT, and confirms it once final ("Saved on chain: all N
   choices, block B, final"). Load restores the local save, and the choices
@@ -81,20 +88,19 @@ cmake --build --preset macos
 
 The first configure applies `patches/suika3.patch` to the submodule; libpdot's
 `git status` does not show the change (`ignore = dirty` in `.gitmodules`). The
-playable game ends up in `build/game`. A `linux` preset is there too, but has
-not been tried.
+playable game ends up in `build/game`. On Linux, use the `linux` preset; CI
+builds it ([`ci/visualnovel.sh`](../../ci/visualnovel.sh) lists the Debian
+packages), but nobody has played it there yet.
 
 ## Playing
 
 The game needs an Asset Hub node and a collection that anyone can mint into.
-Start libpdot's development network: `examples/asteroids/devnet.sh` (Asset
-Hub alone) or `devnet-relay.sh` (with a relay chain, for proven results). Both
-create the asteroids trophy collection 0. Then create the story collection,
-which will be 1, as //Alice:
-
-```bash
-build/pdot-bulletin --rpc http://127.0.0.1:9944 --seed e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a call Nfts create '["5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", {"settings": 0, "max_supply": null, "mint_settings": {"mint_type": "Public", "price": null, "start_block": null, "end_block": null, "default_item_settings": 0}}]'
-```
+libpdot's development networks set up both: `examples/asteroids/devnet.sh`
+(Asset Hub and Bulletin) or `examples/asteroids/devnet-relay.sh` (under a
+relay chain, for proven results). After the asteroids trophy collection 0,
+they create the story collection 1, owned by //Alice with public minting.
+`devnet-relay.sh` also writes a checkpoint and prints the game's command
+with `PDOT_RELAY` and `PDOT_CHECKPOINT` set.
 
 Run the game from inside its folder (it keeps saves and the unfinished story
 there):
@@ -115,10 +121,6 @@ Settings come from the environment:
 | `PDOT_RELAY`, `PDOT_CHECKPOINT` | prove results from relay-chain finality | off |
 
 Without a chain the story still plays, with a local seed, and says so.
-
-Each story leaves about 0.02 WND reserved in its session key: the deposits
-for the attributes it wrote (pallet-nfts charges the account that writes in
-its own namespace).
 
 ## Updating Suika3
 

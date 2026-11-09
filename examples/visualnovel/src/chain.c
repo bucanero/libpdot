@@ -29,12 +29,18 @@
  *	choices made meanwhile go out together in the next.
  *
  *   [chain_ending name="B"]
- *	Records the last choices and the ending, and sends the session key's
- *	funds back, in one transaction. Waits until it is final, showing its
- *	progress at the top left of the screen, so the player knows the story
- *	is complete on chain before the game says so. A choices
- *	write still waiting for finality is not waited for: its transaction
- *	lands anyway, and the ending carries every choice.
+ *	The player seals the story, with a second signature: the last
+ *	choices and the ending, signed by the session key for its own
+ *	attribute namespace, submitted and paid for by the player, who owns
+ *	the NFT (Nfts.set_attributes_pre_signed). pallet-nfts takes an
+ *	attribute's deposit from whoever pays for it, so this also moves the
+ *	session key's deposits to the player. Once that is final, the session
+ *	key sends everything it holds back to the player (transfer_all) and is
+ *	gone: nothing is left behind. Waits for both, showing the progress at
+ *	the top left of the screen, so the player knows the story is complete
+ *	on chain before the game says so. A choices write still in flight is
+ *	waited for first: it is the session key's, the seal the player's, so
+ *	nothing else would keep it from landing after the seal.
  *
  * Continuing: [chain_start] saves the session key and the story's item
  * and seed block to pdot-story.txt (readable by this user only) before
@@ -109,6 +115,8 @@ struct job {
 	char		choices[CHOICES_MAX + 1];
 	char		ending[ENDING_MAX + 1];
 	pdot_tx_result	tx;
+	int		sealed;		/* end: the player's seal is final; tx is the funds' return */
+	pdot_tx_result	seal;		/* end: the player's seal */
 
 	/* start: filled on the worker before the transaction is sent;
 	   resume: from the story file */
@@ -458,20 +466,6 @@ work_start(
 	return rc;
 }
 
-/* Nfts.set_attribute(collection, item, Account(session key), key, value), as JSON. */
-static void
-attribute_json(
-	char *out,
-	size_t cap,
-	const char *session,
-	const char *key,
-	const char *value)
-{
-	snprintf(out, cap,
-		 "{\"Nfts\":{\"set_attribute\":[%u,%u,{\"Account\":\"%s\"},\"%s\",\"%s\"]}}",
-		 g.collection, g.item, session, key, value);
-}
-
 static int
 work_write(
 	pdot_client *c,
@@ -493,25 +487,63 @@ work_write(
 	return rc;
 }
 
+/*
+ * The ending, in two transactions. The player seals the story: the last
+ * choices and the ending go in the session key's attribute namespace,
+ * signed by the session key (Nfts.set_attributes_pre_signed) but submitted
+ * and paid for by the player, who owns the NFT. That moves the attributes'
+ * deposits from the session key to the player. Once that is final, the
+ * session key sends everything it holds back to the player and is gone.
+ */
 static int
 work_end(
 	pdot_client *c,
 	void *ud)
 {
 	struct job *j = ud;
-	char session[67], player[67], a[512], b[256], json[1024];
-	uint8_t *call;
-	size_t len;
+	char session[67], player[67], zero[131], json[1024];
+	uint8_t *call, sig[64];
+	size_t len, data_len;
 	int rc;
 
 	hex32(g.session.account_id, session);
 	hex32(g.player.account_id, player);
-	attribute_json(a, sizeof(a), session, "choices", j->choices);
-	attribute_json(b, sizeof(b), session, "ending", j->ending);
-	/* The session key's funds go back in the same transaction. */
+
+	/*
+	 * Encoded with a blank signature first: the call is pallet, call, the
+	 * data, then MultiSignature::Sr25519 (1 + 64 bytes) and the signer
+	 * (32), so the data the session key signs is what lies between.
+	 */
+	memset(zero, '0', sizeof(zero) - 1);
+	zero[0] = '0';
+	zero[1] = 'x';
+	zero[sizeof(zero) - 1] = '\0';
 	snprintf(json, sizeof(json),
-		 "[[%s,%s,{\"Balances\":{\"transfer_all\":[\"%s\",false]}}]]", a, b, player);
-	if ((rc = pdot_call_from_json(c, "Utility", "batch_all", json, &call, &len)))
+		 "[[%u,%u,[[\"choices\",\"%s\"],[\"ending\",\"%s\"]],{\"Account\":\"%s\"},"
+		 "4294967295],{\"Sr25519\":\"%s\"},\"%s\"]",
+		 g.collection, g.item, j->choices, j->ending, session, zero, session);
+	if ((rc = pdot_call_from_json(c, "Nfts", "set_attributes_pre_signed", json, &call, &len)))
+		return rc;
+	if (len < 2 + 97) {
+		pdot_free(call);
+		return PDOT_E_INVALID;
+	}
+	data_len = len - 2 - 97;
+	if ((rc = pdot_signer_sign(&g.session, call + 2, data_len, sig))) {
+		pdot_free(call);
+		return rc;
+	}
+	memcpy(call + 2 + data_len + 1, sig, 64);
+	rc = pdot_tx_submit(c, &g.player, call, len, NULL, &j->seal);
+	pdot_free(call);
+	if (rc) {
+		j->tx = j->seal;  /* the error to report */
+		return rc;
+	}
+	j->sealed = 1;
+
+	snprintf(json, sizeof(json), "[\"%s\",false]", player);
+	if ((rc = pdot_call_from_json(c, "Balances", "transfer_all", json, &call, &len)))
 		return rc;
 	rc = pdot_tx_submit(c, &g.session, call, len, NULL, &j->tx);
 	pdot_free(call);
@@ -637,12 +669,20 @@ on_included(
 		}
 		break;
 	case J_END:
-		status("ending \"%s\" in block %u", j->ending, where->block);
 		{
 			char buf[160];
-			snprintf(buf, sizeof(buf),
-				 "Recording your ending: in block %u, waiting for finality...",
-				 where->block);
+			if (!j->sealed) {
+				status("ending \"%s\" sealed by the player in block %u", j->ending,
+				       where->block);
+				snprintf(buf, sizeof(buf),
+					 "Sealing your ending: in block %u, waiting for finality...",
+					 where->block);
+			} else {
+				status("session key's funds returning in block %u", where->block);
+				snprintf(buf, sizeof(buf),
+					 "Ending sealed; returning the session key's funds "
+					 "(block %u)...", where->block);
+			}
 			notice(buf, 0, 0);
 		}
 		break;
@@ -801,7 +841,7 @@ job_done(
 			g.dirty = 0;
 		break;
 	case J_END:
-		if (rc) {
+		if (rc && !j->sealed) {
 			char buf[200];
 			fail("the ending was not recorded", why);
 			snprintf(buf, sizeof(buf), "Ending not saved on chain: %s", why);
@@ -809,14 +849,23 @@ job_done(
 		} else {
 			char buf[200];
 			g.state = ST_ENDED;
-			snprintf(buf, sizeof(buf), "Story saved on chain: all %u choices and the ending, "
-				 "block %u, %s", (unsigned)count_choices(j->choices), j->tx.block,
-				 j->tx.verified ? "final and proven" : "final");
+			snprintf(buf, sizeof(buf), "Story sealed on chain: all %u choices and the ending, "
+				 "block %u, %s", (unsigned)count_choices(j->choices), j->seal.block,
+				 j->seal.verified ? "final and proven" : "final");
 			notice(buf, 0, 1);
-			status("ending final (block %u%s); session key's funds returned",
-			       j->tx.block, j->tx.verified ? ", proven" : "");
-			remove(STORY_FILE);  /* nothing left to continue */
-			remove(CHOICES_FILE);
+			status("ending sealed by the player, final (block %u%s)", j->seal.block,
+			       j->seal.verified ? ", proven" : "");
+			if (rc) {
+				char addr[PDOT_SS58_MAX_LEN];
+				pdot_ss58_encode(g.session.account_id, 42, addr, sizeof(addr));
+				status("the session key's funds were not returned: %s; they stay with "
+				       "%s (its seed is in %s)", why, addr, STORY_FILE);
+			} else {
+				status("session key emptied: everything it held is back with the player "
+				       "(block %u%s)", j->tx.block, j->tx.verified ? ", proven" : "");
+				remove(STORY_FILE);  /* nothing left to continue */
+				remove(CHOICES_FILE);
+			}
 		}
 		break;
 	}
@@ -1103,16 +1152,20 @@ tag_chain_ending(
 		if (g.state != ST_OPEN)
 			return s3_move_to_next_tag();  /* offline: nothing to record */
 		s3_evaluate_tag();
-		g.dirty = 0;  /* the ending carries every choice */
-		if (g.writing)  /* stop waiting for its finality: the ending goes next */
-			pdot_async_cancel(g.a, g.write_id);
+		/*
+		 * The ending carries every choice. A choices write in flight is
+		 * waited for (jobs run in order): it is the session key's, the
+		 * seal the player's, so nothing else keeps it from landing after
+		 * the seal and taking a deposit back.
+		 */
+		g.dirty = 0;
 		if (!(j = queue(J_END, work_end, s3_get_tag_arg_string("name", false, ""), NULL))) {
 			fail("the ending was not recorded", "could not queue the transaction");
 			return s3_move_to_next_tag();
 		}
 		g.state = ST_ENDING;
-		status("recording the ending \"%s\"", j->ending);
-		notice("Recording your ending on chain...", 0, 0);
+		status("sealing the ending \"%s\": the player signs", j->ending);
+		notice("Sealing your ending on chain (your signature)...", 0, 0);
 		s3_start_command_repetition();
 	}
 	if (g.state == ST_ENDING)

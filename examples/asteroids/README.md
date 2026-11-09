@@ -130,7 +130,8 @@ cmake --build build-game -j
 In one terminal, start the local dev chains. The script builds an Asset Hub
 node (port 9944) and a Bulletin node (port 9945) from Westend's runtimes.
 //Bob creates trophy collection 0 on Asset Hub, and //Eve authorizes //Bob
-to store on Bulletin:
+to store on Bulletin (//Alice also creates collection 1, for the
+[visual novel](../visualnovel)):
 
 ```bash
 OMNI_NODE=/path/to/polkadot-omni-node examples/asteroids/devnet.sh
