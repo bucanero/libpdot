@@ -1,3 +1,8 @@
 [submodule "third_party/sr25519-donna"]
 	path = third_party/sr25519-donna
 	url = https://github.com/TerenceGe/sr25519-donna
+[submodule "examples/visualnovel/suika3"]
+	path = examples/visualnovel/suika3
+	url = https://github.com/awemorris/suika3.git
+	update = none
+	ignore = dirty

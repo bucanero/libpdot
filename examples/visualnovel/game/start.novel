@@ -1,0 +1,264 @@
+#
+# The Last Week of Summer
+#
+# A short story for the libpdot sample. Each playthrough is unique: the
+# chain_start tag seeds three character traits from a recent Asset Hub
+# block and the player's account, so the same answer can please one
+# player's Xiaoling and disappoint another's. Every choice is recorded on
+# the player's story NFT ([chain_choose]); the ending too. Quit midway and
+# the next run continues the same story from the NFT.
+#
+
+[config name="game.locale" value="en"]
+
+#
+# Title Screen
+#
+
+[volume track="bgm" vol="0.5"]
+[bgm file="sound/bgm/start.ogg"]
+[gui file="system/title/title.gui"]
+
+[label name="start"]
+[volume track="bgm" vol="0.0" span="1.0"]
+[wait time="1.0"]
+
+[set name="xiao" value="0"]
+[set name="mido" value="0"]
+
+#
+# The story begins on chain: the player signs once.
+#
+
+[bg file="images/bg/black.png" time="0.5"]
+[text text="Opening your story on chain... (one signature)"]
+
+[chain_start collection="1" name="Player" traits="xiao_bold mido_trust xiao_patience"]
+
+[if lhs="${chain_resumed}" op="==" rhs="1"]
+  [text text="Welcome back. Story #${chain_item} continues from where you left it: your choices so far are on chain."]
+[elseif lhs="${chain_status}" op="==" rhs="ok"]
+  [text text="Story #${chain_item} begins, seeded from block ${chain_block}. No one else will live this summer the same way."]
+[else]
+  [text text="Playing without a chain (${chain_status}). Your summer is still your own."]
+[endif]
+
+#
+# 1. The invitation
+#
+
+[chapter name="Monday"]
+[bg file="images/bg/school.png" time="0.5"]
+[volume track="bgm" vol="0.5"]
+[bgm file="sound/bgm/afternoon2.ogg"]
+
+[text text="The last week of summer. The classroom smells of dust and sunscreen."]
+
+[ch time="1.0" fade="normal" left="images/ch/xiaoling/xiaoling-normal.png"]
+
+[if lhs="${xiao_bold}" op=">=" rhs="50"]
+  [text text="Xiaoling is already standing by your desk, bag over her shoulder, grinning like she has a plan."]
+[else]
+  [text text="Xiaoling hovers near the door, tugging at her sleeve, glancing at you and then away."]
+[endif]
+
+[text name="Xiaoling" text="Hey, ${player_name}... there's a new cafe by the station. Want to go after class?"]
+
+[chain_choose name="c1"
+  text1="Sure, let's go!"
+  text2="Not today, sorry."
+  value1="yes"
+  value2="no"
+]
+
+[if lhs="${c1}" op="==" rhs="yes"]
+  [if lhs="${xiao_bold}" op=">=" rhs="50"]
+    [ch left="images/ch/xiaoling/xiaoling-happy.png" time="0.5" fade="normal"]
+    [text name="Xiaoling" text="Yes! I knew you'd say that. Come on, before the good seats are gone!"]
+    [set name="xiao" value1="${xiao}" op="+" value2="2"]
+  [else]
+    [text name="Xiaoling" text="Oh! Um... okay. I didn't think you'd actually say yes."]
+    [text text="She walks a little ahead of you the whole way, saying almost nothing."]
+  [endif]
+[else]
+  [if lhs="${xiao_bold}" op=">=" rhs="50"]
+    [text name="Xiaoling" text="Seriously? ...Fine. Your loss."]
+    [text text="She leaves without looking back."]
+    [set name="xiao" value1="${xiao}" op="-" value2="1"]
+  [else]
+    [ch left="images/ch/xiaoling/xiaoling-smile.png" time="0.5" fade="normal"]
+    [text name="Xiaoling" text="That's okay. Honestly... I was nervous about asking. Maybe later this week?"]
+    [text text="She sounds relieved. You get the feeling you just did her a kindness."]
+    [set name="xiao" value1="${xiao}" op="+" value2="1"]
+  [endif]
+[endif]
+
+[ch left="none" time="0.5"]
+
+#
+# 2. Midori's secret
+#
+
+[chapter name="Wednesday"]
+
+[ch time="0.5" fade="normal" right="images/ch/midori/midori-normal.png"]
+
+[if lhs="${mido_trust}" op=">=" rhs="50"]
+  [text text="Midori waves you over and lowers her voice, like you're the only one she'd tell."]
+[else]
+  [text text="Midori checks the hallway twice before she speaks, as if she half expects to regret it."]
+[endif]
+
+[text name="Midori" text="I'm moving away after the festival. My parents decided last night. Xiaoling doesn't know yet."]
+
+[text name="Midori" text="Should I tell her? Or... could you keep it between us, for now?"]
+
+[chain_choose name="c2"
+  text1="Your secret is safe with me."
+  text2="You should tell Xiaoling."
+  value1="keep"
+  value2="tell"
+]
+
+[if lhs="${c2}" op="==" rhs="keep"]
+  [if lhs="${mido_trust}" op=">=" rhs="50"]
+    [ch right="images/ch/midori/midori-smile.png" time="0.5" fade="normal"]
+    [text name="Midori" text="Thank you. I knew I could count on you."]
+    [set name="mido" value1="${mido}" op="+" value2="2"]
+  [else]
+    [text name="Midori" text="...Right. Of course. That's the easy answer, isn't it."]
+    [text text="She was hoping you'd push her. You didn't."]
+    [set name="mido" value1="${mido}" op="-" value2="1"]
+  [endif]
+[else]
+  [if lhs="${mido_trust}" op=">=" rhs="50"]
+    [text name="Midori" text="I told you because I trusted you. Not so you'd tell me what to do."]
+    [set name="mido" value1="${mido}" op="-" value2="1"]
+  [else]
+    [ch right="images/ch/midori/midori-happy.png" time="0.5" fade="normal"]
+    [text name="Midori" text="You're right. I needed someone to say it out loud. I'll tell her tonight."]
+    [set name="mido" value1="${mido}" op="+" value2="2"]
+    [set name="xiao" value1="${xiao}" op="+" value2="1"]
+  [endif]
+[endif]
+
+[ch right="none" time="0.5"]
+
+#
+# 3. The festival
+#
+
+[chapter name="Saturday"]
+[bg file="images/bg/black.png" time="1.0"]
+[text text="Saturday night. Lanterns along the river, the smell of grilled corn, drums somewhere far away."]
+
+[ch time="0.5" fade="normal" left="images/ch/xiaoling/xiaoling-normal.png" right="images/ch/midori/midori-normal.png"]
+
+[text name="Xiaoling" text="The fireworks start at nine. Walk with me to the bridge?"]
+[text name="Midori" text="I promised to help at my aunt's stall... it's my last festival here. Stay with me a while?"]
+
+[chain_choose name="c3"
+  text1="Walk to the bridge with Xiaoling."
+  text2="Help Midori at the stall."
+  value1="bridge"
+  value2="stall"
+]
+
+[if lhs="${c3}" op="==" rhs="bridge"]
+  [ch right="none" time="0.5"]
+  [if lhs="${xiao_patience}" op=">=" rhs="50"]
+    [ch left="images/ch/xiaoling/xiaoling-smile.png" time="0.5" fade="normal"]
+    [text text="You wait an hour on the bridge for the fireworks. Xiaoling doesn't mind the wait at all; she tells you about every summer she can remember."]
+    [set name="xiao" value1="${xiao}" op="+" value2="2"]
+  [else]
+    [text text="The fireworks are late. Xiaoling paces, checks her phone, sighs. When they finally start, she's already talking about going home."]
+    [set name="xiao" value1="${xiao}" op="+" value2="1"]
+  [endif]
+[else]
+  [ch left="none" time="0.5"]
+  [ch right="images/ch/midori/midori-happy.png" time="0.5" fade="normal"]
+  [text text="You flip skewers and hand out change until your fingers ache. Midori laughs more than you've ever heard her laugh."]
+  [set name="mido" value1="${mido}" op="+" value2="2"]
+[endif]
+
+[ch left="none" right="none" time="0.5"]
+
+#
+# 4. The last day
+#
+
+[chapter name="Sunday"]
+[bg file="images/bg/school.png" time="1.0"]
+[text text="The last day of summer. Tomorrow everything starts again, and some things won't."]
+
+[if lhs="${xiao}" op=">=" rhs="${mido}"]
+  [ch time="0.5" fade="normal" center="images/ch/xiaoling/xiaoling-normal.png"]
+  [text name="Xiaoling" text="${player_name}... can I say something weird?"]
+[else]
+  [ch time="0.5" fade="normal" center="images/ch/midori/midori-normal.png"]
+  [text name="Midori" text="Before I go... there's something I wanted to say."]
+[endif]
+
+[chain_choose name="c4"
+  text1="Say what you feel."
+  text2="Smile, and keep it to yourself."
+  value1="confess"
+  value2="quiet"
+]
+
+[ch center="none" time="0.5"]
+
+#
+# Endings
+#
+
+[if lhs="${c4}" op="==" rhs="confess"]
+  [if lhs="${xiao}" op=">=" rhs="4"]
+    [set name="ending" value="A"]
+  [elseif lhs="${mido}" op=">=" rhs="4"]
+    [set name="ending" value="B"]
+  [else]
+    [set name="ending" value="D"]
+  [endif]
+[else]
+  [if lhs="${xiao}" op=">=" rhs="2"]
+    [set name="ending" value="C"]
+  [elseif lhs="${mido}" op=">=" rhs="2"]
+    [set name="ending" value="C"]
+  [else]
+    [set name="ending" value="D"]
+  [endif]
+[endif]
+
+[if lhs="${ending}" op="==" rhs="A"]
+  [ch center="images/ch/xiaoling/xiaoling-happy.png" time="1.0" fade="normal"]
+  [text text="Ending A: Fireworks for Two. Xiaoling takes your hand, and for once she doesn't look away."]
+  [set name="ending_name" value="A Fireworks for Two"]
+[elseif lhs="${ending}" op="==" rhs="B"]
+  [ch center="images/ch/midori/midori-happy.png" time="1.0" fade="normal"]
+  [text text="Ending B: The Stall by the River. Midori writes her new address on your palm. You promise to visit before the first snow."]
+  [set name="ending_name" value="B The Stall by the River"]
+[elseif lhs="${ending}" op="==" rhs="C"]
+  [ch left="images/ch/xiaoling/xiaoling-smile.png" right="images/ch/midori/midori-smile.png" time="1.0" fade="normal"]
+  [text text="Ending C: Three of Us. Nothing is said, and nothing needs to be. Some summers are better left exactly as they were."]
+  [set name="ending_name" value="C Three of Us"]
+[else]
+  [text text="Ending D: The Summer That Slipped Away. The week is over before you understood what it was for."]
+  [set name="ending_name" value="D The Summer That Slipped Away"]
+[endif]
+
+#
+# The ending goes on chain, and the session key's funds go back.
+#
+
+# Waits until the ending is final; the progress shows at the top left.
+[chain_ending name="${ending_name}"]
+
+[ch left="none" right="none" center="none" time="0.5"]
+[bg file="images/bg/black.png" time="1.0"]
+
+[if lhs="${chain_status}" op="==" rhs="ok"]
+  [text text="Your story is recorded on Asset Hub: collection ${chain_collection}, item ${chain_item}, with every choice you made. Ask a friend to play: their summer will not be yours."]
+[else]
+  [text text="The end. (${chain_status})"]
+[endif]
