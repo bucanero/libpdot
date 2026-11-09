@@ -5,6 +5,11 @@ plus `asteroids-operator`, the game's server. The game holds the player's
 keys; the operator holds the operator key, re-runs every claimed game from
 its replay and checks the score on chain before it acts on it.
 
+![The title screen: the record, the player's trophies and the session key's status](screenshot.png)
+
+*The title screen, read from the chain: the record and its holder, the player's
+trophies, and at the bottom the newest final block and the session key, ready.*
+
 - **One signature from the player.** At startup the player's account adds a
   fresh session key as a `NonTransfer` proxy and funds it, in one transaction
   (`pdot_proxy_add`). After that the game signs alone, and the key cannot

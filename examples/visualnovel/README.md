@@ -5,6 +5,11 @@ Polkadot Asset Hub, built on the [Suika3](https://github.com/awemorris/suika3)
 engine with libpdot. There is no game server and no operator: the player's
 account and the chain are all there is.
 
+![Ending C on screen while the player's seal waits for finality](screenshot.webp)
+
+*Ending C, "Three of Us", while the player's seal of the story waits for finality
+(top left).*
+
 - **Two signatures: one to start, one to seal.** Starting a story, the
   player signs one `Utility.batch_all`: it funds a fresh session key, mints
   the story NFT to the player in the game's collection (public minting),
@@ -151,5 +156,6 @@ cd .. && git -C ../.. add examples/visualnovel/suika3 examples/visualnovel/patch
 
 Suika3 is under the zlib license, © Awe Morris / SCHOLA SUIKAE; the patch and
 `game/` are changes to it, and the game folder the build assembles is
-Suika3's sample assets with this story added. `src/chain.c` is part of the
+Suika3's sample assets with this story added. The screenshot shows those
+assets. `src/chain.c` is part of the
 libpdot sample.

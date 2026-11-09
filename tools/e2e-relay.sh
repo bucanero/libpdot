@@ -38,9 +38,21 @@ EVE_SR=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
 PIDS=
 WATCH_PID=
 KEEP_LOGS=
+# Stops the processes and waits for each to exit (SIGKILL after 15 s), so a
+# node has closed its database before the work directory goes: removing it
+# while the node still writes fails with "Directory not empty".
+stop() {
+    for p in "$@"; do kill "$p" 2>/dev/null || true; done
+    for p in "$@"; do
+        (sleep 15; kill -9 "$p" 2>/dev/null) &
+        w=$!
+        wait "$p" 2>/dev/null || true
+        kill "$w" 2>/dev/null || true
+    done
+}
 cleanup() {
-    for p in $PIDS $WATCH_PID; do kill "$p" 2>/dev/null || true; done
-    if [ -n "$KEEP_LOGS" ]; then echo "logs kept in $WORK"; else rm -rf "$WORK"; fi
+    stop $PIDS $WATCH_PID
+    if [ -n "$KEEP_LOGS" ]; then echo "logs kept in $WORK"; else rm -rf "$WORK" || true; fi
 }
 trap cleanup EXIT INT TERM
 
