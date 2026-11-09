@@ -11,6 +11,9 @@ account and the chain are all there is.
   approves the session key to write attributes on it, and records the
   player's name and the seed block as the player's own attribute. In
   between, the game signs alone.
+- **Your name on it.** A new story asks the player's name first; it goes on
+  the NFT and into the story's lines. A continued story reads it back from
+  the NFT.
 - **Every summer is different.** The hash of the newest final block when the
   story starts, together with the player's account, sets three character
   traits from 0 to 100: how bold Xiaoling is, how much Midori trusts you, how
@@ -62,7 +65,7 @@ The story uses four tags from [`src/chain.c`](src/chain.c); its header
 comment documents them in full:
 
 ```
-[chain_start collection="1" name="Player" traits="xiao_bold mido_trust xiao_patience"]
+[chain_start collection="1" name="Player" ask_name="true" traits="xiao_bold mido_trust xiao_patience"]
 [chain_choose name="c1" text1="Sure, let's go!" value1="yes" text2="Not today." value2="no"]
 [chain_choice var="result"]
 [chain_ending name="${ending_name}"]
@@ -115,7 +118,7 @@ Settings come from the environment:
 |---|---|---|
 | `PDOT_RPC` | Asset Hub RPC | `http://127.0.0.1:9944` |
 | `PDOT_PLAYER_SEED` | the player's sr25519 seed, hex | //Alice (dev chains only) |
-| `PDOT_PLAYER_NAME` | the name on the story NFT | the tag's `name=` |
+| `PDOT_PLAYER_NAME` | the name on the story NFT, without asking | asked when a story starts |
 | `PDOT_COLLECTION` | the story collection | the tag's `collection=` (1) |
 | `PDOT_FUND` | tokens sent to the session key | 1 |
 | `PDOT_RELAY`, `PDOT_CHECKPOINT` | prove results from relay-chain finality | off |

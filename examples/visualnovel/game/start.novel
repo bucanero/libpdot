@@ -31,9 +31,9 @@
 #
 
 [bg file="images/bg/black.png" time="0.5"]
-[text text="Opening your story on chain... (one signature)"]
+[text text="Opening your story on chain. You sign twice: now, to start it, and at the end, to seal it."]
 
-[chain_start collection="1" name="Player" traits="xiao_bold mido_trust xiao_patience"]
+[chain_start collection="1" name="Player" ask_name="true" traits="xiao_bold mido_trust xiao_patience"]
 
 [if lhs="${chain_resumed}" op="==" rhs="1"]
   [text text="Welcome back. Story #${chain_item} continues from where you left it: your choices so far are on chain."]
