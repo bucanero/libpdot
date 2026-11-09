@@ -2,8 +2,9 @@
 # pdot-asteroids under a local relay chain, for proven mode: a westend-local
 # relay (validators //Alice and //Bob) with Asset Hub as parachain 1000 and
 # the Bulletin chain as parachain 2487, from the runtimes live on Westend.
-# Then the same setup as devnet.sh (//Bob's trophy collection 0, //Eve
-# authorizing //Bob on Bulletin) and a checkpoint for the verifiers.
+# Then the same setup as devnet.sh (//Bob's trophy collection 0, //Alice's
+# story collection 1 for examples/visualnovel, //Eve authorizing //Bob on
+# Bulletin) and a checkpoint for the verifiers.
 #
 #   VALIDATOR_EXTRA_ARGS=--insecure-validator-i-know-what-i-do \
 #   POLKADOT=/path/to/polkadot OMNI_NODE=/path/to/polkadot-omni-node \
@@ -36,12 +37,27 @@ CK=$BUILD/asteroids-relay.ck
 BOB=398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89
 BOB_ADDR=5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty
 EVE=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
+# //Alice: owns examples/visualnovel's story collection.
+ALICE=e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a
+ALICE_ADDR=5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 
 PIDS=
 KEEP_LOGS=
+# Stops the processes and waits for each to exit (SIGKILL after 15 s), so a
+# node has closed its database before the work directory goes: removing it
+# while the node still writes fails with "Directory not empty".
+stop() {
+    for p in "$@"; do kill "$p" 2>/dev/null || true; done
+    for p in "$@"; do
+        (sleep 15; kill -9 "$p" 2>/dev/null) &
+        w=$!
+        wait "$p" 2>/dev/null || true
+        kill "$w" 2>/dev/null || true
+    done
+}
 cleanup() {
-    for p in $PIDS; do kill "$p" 2>/dev/null || true; done
-    if [ -n "$KEEP_LOGS" ]; then echo "logs kept in $WORK"; else rm -rf "$WORK"; fi
+    stop $PIDS
+    if [ -n "$KEEP_LOGS" ]; then echo "logs kept in $WORK"; else rm -rf "$WORK" || true; fi
 }
 trap cleanup EXIT INT TERM
 fail() { echo "FAIL: $*"; show_logs; exit 1; }
@@ -197,6 +213,14 @@ echo "== //Bob creates trophy collection 0 on Asset Hub (proven)"
 grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "Nfts.create"; }
 grep 'verified' "$WORK/tx.out" || true
 
+echo "== //Alice creates story collection 1 for examples/visualnovel (public minting, proven)"
+# shellcheck disable=SC2086
+"$CLI" --rpc $AH $V --para-id $AH_ID --seed $ALICE call Nfts create "[\"$ALICE_ADDR\", {\"settings\": 0,
+    \"max_supply\": null, \"mint_settings\": {\"mint_type\": \"Public\", \"price\": null,
+    \"start_block\": null, \"end_block\": null, \"default_item_settings\": 0}}]" \
+    > "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "Nfts.create (story)"; }
+grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "Nfts.create (story)"; }
+
 echo "== //Eve authorizes //Bob on Bulletin: 1000 stores, 16 MiB (proven)"
 # shellcheck disable=SC2086
 "$CLI" --rpc $BULLETIN $V --para-id $BULLETIN_ID --seed $EVE authorize $BOB_ADDR 1000 16777216 \
@@ -212,8 +236,11 @@ if [ -f asteroids-claims.txt ]; then
 fi
 cp "$CK" "$BUILD/asteroids-operator.ck"
 cp "$CK" "$BUILD/asteroids-game.ck"
+cp "$CK" "$BUILD/visualnovel.ck"
 echo "== ready. In two more terminals:"
 echo "   $BUILD/examples/asteroids/asteroids-operator --relay $RELAY --checkpoint $BUILD/asteroids-operator.ck"
 echo "   $BUILD/examples/asteroids/asteroids --relay $RELAY --checkpoint $BUILD/asteroids-game.ck"
+echo "   The visual novel, proven: cd examples/visualnovel/build/game &&"
+echo "     PDOT_RELAY=$RELAY PDOT_CHECKPOINT=$(cd "$BUILD" && pwd)/visualnovel.ck ./Suika3.app/Contents/MacOS/Suika3"
 echo "   (Ctrl-C here stops the chains)"
 wait

@@ -1,0 +1,120 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 767fb9ba..3b1721ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -592,7 +592,10 @@ if(   SUIKA_TARGET_MACOS
+   # Exclude Homebrew packaging.
+   #  - Homebrew provides arch-specific libraries.
+   #  - If we try to make a fat binary, link will fail.
+-  if(NOT SUIKA_ENABLE_DIST AND NOT SUIKA_ENABLE_DIST_CONSERVATIVE)
++  #  - Likewise with libpdot (SUIKA_WITH_PDOT, set by libpdot's
++  #    examples/visualnovel): its mbedTLS, cJSON and curl come from
++  #    Homebrew, for this Mac's architecture only.
++  if(NOT SUIKA_ENABLE_DIST AND NOT SUIKA_ENABLE_DIST_CONSERVATIVE AND NOT SUIKA_WITH_PDOT)
+     set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "" FORCE)
+   endif()
+ endif()
+diff --git a/src/api.c b/src/api.c
+index e96d5401..3b17a357 100644
+--- a/src/api.c
++++ b/src/api.c
+@@ -33,6 +33,7 @@
+ #include "game.h"
+ #include "image.h"
+ #include "text.h"
++#include "cmd.h"  /* s3i_chain_poll */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -1028,6 +1029,11 @@ Suika_update(
+ {
+ 	UNUSED_PARAMETER(p);
+ 
++#if defined(S3_USE_PDOT)
++	/* Chain results arrive here, once a frame (src/chain.c). */
++	s3i_chain_poll();
++#endif
++
+ 	if (!s3i_on_game_update())
+ 		return false;
+ 
+diff --git a/src/cmd.h b/src/cmd.h
+index 9c3694b3..0e060488 100644
+--- a/src/cmd.h
++++ b/src/cmd.h
+@@ -38,6 +38,22 @@
+ bool
+ s3i_install_tag_funcs(void);
+ 
++#if defined(S3_USE_PDOT)
++/* src/chain.c: the chain tags, and their per-frame poll. */
++bool
++s3i_install_chain_tags(void);
++
++void
++s3i_chain_poll(void);
++
++/* After the engine's local save / load (src/save.c). */
++void
++s3i_chain_save(void);
++
++void
++s3i_chain_loaded(void);
++#endif
++
+ /*
+  * Specially visible: The "gui" tag function. 
+  */
+diff --git a/src/game.c b/src/game.c
+index 473d1f74..f1467823 100755
+--- a/src/game.c
++++ b/src/game.c
+@@ -196,6 +196,12 @@ pf_init_hook(
+ 	if (!s3i_install_tag_funcs())
+ 		return false;
+ 
++#if defined(S3_USE_PDOT)
++	/* Install the chain tags (src/chain.c). */
++	if (!s3i_install_chain_tags())
++		return false;
++#endif
++
+ 	return true;
+ }
+ 
+diff --git a/src/save.c b/src/save.c
+index 876e3139..1167240d 100644
+--- a/src/save.c
++++ b/src/save.c
+@@ -31,6 +31,7 @@
+ #include "save.h"
+ #include "conf.h"
+ #include "image.h"
++#include "cmd.h"  /* s3i_chain_save, s3i_chain_loaded */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -625,6 +626,11 @@ s3_execute_save_local(
+ 		return false;
+ 	}
+ 
++#if defined(S3_USE_PDOT)
++	/* The choices so far go on chain too (src/chain.c). */
++	s3i_chain_save();
++#endif
++
+ 	return true;
+ }
+ 
+@@ -928,6 +934,11 @@ s3_execute_load_local(
+ 		return false;
+ 	}
+ 
++#if defined(S3_USE_PDOT)
++	/* The choices up to this point come back (src/chain.c). */
++	s3i_chain_loaded();
++#endif
++
+ 	return true;
+ }
+ 

@@ -21,9 +21,21 @@ ALICE_ADDR=5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 BOB_ADDR=5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty
 
 NODE_PID=
+# Stops the processes and waits for each to exit (SIGKILL after 15 s), so a
+# node has closed its database before the work directory goes: removing it
+# while the node still writes fails with "Directory not empty".
+stop() {
+    for p in "$@"; do kill "$p" 2>/dev/null || true; done
+    for p in "$@"; do
+        (sleep 15; kill -9 "$p" 2>/dev/null) &
+        w=$!
+        wait "$p" 2>/dev/null || true
+        kill "$w" 2>/dev/null || true
+    done
+}
 cleanup() {
-    if [ -n "$NODE_PID" ]; then kill "$NODE_PID" 2>/dev/null || true; fi
-    rm -rf "$WORK"
+    stop $NODE_PID
+    rm -rf "$WORK" || true
 }
 trap cleanup EXIT INT TERM
 

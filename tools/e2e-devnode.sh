@@ -30,11 +30,21 @@ EVE_SR=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
 NODE_PID=
 KUBO_PID=
 WATCH_PID=
+# Stops the processes and waits for each to exit (SIGKILL after 15 s), so a
+# node has closed its database before the work directory goes: removing it
+# while the node still writes fails with "Directory not empty".
+stop() {
+    for p in "$@"; do kill "$p" 2>/dev/null || true; done
+    for p in "$@"; do
+        (sleep 15; kill -9 "$p" 2>/dev/null) &
+        w=$!
+        wait "$p" 2>/dev/null || true
+        kill "$w" 2>/dev/null || true
+    done
+}
 cleanup() {
-    if [ -n "$WATCH_PID" ]; then kill "$WATCH_PID" 2>/dev/null || true; fi
-    if [ -n "$NODE_PID" ]; then kill "$NODE_PID" 2>/dev/null || true; fi
-    if [ -n "$KUBO_PID" ]; then kill "$KUBO_PID" 2>/dev/null || true; fi
-    rm -rf "$WORK"
+    stop $WATCH_PID $NODE_PID $KUBO_PID
+    rm -rf "$WORK" || true
 }
 trap cleanup EXIT INT TERM
 

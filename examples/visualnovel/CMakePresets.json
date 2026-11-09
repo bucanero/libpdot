@@ -1,0 +1,35 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "macos",
+            "displayName": "macOS (this Mac's architecture, Homebrew libraries)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0",
+                "CMAKE_PREFIX_PATH": "/opt/homebrew/opt/mbedtls@3;/opt/homebrew/opt/cjson",
+                "SUIKA_TARGET_MACOS": "ON",
+                "SUIKA_ENABLE_JIT": "ON",
+                "SUIKA_ENABLE_I18N": "ON"
+            }
+        },
+        {
+            "name": "linux",
+            "displayName": "Linux",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "SUIKA_TARGET_LINUX": "ON",
+                "SUIKA_ENABLE_JIT": "ON",
+                "SUIKA_ENABLE_I18N": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "macos", "configurePreset": "macos" },
+        { "name": "linux", "configurePreset": "linux" }
+    ]
+}

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Local dev chains for pdot-asteroids, built like tools/e2e-assethub.sh and
 # tools/e2e-devnode.sh from the runtimes deployed on Westend (no Rust build):
-#   Asset Hub  http://127.0.0.1:9944  //Bob, the operator's key, creates trophy collection 0
+#   Asset Hub  http://127.0.0.1:9944  //Bob, the operator's key, creates trophy collection 0;
+#                                     //Alice creates story collection 1 for examples/visualnovel
 #   Bulletin   http://127.0.0.1:9945  //Eve authorizes //Bob to store the leaderboard
 # The nodes run until Ctrl-C.
 #
@@ -23,12 +24,27 @@ BULLETIN=http://127.0.0.1:9945
 BOB=398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89
 BOB_ADDR=5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty
 EVE=786ad0e2df456fe43dd1f91ebca22e235bc162e0bb8d53c633e8c85b2af68b7a
+# //Alice: owns examples/visualnovel's story collection.
+ALICE=e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a
+ALICE_ADDR=5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 
 AH_PID=
 BULLETIN_PID=
+# Stops the processes and waits for each to exit (SIGKILL after 15 s), so a
+# node has closed its database before the work directory goes: removing it
+# while the node still writes fails with "Directory not empty".
+stop() {
+    for p in "$@"; do kill "$p" 2>/dev/null || true; done
+    for p in "$@"; do
+        (sleep 15; kill -9 "$p" 2>/dev/null) &
+        w=$!
+        wait "$p" 2>/dev/null || true
+        kill "$w" 2>/dev/null || true
+    done
+}
 cleanup() {
-    for p in $AH_PID $BULLETIN_PID; do kill "$p" 2>/dev/null || true; done
-    rm -rf "$WORK"
+    stop $AH_PID $BULLETIN_PID
+    rm -rf "$WORK" || true
 }
 trap cleanup EXIT INT TERM
 fail() { echo "FAIL: $*"; exit 1; }
@@ -81,6 +97,13 @@ echo "== //Bob creates trophy collection 0 on Asset Hub"
     > "$WORK/tx.out"
 grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "Nfts.create"; }
 
+echo "== //Alice creates story collection 1 for examples/visualnovel (public minting)"
+"$CLI" --rpc $AH --seed $ALICE call Nfts create "[\"$ALICE_ADDR\", {\"settings\": 0,
+    \"max_supply\": null, \"mint_settings\": {\"mint_type\": \"Public\", \"price\": null,
+    \"start_block\": null, \"end_block\": null, \"default_item_settings\": 0}}]" \
+    > "$WORK/tx.out"
+grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "Nfts.create (story)"; }
+
 echo "== //Eve authorizes //Bob on Bulletin: 1000 stores, 16 MiB"
 "$CLI" --rpc $BULLETIN --seed $EVE authorize $BOB_ADDR 1000 16777216 > "$WORK/tx.out"
 grep -q 'dispatch:   ok' "$WORK/tx.out" || { cat "$WORK/tx.out"; fail "authorize"; }
@@ -93,4 +116,5 @@ if [ -f asteroids-claims.txt ]; then
 fi
 echo "== ready: run $BUILD/examples/asteroids/asteroids-operator, then"
 echo "   $BUILD/examples/asteroids/asteroids, each in its own terminal (Ctrl-C here stops the nodes)"
+echo "   The visual novel: cd examples/visualnovel/build/game && ./Suika3.app/Contents/MacOS/Suika3"
 wait "$AH_PID"
