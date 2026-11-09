@@ -1077,8 +1077,13 @@ tag_chain_choose(
 	}
 	if (!s3i_tag_choose(p))
 		return false;
-	/* [choose] has moved on: the player picked (or there was nothing to pick). */
-	if (!s3_is_in_command_repetition() && g.choose_var[0]) {
+	/*
+	 * [choose] has moved on: the player picked (or there was nothing to
+	 * pick). Unless it stopped to open the system menu (save, load...):
+	 * then nothing was picked, and the tag runs again when the menu
+	 * closes, or a load replaces the story.
+	 */
+	if (!s3_is_in_command_repetition() && !s3_is_gui_running() && g.choose_var[0]) {
 		add_choice(s3_get_variable_string(g.choose_var));
 		g.choose_var[0] = '\0';
 	}
