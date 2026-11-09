@@ -15,6 +15,7 @@
 # Title Screen
 #
 
+[label name="title"]
 [volume track="bgm" vol="0.5"]
 [bgm file="sound/bgm/start.ogg"]
 [gui file="system/title/title.gui"]
@@ -26,11 +27,22 @@
 [set name="xiao" value="0"]
 [set name="mido" value="0"]
 
+[bg file="images/bg/black.png" time="0.5"]
+[choose name="mode"
+  text1="Begin your summer"
+  text2="Read a friend's story"
+  value1="play"
+  value2="friend"
+]
+[if lhs="${mode}" op="==" rhs="friend"]
+  [goto name="friend"]
+[endif]
+
 #
-# The story begins on chain: the player signs once.
+# The story begins on chain: the player signs to start it (and, at the
+# end, to seal it).
 #
 
-[bg file="images/bg/black.png" time="0.5"]
 [text text="Opening your story on chain. You sign twice: now, to start it, and at the end, to seal it."]
 
 [chain_start collection="1" name="Player" ask_name="true" traits="xiao_bold mido_trust xiao_patience"]
@@ -258,7 +270,74 @@
 [bg file="images/bg/black.png" time="1.0"]
 
 [if lhs="${chain_status}" op="==" rhs="ok"]
-  [text text="Your story is recorded on Asset Hub: collection ${chain_collection}, item ${chain_item}, with every choice you made. Ask a friend to play: their summer will not be yours."]
+  [text text="Your story is sealed on Asset Hub as story #${chain_item}, with every choice you made. A friend can read it from the title screen, by that number, and play their own: their summer will not be yours."]
 [else]
   [text text="The end. (${chain_status})"]
 [endif]
+
+[goto name="title"]
+
+#
+# A friend's story: read from the chain by its number. Same questions,
+# their characters, their answers, their ending.
+#
+
+[label name="friend"]
+[chain_friend collection="1" traits="xiao_bold mido_trust xiao_patience"]
+
+[if lhs="${friend_status}" op="==" rhs="ok"]
+  [text text="Story #${friend_item}: ${friend_name}'s summer, seeded from block ${friend_block}."]
+  [if lhs="${friend_traits_known}" op="==" rhs="1"]
+    [if lhs="${friend_xiao_bold}" op=">=" rhs="50"]
+      [set name="f_bold" value="bold"]
+    [else]
+      [set name="f_bold" value="shy"]
+    [endif]
+    [if lhs="${friend_mido_trust}" op=">=" rhs="50"]
+      [set name="f_trust" value="trusting"]
+    [else]
+      [set name="f_trust" value="guarded"]
+    [endif]
+    [if lhs="${friend_xiao_patience}" op=">=" rhs="50"]
+      [set name="f_patience" value="patient"]
+    [else]
+      [set name="f_patience" value="restless"]
+    [endif]
+    [text text="In that summer, Xiaoling was ${f_bold} (${friend_xiao_bold}) and ${f_patience} (${friend_xiao_patience}); Midori was ${f_trust} (${friend_mido_trust})."]
+  [else]
+    [text text="Their seed block is older than the chain keeps, so their Xiaoling and Midori stay a mystery."]
+  [endif]
+
+  [if lhs="${friend_c1}" op="==" rhs="yes"]
+    [text text="Monday: they said yes to the cafe."]
+  [elseif lhs="${friend_c1}" op="==" rhs="no"]
+    [text text="Monday: they turned down the cafe."]
+  [endif]
+  [if lhs="${friend_c2}" op="==" rhs="keep"]
+    [text text="Wednesday: they kept Midori's secret."]
+  [elseif lhs="${friend_c2}" op="==" rhs="tell"]
+    [text text="Wednesday: they told Midori to tell Xiaoling."]
+  [endif]
+  [if lhs="${friend_c3}" op="==" rhs="bridge"]
+    [text text="Saturday: they walked to the bridge with Xiaoling."]
+  [elseif lhs="${friend_c3}" op="==" rhs="stall"]
+    [text text="Saturday: they helped Midori at her aunt's stall."]
+  [endif]
+  [if lhs="${friend_c4}" op="==" rhs="confess"]
+    [text text="Sunday: they said what they felt."]
+  [elseif lhs="${friend_c4}" op="==" rhs="quiet"]
+    [text text="Sunday: they smiled, and kept it to themselves."]
+  [endif]
+
+  [if lhs="${friend_finished}" op="==" rhs="1"]
+    [text text="Their summer ended with ending ${friend_ending}."]
+  [else]
+    [text text="Their story is still being written: ${friend_count} choices so far."]
+  [endif]
+  [text text="Your answers might be the same as theirs. Your summer won't be."]
+[elseif lhs="${friend_status}" op="==" rhs="cancelled"]
+[else]
+  [text text="That story could not be read: ${friend_status}."]
+[endif]
+
+[goto name="title"]

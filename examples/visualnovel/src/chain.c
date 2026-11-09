@@ -11,8 +11,9 @@
  *	its NFT. Then the player signs one transaction (Utility.batch_all): it funds a
  *	fresh session key, mints the story NFT to the player in the game's
  *	collection (public minting: no operator), approves the session key
- *	to set attributes on it, and records "name=... block=N" as the
- *	player's own attribute. Block N is the newest final block when the
+ *	to set attributes on it, and records "name=... block=N session=..."
+ *	as the player's own attribute (the session key's address, so anyone
+ *	can find the choices from the story's number alone). Block N is the newest final block when the
  *	story starts; its hash and the player's account seed the story,
  *	setting each trait variable to 0..100, so the same choice lands
  *	differently for different players. The tag waits only until the
@@ -44,6 +45,15 @@
  *	on chain before the game says so. A choices write still in flight is
  *	waited for first: it is the session key's, the seal the player's, so
  *	nothing else would keep it from landing after the seal.
+ *
+ *   [chain_friend collection="1" traits="rei_warmth,mio_trust"]
+ *	Asks for a story's number and reads it from the chain: friend_status
+ *	("ok", "cancelled", "not found: ..." or "offline: ..."), friend_item,
+ *	friend_name, friend_owner, friend_block, friend_choices, friend_c1,
+ *	friend_c2..., friend_count, friend_finished, friend_ending,
+ *	friend_ending_id, and the friend's traits as friend_<trait> when
+ *	friend_traits_known is 1 (the seed block is within the last 4096,
+ *	which the chain keeps hashes for).
  *
  * Continuing: [chain_start] saves the session key and the story's item
  * and seed block to pdot-story.txt (readable by this user only) before
@@ -113,7 +123,7 @@ bool s3i_tag_choose(void *p);
 #define TRAITS_MAX	256
 
 enum { ST_NONE, ST_RESUMING, ST_NAMING, ST_STARTING, ST_OPEN, ST_ENDING, ST_ENDED, ST_FAILED };
-enum { J_START, J_WRITE, J_END, J_RESUME };
+enum { J_START, J_WRITE, J_END, J_RESUME, J_FRIEND };
 
 struct job {
 	int		kind;
@@ -134,8 +144,14 @@ struct job {
 	int		resume;		/* 1: continue it; 0: start a new story */
 	int		finished;	/* the story has its ending */
 	char		name[NAME_MAX + 1];	/* the name on it */
+
+	/* friend: someone's story, read by its item number */
+	uint8_t		owner[32];
+	int		has_hash;	/* block_hash is the seed block's (the chain still keeps it) */
 	char		why[160];	/* why not, when resume is 0 */
 };
+
+enum { PROMPT_NONE, PROMPT_NAME, PROMPT_STORY };
 
 static struct {
 	pdot_async	*a;
@@ -145,7 +161,14 @@ static struct {
 	uint8_t		block_hash[32];
 	char		name[NAME_MAX + 1];
 	int		ask_name;	/* a new story asks the player's name first */
-	int		name_keys;	/* Return and Backspace as they were last frame */
+
+	/* the prompt in the middle of the screen: the name, or a story's number */
+	int		prompt;		/* PROMPT_* */
+	char		input[NAME_MAX + 1];
+	int		prompt_keys;	/* Return, Backspace, Escape as they were last frame */
+
+	/* [chain_friend]: 0 idle, 1 asking the number, 2 reading, 3 done */
+	int		friend;
 	char		traits[TRAITS_MAX];
 	char		choices[CHOICES_MAX + 1];
 	int		state;
@@ -317,13 +340,20 @@ splitmix(
  * player's account: a different cast of characters for every player and
  * every story.
  */
+/*
+ * Sets each trait named in traits (commas or spaces between) to 0..100, from
+ * the seed block's hash and the player's account, as prefix + name.
+ */
 static void
-set_traits(
+set_traits_as(
+	const char *traits,
+	const char *prefix,
 	const uint8_t block_hash[32],
-	const uint8_t account[32])
+	const uint8_t account[32],
+	int log)
 {
-	char name[64];
-	const char *s = g.traits;
+	char name[96];
+	const char *s = traits;
 	uint64_t x = 0xcbf29ce484222325ull;
 	size_t n;
 	int i;
@@ -335,19 +365,27 @@ set_traits(
 	while (*s) {
 		int v;
 
-		/* names separated by commas or spaces */
 		while (*s == ',' || *s == ' ')
 			s++;
 		for (n = 0; s[n] && s[n] != ',' && s[n] != ' '; n++)
 			;
 		if (!n)
 			break;
-		snprintf(name, sizeof(name), "%.*s", (int)n, s);
+		snprintf(name, sizeof(name), "%s%.*s", prefix, (int)n, s);
 		s += n;
 		v = (int)(splitmix(&x) % 101);
 		s3_set_variable_int(name, v);
-		status("trait %s = %d", name, v);
+		if (log)
+			status("trait %s = %d", name, v);
 	}
+}
+
+static void
+set_traits(
+	const uint8_t block_hash[32],
+	const uint8_t account[32])
+{
+	set_traits_as(g.traits, "", block_hash, account, 1);
 }
 
 /* ---- the story file -------------------------------------------------- */
@@ -423,6 +461,7 @@ work_start(
 {
 	struct job *j = ud;
 	char symbol[16], amount[64], player[67], session[67], json[1536];
+	char session_ss58[PDOT_SS58_MAX_LEN];
 	uint8_t decimals, seed[32];
 	pdot_balance bal;
 	pdot_u128 fund;
@@ -456,17 +495,18 @@ work_start(
 
 	hex32(g.player.account_id, player);
 	hex32(j->session.account_id, session);
+	pdot_ss58_encode(j->session.account_id, 42, session_ss58, sizeof(session_ss58));
 	snprintf(json, sizeof(json),
 		 "[["
 		 "{\"Balances\":{\"transfer_keep_alive\":[\"%s\",\"%s\"]}},"
 		 "{\"Nfts\":{\"mint\":[%u,%u,\"%s\",null]}},"
 		 "{\"Nfts\":{\"approve_item_attributes\":[%u,%u,\"%s\"]}},"
-		 "{\"Nfts\":{\"set_attribute\":[%u,%u,\"ItemOwner\",\"story\",\"name=%s block=%u\"]}}"
+		 "{\"Nfts\":{\"set_attribute\":[%u,%u,\"ItemOwner\",\"story\",\"name=%s block=%u session=%s\"]}}"
 		 "]]",
 		 session, amount,
 		 g.collection, j->item, player,
 		 g.collection, j->item, session,
-		 g.collection, j->item, g.name, j->block);
+		 g.collection, j->item, g.name, j->block, session_ss58);
 	if ((rc = pdot_call_from_json(c, "Utility", "batch_all", json, &call, &len)))
 		return rc;
 	rc = pdot_tx_submit(c, &g.player, call, len, NULL, &j->tx);
@@ -635,6 +675,134 @@ work_resume(
 
 /* ---- results: run inside s3i_chain_poll, on the game thread ---------- */
 
+/*
+ * Someone's story, by item number: its owner and "story" attribute (name,
+ * seed block and session key), then the choices and ending in the session
+ * key's namespace, and the seed block's hash for their traits while the
+ * chain keeps it. Everything is read at the newest final block, proven
+ * with a verifier.
+ */
+static int
+work_friend(
+	pdot_client *c,
+	void *ud)
+{
+	struct job *j = ud;
+	const char *key, *p;
+	pdot_nft_item item;
+	pdot_nft_attribute a;
+	pdot_final_block at;
+	char v[260];
+	uint16_t prefix;
+	int rc;
+
+	if ((rc = pdot_nft_item_get(c, g.collection, j->item, &item)))
+		return rc;
+	if (!item.exists) {
+		snprintf(j->why, sizeof(j->why), "there is no story %u", j->item);
+		return 0;
+	}
+	memcpy(j->owner, item.owner, 32);
+	key = "story";
+	if ((rc = pdot_nft_attribute_get(c, g.collection, 1, j->item, PDOT_NFT_NS_ITEM_OWNER,
+					 NULL, (const uint8_t *)key, strlen(key), &a)))
+		return rc;
+	if (!a.exists) {
+		snprintf(j->why, sizeof(j->why), "story %u was never opened", j->item);
+		return 0;
+	}
+	snprintf(v, sizeof(v), "%.*s", (int)a.len, (const char *)a.value);
+	if ((p = strstr(v, "block=")) != NULL)
+		j->block = (uint32_t)strtoul(p + 6, NULL, 10);
+	if (!(p = strstr(v, "session=")) ||
+	    pdot_ss58_decode(p + 8, j->session.account_id, &prefix)) {
+		snprintf(j->why, sizeof(j->why), "story %u is from before stories named their "
+			 "session key", j->item);
+		return 0;
+	}
+	if (strncmp(v, "name=", 5) == 0) {
+		char *end = strstr(v, " block=");
+		if (end)
+			*end = '\0';
+		clean(j->name, sizeof(j->name), v + 5, 1);
+	}
+	key = "choices";
+	if ((rc = pdot_nft_attribute_get(c, g.collection, 1, j->item, PDOT_NFT_NS_ACCOUNT,
+					 j->session.account_id, (const uint8_t *)key, strlen(key),
+					 &a)))
+		return rc;
+	if (a.exists)
+		snprintf(j->choices, sizeof(j->choices), "%.*s", (int)a.len, (const char *)a.value);
+	key = "ending";
+	if ((rc = pdot_nft_attribute_get(c, g.collection, 1, j->item, PDOT_NFT_NS_ACCOUNT,
+					 j->session.account_id, (const uint8_t *)key, strlen(key),
+					 &a)))
+		return rc;
+	if (a.exists) {
+		j->finished = 1;
+		snprintf(j->ending, sizeof(j->ending), "%.*s", (int)a.len, (const char *)a.value);
+	}
+	rc = pdot_block_hash_get(c, j->block, j->block_hash, &at);
+	if (rc == 0)
+		j->has_hash = 1;
+	else if (rc != PDOT_E_NOTFOUND)  /* not found: older than the chain keeps */
+		return rc;
+	j->resume = 1;  /* found */
+	return 0;
+}
+
+/* The friend's story into variables for the script: friend_*. */
+static void
+friend_done(
+	struct job *j,
+	int rc,
+	const char *error)
+{
+	char name[32], owner[PDOT_SS58_MAX_LEN];
+	const char *s = j->choices;
+	int n = 0;
+
+	g.friend = 3;
+	notice(NULL, 0, 0);
+	if (rc || !j->resume) {
+		char buf[200];
+		snprintf(buf, sizeof(buf), "not found: %s", rc ? error : j->why);
+		s3_set_variable_string("friend_status", buf);
+		status("friend's story %u: %s", j->item, rc ? error : j->why);
+		return;
+	}
+	pdot_ss58_encode(j->owner, 42, owner, sizeof(owner));
+	s3_set_variable_string("friend_status", "ok");
+	s3_set_variable_int("friend_item", (int)j->item);
+	s3_set_variable_string("friend_name", j->name[0] ? j->name : "Someone");
+	s3_set_variable_string("friend_owner", owner);
+	s3_set_variable_int("friend_block", (int)j->block);
+	s3_set_variable_string("friend_choices", j->choices);
+	s3_set_variable_int("friend_finished", j->finished);
+	s3_set_variable_string("friend_ending", j->ending);
+	snprintf(name, sizeof(name), "%c", j->ending[0] ? j->ending[0] : '-');
+	s3_set_variable_string("friend_ending_id", name);
+	/* friend_c1, friend_c2...: the choices in order */
+	while (*s && n < 32) {
+		size_t len = strcspn(s, ",");
+		char value[24];
+		snprintf(value, sizeof(value), "%.*s", (int)len, s);
+		snprintf(name, sizeof(name), "friend_c%d", ++n);
+		s3_set_variable_string(name, value);
+		s += len;
+		if (*s == ',')
+			s++;
+	}
+	s3_set_variable_int("friend_count", n);
+	s3_set_variable_int("friend_traits_known", j->has_hash);
+	if (j->has_hash)
+		set_traits_as(g.traits, "friend_", j->block_hash, j->owner, 0);
+	status("friend's story %u/%u: %s's, seeded from block %u%s; choices \"%s\"%s%s",
+	       g.collection, j->item, j->name, j->block,
+	       j->has_hash ? "" : " (too old for its traits)", j->choices,
+	       j->finished ? "; ending " : "; still being written", j->ending);
+}
+
 static void
 fail(
 	const char *what,
@@ -780,60 +948,64 @@ draw_line(
 	}
 }
 
-/* The prompt in the middle of the screen (text layer 7); NULL name hides it. */
+/* The prompt in the middle of the screen (text layer 7), or none. */
 static void
-draw_name_prompt(
-	const char *name)
+draw_prompt(void)
 {
 	struct s3_image *img;
 	char line[NAME_MAX + 8];
+	const char *title, *hint;
 	const int w = 640, h = 190;
 
-	if (!name) {
+	if (g.prompt == PROMPT_NONE) {
 		s3_set_layer_image(S3_LAYER_TEXT7, NULL);
 		return;
+	}
+	if (g.prompt == PROMPT_NAME) {
+		title = "Who is living this summer?";
+		hint = "Type your name, then press Return. It goes on your story NFT.";
+	} else {
+		title = "Whose summer? Their story's number:";
+		hint = "Digits, then Return. Escape (or an empty number) goes back.";
 	}
 	if (!(img = s3_create_image(w, h)))
 		return;
 	s3_fill_image_rect(img, 0, 0, w, h, s3_make_pixel(200, 0, 0, 0));
-	draw_line(img, "Who is living this summer?", 30, 30, 24, s3_make_pixel(255, 255, 255, 255));
-	snprintf(line, sizeof(line), "%s_", name);
+	draw_line(img, title, 30, 30, 24, s3_make_pixel(255, 255, 255, 255));
+	snprintf(line, sizeof(line), "%s_", g.input);
 	draw_line(img, line, 36, 30, 78, s3_make_pixel(255, 255, 230, 140));
-	draw_line(img, "Type your name, then press Return. It goes on your story NFT.", 18, 30,
-		  142, s3_make_pixel(255, 190, 190, 190));
+	draw_line(img, hint, 18, 30, 142, s3_make_pixel(255, 190, 190, 190));
 	s3_notify_image_update(img);
 	s3_set_layer_image(S3_LAYER_TEXT7, img);  /* the layer owns it now */
 	s3_set_layer_position(S3_LAYER_TEXT7, (1280 - w) / 2, (720 - h) / 2 - 40);
 	s3_set_layer_alpha(S3_LAYER_TEXT7, 255);
 }
 
-/* A new story: the player names it first if asked to, else it opens now. */
 static void
-begin_new(void)
+prompt_open(
+	int kind)
 {
-	if (g.ask_name) {
-		g.state = ST_NAMING;
-		g.name[0] = '\0';
-		g.name_keys = 3;  /* ignore a Return still held from the title screen */
-		draw_name_prompt(g.name);
-		status("asking the player's name");
-		return;
-	}
-	if (!queue(J_START, work_start, NULL, NULL)) {
-		fail("the story was not opened", "could not queue the transaction");
-		return;
-	}
-	g.state = ST_STARTING;
-	status("opening the story: %s signs once", g.name);
+	g.prompt = kind;
+	g.input[0] = '\0';
+	g.prompt_keys = 7;  /* ignore keys still held from before */
+	draw_prompt();
+}
+
+static void
+prompt_close(void)
+{
+	g.prompt = PROMPT_NONE;
+	draw_prompt();
 }
 
 /*
- * A frame of the prompt. Playfield reports letters and digits for the frame
- * they are pressed in; Return and Backspace while held, so those count when
- * they go down.
+ * A frame of the prompt: 1 when Return confirms g.input, -1 on Escape, 0
+ * while typing. Playfield reports letters and digits for the frame they are
+ * pressed in; Return, Backspace and Escape while held, so those count when
+ * they go down. A name takes letters, digits and spaces; a number, digits.
  */
-static void
-name_frame(void)
+static int
+prompt_frame(void)
 {
 	static const struct { const bool *key; char lower; } keys[] = {
 		{ &pf_is_a_key_pressed, 'a' }, { &pf_is_b_key_pressed, 'b' },
@@ -855,46 +1027,78 @@ name_frame(void)
 		{ &pf_is_7_key_pressed, '7' }, { &pf_is_8_key_pressed, '8' },
 		{ &pf_is_9_key_pressed, '9' }, { &pf_is_0_key_pressed, '0' },
 	};
-	const size_t max = 16;
-	int held = (pf_is_return_key_pressed ? 1 : 0) | (pf_is_backspace_key_pressed ? 2 : 0);
-	int down = held & ~g.name_keys;
-	size_t n = strlen(g.name), i;
+	const int digits_only = g.prompt == PROMPT_STORY;
+	const size_t max = digits_only ? 10 : 16;
+	int held = (pf_is_return_key_pressed ? 1 : 0) | (pf_is_backspace_key_pressed ? 2 : 0) |
+		   (pf_is_escape_key_pressed ? 4 : 0);
+	int down = held & ~g.prompt_keys;
+	size_t n = strlen(g.input), i;
 	int changed = 0;
 
-	g.name_keys = held;
+	g.prompt_keys = held;
+	if (down & 4)
+		return -1;
 	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-		if (*keys[i].key && n < max) {
-			char ch = keys[i].lower;
-			if (ch >= 'a' && ch <= 'z' && (pf_is_shift_key_pressed || n == 0 ||
-						      g.name[n - 1] == ' '))
-				ch = (char)(ch - 'a' + 'A');  /* capitalized as typed */
-			g.name[n++] = ch;
-			g.name[n] = '\0';
-			changed = 1;
-		}
+		char ch = keys[i].lower;
+		if (!*keys[i].key || n >= max || (digits_only && (ch < '0' || ch > '9')))
+			continue;
+		if (ch >= 'a' && ch <= 'z' && (pf_is_shift_key_pressed || n == 0 ||
+					      g.input[n - 1] == ' '))
+			ch = (char)(ch - 'a' + 'A');  /* capitalized as typed */
+		g.input[n++] = ch;
+		g.input[n] = '\0';
+		changed = 1;
 	}
-	if (pf_is_space_key_pressed && n > 0 && n < max && g.name[n - 1] != ' ') {
-		g.name[n++] = ' ';
-		g.name[n] = '\0';
+	if (!digits_only && pf_is_space_key_pressed && n > 0 && n < max &&
+	    g.input[n - 1] != ' ') {
+		g.input[n++] = ' ';
+		g.input[n] = '\0';
 		changed = 1;
 	}
 	if ((down & 2) && n > 0) {
-		g.name[--n] = '\0';
+		g.input[--n] = '\0';
 		changed = 1;
 	}
 	if (down & 1) {
-		while (n > 0 && g.name[n - 1] == ' ')
-			g.name[--n] = '\0';
-		if (n == 0)
-			snprintf(g.name, sizeof(g.name), "Player");
-		draw_name_prompt(NULL);
-		s3_set_variable_string("player_name", g.name);
-		g.ask_name = 0;
-		begin_new();
-		return;
+		while (n > 0 && g.input[n - 1] == ' ')
+			g.input[--n] = '\0';
+		return 1;
 	}
 	if (changed)
-		draw_name_prompt(g.name);
+		draw_prompt();
+	return 0;
+}
+
+/* A new story: the player names it first if asked to, else it opens now. */
+static void
+begin_new(void)
+{
+	if (g.ask_name) {
+		g.state = ST_NAMING;
+		prompt_open(PROMPT_NAME);
+		status("asking the player's name");
+		return;
+	}
+	if (!queue(J_START, work_start, NULL, NULL)) {
+		fail("the story was not opened", "could not queue the transaction");
+		return;
+	}
+	g.state = ST_STARTING;
+	status("opening the story: %s signs once", g.name);
+}
+
+/* A frame of the name prompt. */
+static void
+name_frame(void)
+{
+	if (prompt_frame() != 1)
+		return;  /* Escape does nothing here: a story needs a name */
+	if (g.input[0])
+		snprintf(g.name, sizeof(g.name), "%s", g.input);
+	prompt_close();
+	s3_set_variable_string("player_name", g.name);
+	g.ask_name = 0;
+	begin_new();
 }
 
 /* The saved story checks out: carry on with it. */
@@ -969,6 +1173,9 @@ job_done(
 			remove(CHOICES_FILE);
 		}
 		begin_new();
+		break;
+	case J_FRIEND:
+		friend_done(j, rc, error);
 		break;
 	case J_START:
 		if (rc)
@@ -1086,6 +1293,8 @@ open_chain(void)
 	uint8_t seed[32];
 	pdot_client *c;
 
+	if (g.a)
+		return NULL;  /* already open: [chain_friend] may have opened it */
 	if (!seed_hex) {
 		/* //Alice: a dev account, for local dev chains only */
 		seed_hex = "e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
@@ -1162,8 +1371,15 @@ tag_chain_start(
 		if (!s3i_check_tag_properties(start_props))
 			return false;
 		s3_evaluate_tag();  /* ${var} in arguments */
+		if (g.state == ST_ENDED) {
+			/* the last story is sealed: another one can start */
+			pdot_signer_wipe(&g.session);
+			g.state = ST_NONE;
+			g.choices[0] = g.final_choices[0] = g.replay[0] = '\0';
+			g.saving = g.dirty = g.replaying = 0;
+		}
 		if (g.state != ST_NONE)
-			return s3_move_to_next_tag();  /* one story per run */
+			return s3_move_to_next_tag();  /* one story at a time */
 		g.collection = getenv("PDOT_COLLECTION") ?
 			(uint32_t)strtoul(getenv("PDOT_COLLECTION"), NULL, 10) :
 			(uint32_t)s3_get_tag_arg_int("collection", false, 0);
@@ -1339,13 +1555,77 @@ tag_chain_ending(
 	return s3_move_to_next_tag();
 }
 
+static const char *friend_props[] = { "collection", "traits", NULL };
+
+/*
+ * [chain_friend collection="1" traits="..."]: asks for a story's number and
+ * reads that story from the chain into friend_* variables.
+ */
+static bool
+tag_chain_friend(
+	void *p)
+{
+	(void)p;
+	if (!s3_is_in_command_repetition()) {
+		const char *why;
+
+		if (!s3i_check_tag_properties(friend_props))
+			return false;
+		s3_evaluate_tag();
+		s3_set_variable_string("friend_status", "cancelled");
+		g.collection = getenv("PDOT_COLLECTION") ?
+			(uint32_t)strtoul(getenv("PDOT_COLLECTION"), NULL, 10) :
+			(uint32_t)s3_get_tag_arg_int("collection", false, 0);
+		snprintf(g.traits, sizeof(g.traits), "%s", s3_get_tag_arg_string("traits", true, ""));
+		if ((why = open_chain()) != NULL) {
+			char buf[300];
+			snprintf(buf, sizeof(buf), "offline: %s", why);
+			s3_set_variable_string("friend_status", buf);
+			return s3_move_to_next_tag();
+		}
+		g.friend = 1;
+		prompt_open(PROMPT_STORY);
+		s3_start_command_repetition();
+		return true;
+	}
+	if (g.friend == 1) {
+		int r = prompt_frame();
+		if (r == 0)
+			return true;
+		prompt_close();
+		if (r == 1 && g.input[0]) {
+			struct job *j = calloc(1, sizeof(*j));
+			if (j) {
+				char buf[96];
+				j->kind = J_FRIEND;
+				j->item = (uint32_t)strtoul(g.input, NULL, 10);
+				if (pdot_async_run(g.a, work_friend, job_done, j)) {
+					g.friend = 2;
+					snprintf(buf, sizeof(buf), "Reading story #%u from the chain...",
+						 j->item);
+					notice(buf, 0, 0);
+					return true;
+				}
+				free(j);
+			}
+		}
+		g.friend = 3;  /* cancelled */
+	}
+	if (g.friend == 2)
+		return true;  /* s3i_chain_poll delivers it */
+	g.friend = 0;
+	s3_stop_command_repetition();
+	return s3_move_to_next_tag();
+}
+
 bool
 s3i_install_chain_tags(void)
 {
 	return s3_install_tag("Tag_chain_start", tag_chain_start) &&
 	       s3_install_tag("Tag_chain_choose", tag_chain_choose) &&
 	       s3_install_tag("Tag_chain_choice", tag_chain_choice) &&
-	       s3_install_tag("Tag_chain_ending", tag_chain_ending);
+	       s3_install_tag("Tag_chain_ending", tag_chain_ending) &&
+	       s3_install_tag("Tag_chain_friend", tag_chain_friend);
 }
 
 void

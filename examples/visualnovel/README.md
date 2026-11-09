@@ -38,6 +38,11 @@ account and the chain are all there is.
   far is on the NFT, and confirms it once final ("Saved on chain: all N
   choices, block B, final"). Load restores the local save, and the choices
   up to that point come back with it. Both also print a `[chain]` line.
+- **Read a friend's story.** The title screen's second option asks for a
+  story's number (the ending names yours) and reads it from the chain: the
+  name, their Xiaoling and Midori (from their seed block and account), each
+  answer and the ending. The player's `story` attribute names the session
+  key, so the number is all it takes.
 - **Quit any time.** The next run checks the unfinished story on chain:
   still the player's, not ended, the session key funded, the seed block's
   hash unchanged (`pdot_block_hash_get`). Then it replays the recorded
@@ -61,7 +66,7 @@ after its own save and load. It also stops the engine from forcing a
 universal macOS binary, which Homebrew's single-architecture libraries
 cannot link into.
 
-The story uses four tags from [`src/chain.c`](src/chain.c); its header
+The story uses five tags from [`src/chain.c`](src/chain.c); its header
 comment documents them in full:
 
 ```
@@ -69,6 +74,7 @@ comment documents them in full:
 [chain_choose name="c1" text1="Sure, let's go!" value1="yes" text2="Not today." value2="no"]
 [chain_choice var="result"]
 [chain_ending name="${ending_name}"]
+[chain_friend collection="1" traits="xiao_bold mido_trust xiao_patience"]
 ```
 
 ## Building
